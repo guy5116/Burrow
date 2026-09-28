@@ -1,23 +1,21 @@
 # STATUS — read this first
 
 ## Current phase
-Phase 2 — Images (CLAUDE.md §16). Phase 1 is complete: see docs/phases/PHASE-1.md.
+Phase 3 — GUI (CLAUDE.md §16). Phase 2 is complete: see docs/phases/PHASE-2.md.
 
 ## Done
-- Phases 0 and 1 in full.
+- Phases 0, 1 and 2 in full.
 
 ## Mid-flight
 - (nothing)
 
 ## Next step
-- `internal/media`: size gates (`image.DecodeConfig`, GIF pre-scan), magic sniffing, metadata
-  stripping for JPEG/PNG/WebP/GIF (strip mode) with EXIF orientation, paranoid mode, two-pass
-  deterministic hashing; tests with in-test fixtures and the media fuzzers. Then the IMG_*
-  stream state machine in `internal/session` (per-transfer queues, file-writer/file-reader
-  goroutines), resume via `.meta`, core API (`SendImage`/`AcceptImage`/…), CLI `/image`,
-  `/accept`, `/reject`, Kitty/iTerm2 rendering, end-to-end image part.
+- `internal/ui/gui` + `cmd/burrow-gui` behind the `gui` tag on Fyne v2 (check `fyne.Do` /
+  `fyne.DoAndWait` for the current API): unlock dialog, identity wizard, main window
+  (sidebar + conversation + composer), image bubbles from `core.DecodeImage`, verify
+  dialog, invite/paste dialogs with QR, settings; `docs/gui-test-plan.md`.
 
 ## Open questions for the user
-- Decisions made without confirmation are listed in docs/phases/PHASE-1.md (engine mutex instead
-  of a single goroutine; reconnect policy; 8-alloc budget at the stdlib floor).
+- Phase 2 choices are listed in docs/phases/PHASE-2.md (inline images on demand via /view;
+  paranoid animated GIF stays GIF).
 - GitHub repo rename to lowercase still needs doing in the repository settings.

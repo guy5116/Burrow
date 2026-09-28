@@ -5,7 +5,9 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/guy5116/burrow/internal/core"
@@ -19,11 +21,72 @@ type Controller struct {
 	Current    *core.PeerID // selected conversation
 	InviteHost string       // default host for /invite
 	Typing     bool
+
+	mu      sync.Mutex
+	nextNum int
+	offers  map[int]core.TransferID // short numbers for /accept, /reject, /cancel
+	numOf   map[core.TransferID]int
+	images  []string // saved image paths, for /view
 }
 
 // NewController wires a controller to an engine.
 func NewController(e *core.Engine, inviteHost string) *Controller {
-	return &Controller{E: e, Names: Names{E: e}, InviteHost: inviteHost}
+	return &Controller{E: e, Names: Names{E: e}, InviteHost: inviteHost, offers: map[int]core.TransferID{}, numOf: map[core.TransferID]int{}}
+}
+
+// Observe tracks transfer events so commands can refer to them by number.
+// Call it for every engine event before rendering it.
+func (c *Controller) Observe(ev core.Event) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	switch e := ev.(type) {
+	case core.ImageOffered:
+		c.nextNum++
+		c.offers[c.nextNum] = e.ID
+		c.numOf[e.ID] = c.nextNum
+	case core.TransferDone:
+		if !e.Peer.Outgoing {
+			c.images = append(c.images, e.Path)
+		}
+		c.forget(e.ID)
+	case core.TransferFailed:
+		c.forget(e.ID)
+	}
+}
+
+func (c *Controller) forget(id core.TransferID) {
+	if n, ok := c.numOf[id]; ok {
+		delete(c.offers, n)
+		delete(c.numOf, id)
+	}
+}
+
+// Number returns the short number for an offered transfer (0 if unknown).
+func (c *Controller) Number(id core.TransferID) int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.numOf[id]
+}
+
+// Images returns the paths of received images in arrival order.
+func (c *Controller) Images() []string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]string(nil), c.images...)
+}
+
+func (c *Controller) transferByNum(arg string) (core.TransferID, error) {
+	n, err := strconv.Atoi(strings.TrimSpace(arg))
+	if err != nil {
+		return core.TransferID{}, errors.New("usage: <command> <transfer number> (see /transfers)")
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	id, ok := c.offers[n]
+	if !ok {
+		return core.TransferID{}, errors.New("no pending transfer with that number")
+	}
+	return id, nil
 }
 
 // Resolve finds a contact by exact nickname, or by fingerprint prefix (≥ 8 chars).
@@ -70,6 +133,12 @@ const Help = `/connect <invite|contact>   connect (an invite string starts with 
 /block|/unblock <contact>   block or unblock
 /remove <contact>           delete a contact
 /disconnect <contact>       close the session
+/image <path> [caption]     send an image (metadata is stripped first)
+/accept <n> | /reject <n>   answer an image offer by its number
+/cancel <n>                 cancel a transfer
+/transfers                  list pending offers
+/view <n>                   show a received image inline (Kitty/iTerm2), n from /images
+/images                     list received images
 /typing on|off              typing indicators (off by default)
 /id                         show your fingerprint
 /quit                       exit`
@@ -235,6 +304,62 @@ func (c *Controller) Exec(ctx context.Context, line string) (out []string, quit 
 			return fail(err)
 		}
 		return []string{"* disconnecting from " + c.Names.Label(id)}, false
+	case "image":
+		if c.Current == nil {
+			return fail(errors.New("no conversation selected; use /to <contact>"))
+		}
+		path, caption, _ := strings.Cut(rest, " ")
+		if path == "" {
+			return fail(errors.New("usage: /image <path> [caption]"))
+		}
+		id, err := c.E.SendImage(ctx, *c.Current, path, strings.TrimSpace(caption))
+		if err != nil {
+			return fail(err)
+		}
+		return []string{"* preparing image " + hexID(id)[:8] + " (stripping metadata)…"}, false
+	case "accept", "reject", "cancel":
+		id, err := c.transferByNum(rest)
+		if err != nil {
+			return fail(err)
+		}
+		switch cmd {
+		case "accept":
+			err = c.E.AcceptImage(id, "")
+		case "reject":
+			err = c.E.RejectImage(id)
+		default:
+			err = c.E.CancelTransfer(id)
+		}
+		if err != nil {
+			return fail(err)
+		}
+		return []string{"* " + cmd + "ed transfer " + rest}, false
+	case "transfers":
+		c.mu.Lock()
+		nums := make([]int, 0, len(c.offers))
+		for n := range c.offers {
+			nums = append(nums, n)
+		}
+		c.mu.Unlock()
+		sort.Ints(nums)
+		if len(nums) == 0 {
+			return []string{"(no pending offers)"}, false
+		}
+		for _, n := range nums {
+			out = append(out, fmt.Sprintf("#%d %s", n, hexID(c.offers[n])[:8]))
+		}
+		return out, false
+	case "images":
+		imgs := c.Images()
+		if len(imgs) == 0 {
+			return []string{"(no images received yet)"}, false
+		}
+		for i, p := range imgs {
+			out = append(out, fmt.Sprintf("#%d %s", i+1, p))
+		}
+		return out, false
+	case "view":
+		return []string{"! /view is only available in the full-screen chat"}, false
 	case "typing":
 		c.Typing = rest == "on"
 		return []string{"* typing indicators " + map[bool]string{true: "on", false: "off"}[c.Typing]}, false

@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"crypto/subtle"
+	"hash"
 	"image"
 	"image/draw"
 	"image/gif"
@@ -46,7 +47,7 @@ func ProbeFile(path string) (Info, error) {
 	if err != nil {
 		return Info{}, err
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 	head := make([]byte, SniffLen)
 	n, _ := io.ReadFull(f, head)
 	if _, err := Sniff(head[:n]); err != nil {
@@ -116,6 +117,13 @@ func Stream(p Prepared, sink func(index uint32, chunk []byte) error) error {
 	return nil
 }
 
+// NewHasher returns the BLAKE2b-256 hasher used for transfer integrity, so
+// core never imports x/crypto directly.
+func NewHasher() hash.Hash {
+	h, _ := blake2b.New256(nil)
+	return h
+}
+
 // ErrDiverged means the second stripping pass produced different bytes.
 var ErrDiverged = errBase("media: file changed between passes")
 
@@ -132,7 +140,7 @@ func process(path string, info Info, mode Mode, orientation int, w io.Writer) (F
 	if err != nil {
 		return 0, err
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 	r := bufio.NewReaderSize(f, 64<<10)
 	switch info.Format {
 	case wire.FormatJPEG:
@@ -156,7 +164,7 @@ func orientationOfFile(path string, info Info) int {
 	if err != nil {
 		return 0
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 	r := bufio.NewReaderSize(f, 64<<10)
 	var o int
 	switch info.Format {

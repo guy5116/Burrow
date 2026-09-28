@@ -30,6 +30,18 @@ type Config struct {
 	AutoReconnect bool
 	// ListenAddr overrides the listen socket ("" → ":<ListenPort>"); tests use "127.0.0.1:0".
 	ListenAddr string
+	// DataDir holds partials/ for in-flight transfers; ImageDir receives accepted images
+	// ("" → <DataDir>/images).
+	DataDir  string
+	ImageDir string
+	// MaxImage is the largest image we send or accept, in bytes (0 → wire.DefaultMaxImage).
+	MaxImage uint64
+	// Paranoid re-encodes every outgoing image to PNG (drops encoder fingerprints).
+	Paranoid bool
+	// AutoAcceptFromVerified skips the accept prompt for verified contacts.
+	AutoAcceptFromVerified bool
+	// ChunkDelay slows the receive-side file-writer (debug/tests only; never from config.toml).
+	ChunkDelay time.Duration
 }
 
 // Contact is a saved peer.
@@ -174,14 +186,26 @@ type Typing struct {
 	Typing bool
 }
 
-// ImageOffered, TransferProgress, TransferResumed, TransferDone, TransferFailed arrive in Phase 2.
+// ImageOffered: a peer offers an image; nothing is downloaded until AcceptImage.
 type ImageOffered struct {
-	Peer PeerID
-	ID   TransferID
+	Peer    PeerID
+	ID      TransferID
+	Size    uint64
+	Format  uint8 // wire.Format*
+	Width   uint32
+	Height  uint32
+	Caption string // sanitized, single line
 }
 
-// TransferProgress reports bytes transferred.
+// TransferPeer identifies the peer and direction of a transfer.
+type TransferPeer struct {
+	Peer     PeerID
+	Outgoing bool
+}
+
+// TransferProgress reports bytes transferred (at most 4 per second per transfer).
 type TransferProgress struct {
+	Peer TransferPeer
 	ID   TransferID
 	Done uint64
 	Size uint64
@@ -190,14 +214,16 @@ type TransferProgress struct {
 // TransferResumed reports a resumed transfer.
 type TransferResumed struct{ ID TransferID }
 
-// TransferDone reports completion.
+// TransferDone reports completion; Path is the saved file (incoming) or the source (outgoing).
 type TransferDone struct {
+	Peer TransferPeer
 	ID   TransferID
 	Path string
 }
 
-// TransferFailed reports failure.
+// TransferFailed reports failure with a redacted reason.
 type TransferFailed struct {
+	Peer   TransferPeer
 	ID     TransferID
 	Reason string
 }
@@ -228,6 +254,13 @@ func (c Config) listenPort() uint16 {
 		return wire.DefaultListenPort
 	}
 	return c.ListenPort
+}
+
+func (c Config) maxImage() uint64 {
+	if c.MaxImage == 0 {
+		return wire.DefaultMaxImage
+	}
+	return c.MaxImage
 }
 
 func (c Config) maxPeers() int {

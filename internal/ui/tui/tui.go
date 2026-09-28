@@ -2,10 +2,13 @@
 package tui
 
 import (
+	"bufio"
 	"context"
 	"fmt"
 	"net"
+	"os"
 	"sort"
+	"strconv"
 	"strings"
 
 	"charm.land/bubbles/v2/textinput"
@@ -36,17 +39,19 @@ var (
 )
 
 type model struct {
-	ctx      context.Context
-	ctl      *common.Controller
-	target   core.Target
-	addrs    string
-	contacts []core.Contact
-	logs     map[core.PeerID][]string
-	system   []string
-	vp       viewport.Model
-	in       textinput.Model
-	w, h     int
-	busy     bool
+	ctx        context.Context
+	ctl        *common.Controller
+	target     core.Target
+	addrs      string
+	contacts   []core.Contact
+	logs       map[core.PeerID][]string
+	system     []string
+	vp         viewport.Model
+	in         textinput.Model
+	w, h       int
+	busy       bool
+	prog       *tea.Program
+	showInline func()
 }
 
 // Run starts the TUI and blocks until it exits.
@@ -62,6 +67,7 @@ func Run(ctx context.Context, ctl *common.Controller, target core.Target, addrs 
 		vp: viewport.New(), in: in}
 	m.refreshContacts()
 	p := tea.NewProgram(m)
+	m.prog = p
 	go func() {
 		for {
 			select {
@@ -146,6 +152,9 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if line == "/quit" || line == "/q" {
 				return m, tea.Quit
 			}
+			if strings.HasPrefix(line, "/view") {
+				return m, m.view(strings.TrimSpace(strings.TrimPrefix(line, "/view")))
+			}
 			m.busy = true
 			return m, m.exec(line)
 		default:
@@ -156,6 +165,15 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			return m, cmd
 		}
+	case viewMsg:
+		if m.showInline != nil && m.prog != nil {
+			show := m.showInline
+			m.showInline = nil
+			_ = m.prog.ReleaseTerminal()
+			show()
+			_ = m.prog.RestoreTerminal()
+		}
+		return m, nil
 	case outMsg:
 		m.busy = false
 		if msg.quit {
@@ -164,6 +182,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.system = append(m.system, msg.lines...)
 		m.refreshContacts()
 	case evMsg:
+		m.ctl.Observe(msg.ev)
 		m.onEvent(msg.ev)
 	default:
 		var cmd tea.Cmd
@@ -187,6 +206,18 @@ func (m *model) onEvent(ev core.Event) {
 		if line != "" {
 			m.logs[e.Peer] = append(m.logs[e.Peer], dim.Render(line))
 		}
+	case core.ImageOffered:
+		m.logs[e.Peer] = append(m.logs[e.Peer], bold.Render(fmt.Sprintf("* image offer #%d: %s %s %d×%d%s — /accept %d or /reject %d",
+			m.ctl.Number(e.ID), common.Size(e.Size), common.FormatName(e.Format), e.Width, e.Height, captionOf(e.Caption), m.ctl.Number(e.ID), m.ctl.Number(e.ID))))
+	case core.TransferDone:
+		if e.Peer.Outgoing {
+			m.logs[e.Peer.Peer] = append(m.logs[e.Peer.Peer], dim.Render("* image delivered"))
+		} else {
+			n := len(m.ctl.Images())
+			m.logs[e.Peer.Peer] = append(m.logs[e.Peer.Peer], fmt.Sprintf("* image saved: %s  (/view %d)", e.Path, n))
+		}
+	case core.TransferFailed:
+		m.logs[e.Peer.Peer] = append(m.logs[e.Peer.Peer], alert.Render(line))
 	case core.NameCollision, core.HandshakeFailed:
 		m.system = append(m.system, alert.Render(line))
 	default:
@@ -272,6 +303,43 @@ func (m *model) View() tea.View {
 	v.AltScreen = true
 	return v
 }
+
+func captionOf(c string) string {
+	if c == "" {
+		return ""
+	}
+	return fmt.Sprintf(" %q", c)
+}
+
+// view shows received image n inline when the terminal supports it. The
+// terminal is released for the duration; any key returns to the chat.
+func (m *model) view(arg string) tea.Cmd {
+	imgs := m.ctl.Images()
+	n, err := strconv.Atoi(arg)
+	if err != nil || n < 1 || n > len(imgs) {
+		return func() tea.Msg { return outMsg{lines: []string{"! usage: /view <n> (see /images)"}} }
+	}
+	kind := common.DetectTerminal()
+	if kind == common.TermNone {
+		return func() tea.Msg {
+			return outMsg{lines: []string{"! this terminal cannot show images inline; the file is at " + imgs[n-1]}}
+		}
+	}
+	return func() tea.Msg {
+		img, err := core.DecodeImage(imgs[n-1], 800)
+		if err != nil {
+			return outMsg{lines: []string{"! cannot decode image: " + err.Error()}}
+		}
+		m.showInline = func() {
+			_ = common.WriteImage(os.Stdout, img, kind)
+			fmt.Fprint(os.Stdout, "\n(press Enter to return)")
+			_, _ = bufio.NewReader(os.Stdin).ReadString('\n')
+		}
+		return viewMsg{}
+	}
+}
+
+type viewMsg struct{}
 
 func padRight(s string, w int) string {
 	if n := w - lipgloss.Width(s); n > 0 {

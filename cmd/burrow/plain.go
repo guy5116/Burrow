@@ -40,7 +40,12 @@ func runPlain(ctx context.Context, ctl *common.Controller, target core.Target, a
 		for {
 			select {
 			case ev := <-ctl.E.Events():
-				emit(ctl.Names.JSON(ev), ctl.Names.Line(ev))
+				ctl.Observe(ev)
+				m := ctl.Names.JSON(ev)
+				if o, ok := ev.(core.ImageOffered); ok {
+					m["number"] = ctl.Number(o.ID)
+				}
+				emit(m, ctl.Names.Line(ev))
 			case <-ctx.Done():
 				return
 			}

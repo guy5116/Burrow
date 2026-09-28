@@ -69,11 +69,63 @@ func (n Names) Line(ev core.Event) string {
 			return fmt.Sprintf("* %s is typing…", n.Nick(e.Peer))
 		}
 		return ""
+	case core.ImageOffered:
+		return fmt.Sprintf("* %s offers an image: %s %s %d×%d%s — /accept <n> or /reject <n> (see /transfers)", n.Nick(e.Peer), Size(e.Size), FormatName(e.Format), e.Width, e.Height, captionSuffix(e.Caption))
+	case core.TransferProgress:
+		return "" // too chatty for text mode; JSON carries it
+	case core.TransferResumed:
+		return "* resuming a partial download"
+	case core.TransferDone:
+		if e.Peer.Outgoing {
+			return fmt.Sprintf("* image delivered to %s", n.Nick(e.Peer.Peer))
+		}
+		return fmt.Sprintf("* image from %s saved: %s", n.Nick(e.Peer.Peer), e.Path)
+	case core.TransferFailed:
+		dir := "to"
+		if !e.Peer.Outgoing {
+			dir = "from"
+		}
+		return fmt.Sprintf("! image transfer %s %s failed: %s", dir, n.Nick(e.Peer.Peer), e.Reason)
 	case core.ErrorEvent:
 		return "! " + e.Message
 	}
 	return ""
 }
+
+func captionSuffix(c string) string {
+	if c == "" {
+		return ""
+	}
+	return fmt.Sprintf(" %q", c)
+}
+
+// Size renders bytes as a short human unit.
+func Size(n uint64) string {
+	switch {
+	case n >= 1<<20:
+		return fmt.Sprintf("%.1f MiB", float64(n)/(1<<20))
+	case n >= 1<<10:
+		return fmt.Sprintf("%.0f KiB", float64(n)/(1<<10))
+	}
+	return fmt.Sprintf("%d B", n)
+}
+
+// FormatName names a wire image format.
+func FormatName(f uint8) string {
+	switch f {
+	case 1:
+		return "PNG"
+	case 2:
+		return "JPEG"
+	case 3:
+		return "WebP"
+	case 4:
+		return "GIF"
+	}
+	return "image"
+}
+
+func hexID(id core.TransferID) string { return fmt.Sprintf("%x", id[:]) }
 
 // JSON renders an event as a flat map for --json output.
 func (n Names) JSON(ev core.Event) map[string]any {
@@ -118,6 +170,20 @@ func (n Names) JSON(ev core.Event) map[string]any {
 	case core.Typing:
 		peer(e.Peer)
 		m["typing"] = e.Typing
+	case core.ImageOffered:
+		peer(e.Peer)
+		m["id"], m["size"], m["format"], m["width"], m["height"], m["caption"] = hexID(e.ID), e.Size, FormatName(e.Format), e.Width, e.Height, e.Caption
+	case core.TransferProgress:
+		peer(e.Peer.Peer)
+		m["id"], m["outgoing"], m["done"], m["size"] = hexID(e.ID), e.Peer.Outgoing, e.Done, e.Size
+	case core.TransferResumed:
+		m["id"] = hexID(e.ID)
+	case core.TransferDone:
+		peer(e.Peer.Peer)
+		m["id"], m["outgoing"], m["path"] = hexID(e.ID), e.Peer.Outgoing, e.Path
+	case core.TransferFailed:
+		peer(e.Peer.Peer)
+		m["id"], m["outgoing"], m["reason"] = hexID(e.ID), e.Peer.Outgoing, e.Reason
 	case core.ErrorEvent:
 		m["message"] = e.Message
 	}

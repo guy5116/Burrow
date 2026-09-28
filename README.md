@@ -3,9 +3,9 @@
 Peer-to-peer, end-to-end-encrypted, one-to-one chat for text and images. No servers, no
 accounts, no third parties. Written in Go.
 
-**Status: Phase 1 (secure text over direct TCP) is complete.** Text chat works between two
-`burrow` CLIs with the full handshake, per-message forward secrecy and periodic rekeys.
-Images (Phase 2), the desktop GUI (Phase 3) and Tor (Phase 4) are next. See `docs/STATUS.md`
+**Status: Phases 1 and 2 are complete.** Text and images work between two `burrow` CLIs
+with the full handshake, per-message forward secrecy, periodic rekeys, metadata-stripped
+images and resumable transfers. The desktop GUI (Phase 3) and Tor (Phase 4) are next. See `docs/STATUS.md`
 for the current step and `CLAUDE.md` for the full design.
 
 ## Quick start (two machines on one LAN or VPN)
@@ -20,7 +20,8 @@ burrow listen                        # opens the chat
 burrow connect                       # prompts for the invite (no echo), then opens the chat
 ```
 
-In the chat: type to send, `/help` for commands, `/safety <contact>` to compare safety numbers
+In the chat: type to send, `/image <path> [caption]` to offer a picture (EXIF and other
+metadata are stripped first; the receiver must `/accept`), `/help` for commands, `/safety <contact>` to compare safety numbers
 out of band and `/verify <contact>` once they match. `burrow --plain --json listen` gives a
 scriptable line mode. The default port is 47337; change it with `burrow config set listen_port`.
 

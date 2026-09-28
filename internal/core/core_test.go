@@ -108,6 +108,9 @@ func (n *node) dump() string {
 	var sb strings.Builder
 	for _, ev := range n.events {
 		sb.WriteString(reflect.TypeOf(ev).Name())
+		if f, ok := ev.(TransferFailed); ok {
+			sb.WriteString("(" + f.Reason + ")")
+		}
 		sb.WriteByte(' ')
 	}
 	return sb.String()

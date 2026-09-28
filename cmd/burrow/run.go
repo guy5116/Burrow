@@ -6,8 +6,10 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"os"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/guy5116/burrow/internal/core"
 	"github.com/guy5116/burrow/internal/ui/common"
@@ -55,6 +57,9 @@ func (a *app) cmdRun(ctx context.Context, cmd string, args []string, stdin io.Re
 	ecfg := a.engineConfig()
 	if *listen != "" {
 		ecfg.ListenAddr = *listen
+	}
+	if d, err := time.ParseDuration(os.Getenv("BURROW_DEBUG_CHUNK_DELAY")); err == nil && d > 0 {
+		ecfg.ChunkDelay = d // debugging aid for transfer tests; not a config key
 	}
 	addr := ":" + strconv.Itoa(int(a.cfg.ListenPort))
 	if *listen != "" {

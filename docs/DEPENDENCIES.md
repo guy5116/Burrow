@@ -8,6 +8,7 @@ touch. Additions require asking the user (CLAUDE.md §14). Versions are pinned i
 |---|---|---|---|---|
 | `golang.org/x/crypto` | v0.57.0 | identity, invite, handshake, session, store, media | argon2, blake2b, chacha20poly1305, curve25519 | key material, blobs |
 | `golang.org/x/text` | v0.42.0 | text | NFKC normalization, case folding | peer strings (sanitized) |
+| `golang.org/x/image` | v0.46.0 | media | WebP decoding, thumbnail scaling (`draw`) | image bytes after the size gates |
 | `golang.org/x/sys` | v0.48.0 | store (now), transport, cmd/* (later) | `flock`/exclusive open, socket options, core-dump limits | OS handles |
 | `github.com/flynn/noise` | v1.1.0 | handshake | Noise XK (small, mature; KAT-tested against its own cacophony vectors) | handshake messages only |
 | `go.uber.org/goleak` | v1.3.0 | tests only | goroutine leak detection | — |

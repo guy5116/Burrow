@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"net"
 	"os"
+	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -54,7 +55,8 @@ type Engine struct {
 	clock func() time.Time
 	// clockOffset lets tests move the engine's notion of now without a data race.
 	clockOffset atomic.Int64
-	rand        func() time.Duration // reconnect jitter hook (tests)
+	rand        func() time.Duration              // reconnect jitter hook (tests)
+	chunkHook   func(t *transfer, written uint32) // test hook: called by the file-writer after each chunk
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -79,6 +81,7 @@ type Engine struct {
 	// orphanQueues holds a contact's message queue while no session is live.
 	orphanQueues map[PeerID][]*queued
 	reconnects   map[PeerID]context.CancelFunc
+	transfers    map[TransferID]*transfer
 }
 
 // New builds an engine over an unlocked store and the given transports.
@@ -93,7 +96,7 @@ func New(cfg Config, st *store.Store, trs []transport.Transport, logger *slog.Lo
 	e := &Engine{cfg: cfg, st: st, id: id, trs: map[transport.Kind]transport.Transport{}, log: logger,
 		clock: time.Now, events: make(chan Event, eventsCap), done: make(chan struct{}), replay: handshake.NewReplayLRU(),
 		limiters: map[transport.Kind]*handshake.FailureLimiter{}, reserved: map[[16]byte]PeerID{}, peers: map[PeerID]*peer{},
-		orphanQueues: map[PeerID][]*queued{}, reconnects: map[PeerID]context.CancelFunc{}}
+		orphanQueues: map[PeerID][]*queued{}, reconnects: map[PeerID]context.CancelFunc{}, transfers: map[TransferID]*transfer{}}
 	e.rand = func() time.Duration { return time.Duration(randUint64() % uint64(time.Second)) }
 	for _, tr := range trs {
 		e.trs[tr.Kind()] = tr
@@ -107,6 +110,10 @@ func New(cfg Config, st *store.Store, trs []transport.Transport, logger *slog.Lo
 		id.Clear()
 		return nil, err
 	}
+	if cfg.DataDir == "" {
+		e.cfg.DataDir = filepath.Dir(st.Dir())
+	}
+	e.cleanPartials()
 	return e, nil
 }
 
@@ -407,7 +414,7 @@ func reasonOf(err error) string {
 // exchange, then applies token consumption, contact creation, name-collision
 // and replacement/glare rules. token is the responder-side presented token.
 func (e *Engine) establish(conn net.Conn, kind transport.Kind, res *handshake.Result, token *[16]byte, inviteID string) error {
-	hello := wire.Hello{Name: []byte(e.cfg.DisplayName)}
+	hello := wire.Hello{Name: []byte(e.cfg.DisplayName), Features: wire.FeatureImages | wire.FeatureAnimatedGIF, MaxImage: e.cfg.maxImage()}
 	if e.cfg.Typing {
 		hello.Features |= wire.FeatureTyping
 	}

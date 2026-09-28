@@ -445,7 +445,7 @@ func BenchmarkTransfer(b *testing.B) {
 	// End-to-end throughput of the session layer over net.Pipe (no disk, no TCP).
 	t := &testing.T{}
 	p := newPair(t, time.Hour)
-	const size = 16 << 20
+	const size = 256 * wire.ChunkData // exactly 256 full chunks
 	data := make([]byte, wire.ChunkData)
 	b.SetBytes(size)
 	b.ResetTimer()

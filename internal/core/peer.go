@@ -28,14 +28,15 @@ type peer struct {
 	replaced bool
 
 	// Engine-mutex-guarded.
-	queue []*queued
-	seen  map[MsgID]struct{}
-	order []MsgID // ring of the last MsgIDDedupSet received ids
-	stop  chan struct{}
+	queue     []*queued
+	seen      map[MsgID]struct{}
+	order     []MsgID // ring of the last MsgIDDedupSet received ids
+	stop      chan struct{}
+	transfers map[uint16]*transfer // by stream id
 }
 
 func newPeer(e *Engine, s *session.Session, kind transport.Kind) *peer {
-	return &peer{e: e, s: s, kind: kind, since: e.now(), seen: map[MsgID]struct{}{}, stop: make(chan struct{})}
+	return &peer{e: e, s: s, kind: kind, since: e.now(), seen: map[MsgID]struct{}{}, stop: make(chan struct{}), transfers: map[uint16]*transfer{}}
 }
 
 // run pumps inbound frames until the session ends, then handles teardown,
@@ -116,6 +117,10 @@ func (p *peer) handle(in session.Inbound) {
 			return
 		}
 		p.e.emit(Typing{Peer: id, Typing: st == wire.TypingStart})
+	default:
+		if in.Type.Class() == wire.ClassTransfer {
+			p.e.onStreamInbound(p, in)
+		}
 	}
 }
 
@@ -158,6 +163,7 @@ func (p *peer) onClosed() {
 	id := p.s.Peer()
 	err := p.s.Err()
 	e := p.e
+	e.failPeerTransfers(p)
 	e.mu.Lock()
 	current := e.peers[id] == p
 	if current {

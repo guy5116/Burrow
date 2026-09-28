@@ -171,7 +171,9 @@ func (a *app) cmdInvite(ctx context.Context, args []string, stdin io.Reader, std
 
 func (a *app) engineConfig() core.Config {
 	return core.Config{ListenPort: a.cfg.ListenPort, DisplayName: a.cfg.DisplayName, Typing: a.cfg.Typing,
-		NoTimestamp: !a.cfg.Timestamps, AutoReconnect: a.cfg.AutoReconnect}
+		NoTimestamp: !a.cfg.Timestamps, AutoReconnect: a.cfg.AutoReconnect,
+		DataDir: a.paths.Data, ImageDir: a.cfg.ImageDir, MaxImage: uint64(a.cfg.MaxImageMiB) << 20,
+		Paranoid: a.cfg.ParanoidImages, AutoAcceptFromVerified: a.cfg.AutoAcceptFromVerified}
 }
 
 func (a *app) cmdContacts(args []string, stdin io.Reader, stdout, stderr io.Writer) int {

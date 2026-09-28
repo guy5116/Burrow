@@ -55,8 +55,8 @@ func stripPNG(w io.Writer, r io.Reader) (orientation int, err error) {
 			return 0, ErrCorrupt
 		}
 		crc := crc32.NewIEEE()
-		crc.Write(hdr[4:8])
-		crc.Write(data)
+		_, _ = crc.Write(hdr[4:8])
+		_, _ = crc.Write(data)
 		if crc.Sum32() != binary.BigEndian.Uint32(crcb[:]) {
 			return 0, ErrCorrupt
 		}

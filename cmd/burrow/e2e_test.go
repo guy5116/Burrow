@@ -2,9 +2,13 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
+	"image"
+	"image/png"
 	"io"
+	"math/rand/v2"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -53,6 +57,7 @@ func newProc(t *testing.T, home string, args ...string) *proc {
 	full := append([]string{"--plain", "--json", "--config", home, "--data", home}, args...)
 	cmd := exec.CommandContext(context.Background(), binPath, full...)
 	cmd.Stderr = os.Stderr
+	cmd.Env = append(os.Environ(), "BURROW_DEBUG_CHUNK_DELAY=8ms")
 	stdin, _ := cmd.StdinPipe()
 	stdout, _ := cmd.StdoutPipe()
 	if err := cmd.Start(); err != nil {
@@ -204,4 +209,108 @@ func TestEndToEndText(t *testing.T) {
 	a2.wait("PeerDisconnected", func(m map[string]any) bool { return m["event"] == "PeerDisconnected" && m["reason"] == "peer left" })
 	a2.send("/quit")
 	_ = a2.cmd.Wait()
+}
+
+// makePNG writes a noisy PNG of about the requested size to dir.
+func makePNG(t *testing.T, dir string, side int) string {
+	t.Helper()
+	img := image.NewNRGBA(image.Rect(0, 0, side, side))
+	r := rand.New(rand.NewPCG(7, 9))
+	for i := range img.Pix {
+		img.Pix[i] = byte(r.UintN(256))
+	}
+	var buf bytes.Buffer
+	if err := png.Encode(&buf, img); err != nil {
+		t.Fatal(err)
+	}
+	p := filepath.Join(dir, "shot.png")
+	if err := os.WriteFile(p, buf.Bytes(), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return p
+}
+
+func TestEndToEndImage(t *testing.T) {
+	if testing.Short() {
+		t.Skip("spawns processes")
+	}
+	a := newProc(t, "", "listen", "--listen", "127.0.0.1:0", "--host", "127.0.0.1")
+	ready := a.wait("Ready", is("Ready"))
+	addr := ready["listen"].([]any)[0].(string)
+	port := addr[strings.LastIndex(addr, ":")+1:]
+	a.send("/invite 127.0.0.1")
+	inv := a.wait("invite", func(m map[string]any) bool {
+		s, _ := m["text"].(string)
+		return m["event"] == "Output" && strings.HasPrefix(s, "burrow1:")
+	})["text"].(string)
+	b := newProc(t, "", "listen", "--listen", "127.0.0.1:0")
+	b.wait("Ready", is("Ready"))
+	b.send("/connect " + inv)
+	b.wait("PeerConnected", is("PeerConnected"))
+	a.wait("PeerConnected", is("PeerConnected"))
+	bFP := b.wait("Ready", is("Ready"))["fingerprint"].(string)
+
+	// Small image: offer, accept, saved and decodable on B.
+	small := makePNG(t, t.TempDir(), 64)
+	a.send("/to " + bFP[:12])
+	a.send("/image " + small + " a caption")
+	off := b.wait("ImageOffered", is("ImageOffered"))
+	if off["caption"] != "a caption" || off["format"] != "PNG" {
+		t.Fatalf("%v", off)
+	}
+	b.send("/accept 1")
+	done := b.wait("TransferDone", is("TransferDone"))
+	path := done["path"].(string)
+	if !strings.HasSuffix(path, ".png") || !strings.HasPrefix(path, b.home) {
+		t.Fatal(path)
+	}
+	if _, err := os.Stat(path); err != nil {
+		t.Fatal(err)
+	}
+	a.wait("sender done", func(m map[string]any) bool { return m["event"] == "TransferDone" && m["outgoing"] == true })
+
+	// Large image: kill A mid-transfer, restart it, B reconnects, A re-offers, B resumes.
+	big := makePNG(t, t.TempDir(), 2400) // ~23 MiB of incompressible pixels
+	a.send("/image " + big)
+	b.wait("big offer", func(m map[string]any) bool { return m["event"] == "ImageOffered" && m["number"] == float64(2) })
+	b.send("/accept 2")
+	b.wait("progress", func(m map[string]any) bool {
+		return m["event"] == "TransferProgress" && m["done"].(float64) >= 2<<20
+	})
+	a.kill()
+	b.wait("failed", func(m map[string]any) bool { return m["event"] == "TransferFailed" && m["reason"] == "connection lost" })
+	parts, _ := filepath.Glob(filepath.Join(b.home, "partials", "*.part"))
+	if len(parts) != 1 {
+		t.Fatalf("partial not kept: %v", parts)
+	}
+	a2 := newProc(t, a.home, "listen", "--listen", "127.0.0.1:"+port, "--host", "127.0.0.1")
+	a2.wait("Ready", is("Ready"))
+	b.wait("reconnected", func(m map[string]any) bool {
+		return m["event"] == "PeerConnected" && b.countEvents("PeerConnected") >= 2
+	})
+	a2.send("/to " + bFP[:12])
+	a2.send("/image " + big)
+	b.wait("re-offer", func(m map[string]any) bool { return m["event"] == "ImageOffered" && m["number"] == float64(3) })
+	b.send("/accept 3")
+	b.wait("TransferResumed", is("TransferResumed"))
+	done2 := b.wait("big done", func(m map[string]any) bool { return m["event"] == "TransferDone" && m["path"] != path })
+	if fi, err := os.Stat(done2["path"].(string)); err != nil || fi.Size() < 20<<20 {
+		t.Fatal(err)
+	}
+	if parts, _ := filepath.Glob(filepath.Join(b.home, "partials", "*")); len(parts) != 0 {
+		t.Fatal("partials left over")
+	}
+	b.send("/quit")
+	a2.send("/quit")
+	_ = a2.cmd.Wait()
+}
+
+func (p *proc) countEvents(name string) int {
+	n := 0
+	for _, ev := range p.events { // caller holds p.mu via wait's predicate
+		if ev["event"] == name {
+			n++
+		}
+	}
+	return n
 }

@@ -17,10 +17,10 @@ invites; the fact that two specific peers talk, and when; partial transfers on d
 | Compromise of a long-term key after a conversation | Fresh ephemeral X25519 + ML-KEM per handshake; per-message chain keys deleted after use | done |
 | Compromise of running session state (not the identity key) | Periodic rekey mixes fresh DH + KEM **and** DHs against both static keys; the attacker is evicted at the next epoch even if active | done |
 | Scanners that do not hold a peer's public key | XK: silent close after one cheap DH; responder key never sent; msg1 replay LRU; invite tokens for unknown initiators | done |
-| Image metadata leakage | EXIF/XMP/ICC/comments stripped; no filenames or timestamps on the wire; opaque file names | Phase 2 |
+| Image metadata leakage | EXIF/XMP/ICC/IPTC/comments stripped in every format; orientation applied then dropped; no filenames or timestamps on the wire; opaque `img-<hash8>` file names; paranoid mode re-encodes to drop encoder fingerprints | done |
 | Disk theft | Identity, contacts, invites, transfer metadata encrypted under an Argon2id-derived key (or a random key in `--insecure-no-passphrase` mode); no history by default; no core dumps (Linux/macOS) | Phase 0/1 |
 | Terminal/UI injection and name spoofing | Sanitization of every peer string (`internal/text`); NFKC + case-fold normalization for the name-collision check | Phase 0 |
-| Memory exhaustion, decompression bombs | Hard caps before allocation (frame ≤ 65,552 bytes, rejected before the body is read); bounded queues; per-peer stream/offer caps; image dimension gates; decode semaphore | Phase 0 (wire), Phase 2 (media) |
+| Memory exhaustion, decompression bombs | Hard caps before allocation (frame ≤ 65,552 bytes, rejected before the body is read); bounded queues; per-peer stream/offer caps; image dimension gates and GIF pre-scan before any decode; two-decode semaphore; nothing downloaded before an explicit accept | done |
 | A second local process corrupting the store | Exclusive lock on `store/lock` | Phase 0 |
 
 ## Out of scope (stated in the README)
