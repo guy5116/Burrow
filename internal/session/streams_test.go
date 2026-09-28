@@ -451,6 +451,11 @@ func BenchmarkTransfer(b *testing.B) {
 	b.ResetTimer()
 	for n := 0; n < b.N; n++ {
 		ctx := context.Background()
+		// A real peer may offer at most 16 images per minute; the benchmark
+		// resets the receiver's churn window so b.N iterations are not a violation.
+		p.r.streams.mu.Lock()
+		p.r.streams.offerTimes = nil
+		p.r.streams.mu.Unlock()
 		id, _ := p.i.OpenStream(size)
 		op, _ := wire.AppendImgOffer(nil, wire.ImgOffer{Size: size, Format: 1})
 		done := make(chan struct{})
