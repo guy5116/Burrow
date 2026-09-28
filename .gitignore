@@ -1,0 +1,6 @@
+/burrow
+/burrow-gui
+/dist/
+/testdata/fuzz/**/*.tmp
+*.test
+*.out
