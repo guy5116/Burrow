@@ -3,9 +3,10 @@
 Peer-to-peer, end-to-end-encrypted, one-to-one chat for text and images. No servers, no
 accounts, no third parties. Written in Go.
 
-**Status: Phases 1 and 2 are complete.** Text and images work between two `burrow` CLIs
-with the full handshake, per-message forward secrecy, periodic rekeys, metadata-stripped
-images and resumable transfers. The desktop GUI (Phase 3) and Tor (Phase 4) are next. See `docs/STATUS.md`
+**Status: Phases 1–3 are complete.** Text and images work between `burrow` CLIs and the
+`burrow-gui` desktop app with the full handshake, per-message forward secrecy, periodic
+rekeys, metadata-stripped images and resumable transfers. Tor and LAN discovery (Phase 4)
+are next. See `docs/STATUS.md`
 for the current step and `CLAUDE.md` for the full design.
 
 ## Quick start (two machines on one LAN or VPN)
@@ -50,6 +51,7 @@ resolver; IP literals and onion addresses are preferred.
 
 ```
 make build        # CLI, no CGo
+make build-gui    # desktop GUI (needs CGo + OpenGL/X11 dev packages)
 make test         # go test -race ./...
 make lint         # gofmt, vet, staticcheck, gosec, govulncheck, golangci-lint (run `make tools` once)
 make docs-check   # docs/PROTOCOL.md constants match internal/wire

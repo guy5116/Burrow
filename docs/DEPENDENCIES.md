@@ -17,7 +17,8 @@ touch. Additions require asking the user (CLAUDE.md §14). Versions are pinned i
 | `charm.land/bubbletea/v2` | v2.0.10 | ui/tui | TUI framework (v2 moved to `charm.land`) | terminal |
 | `charm.land/bubbles/v2` | v2.2.1 | ui/tui | text input, viewport. Transitively pulls `github.com/atotto/clipboard` (pure Go; execs the platform clipboard tool on ctrl+v only) | terminal, clipboard on user action |
 | `charm.land/lipgloss/v2` | v2.0.6 | ui/tui | styling | terminal |
-| `github.com/skip2/go-qrcode` | v0.0.0-2020 (frozen) | cmd/burrow | `id --qr`, `invite --qr` | stdout |
+| `github.com/skip2/go-qrcode` | v0.0.0-2020 (frozen) | cmd/burrow, ui/gui | `id --qr`, `invite --qr`, invite dialog | stdout / canvas |
+| `fyne.io/fyne/v2` | v2.8.1 | ui/gui, cmd/burrow-gui (tag `gui`) | desktop GUI. Transitive: go-text/typesetting (fonts), goldmark (unused markdown), oksvg/rasterx (icons), go-locale, go-i18n, gobmp, glfw (CGo) | window, clipboard, file chooser, `OpenURL` only behind `open_links` |
 
 Planned (allowlisted, not yet imported): `golang.org/x/image` (WebP decode, Phase 2),
 `golang.org/x/term` (no-echo prompts, Phase 1), `golang.org/x/net/dns/dnsmessage` (mDNS,
