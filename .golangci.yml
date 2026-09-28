@@ -20,14 +20,17 @@ linters:
           allow: ["$gostd", "golang.org/x/text", "github.com/guy5116/burrow/internal/text"]
         xcrypto:
           list-mode: lax
-          files: ["**/internal/**"]
+          files:
+            - "**/internal/**"
+            - "!**/internal/identity/**"
+            - "!**/internal/invite/**"
+            - "!**/internal/handshake/**"
+            - "!**/internal/session/**"
+            - "!**/internal/store/**"
+            - "!**/internal/media/**"
           deny:
             - pkg: "golang.org/x/crypto"
               desc: "x/crypto only in identity, invite, handshake, session, store, media (CLAUDE.md §2.2)"
-        xcrypto-ok:
-          list-mode: lax
-          files: ["**/internal/identity/**", "**/internal/invite/**", "**/internal/handshake/**", "**/internal/session/**", "**/internal/store/**", "**/internal/media/**"]
-          allow: ["golang.org/x/crypto"]
         ui:
           list-mode: lax
           files: ["**/internal/ui/**", "**/cmd/**"]
@@ -45,6 +48,7 @@ linters:
           files: ["$all"]
           allow:
             - "$gostd"
+            - "go/" # go/ast, go/types… (stdlib; $gostd misses them in the $all rule)
             - "github.com/guy5116/burrow"
             - "golang.org/x/crypto"
             - "golang.org/x/image"

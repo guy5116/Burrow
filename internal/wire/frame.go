@@ -124,7 +124,7 @@ func EncodeInner(dst []byte, typ FrameType, stream uint16, payload []byte) ([]by
 	b[0] = byte(typ)
 	b[1] = 0
 	binary.BigEndian.PutUint16(b[2:], stream)
-	binary.BigEndian.PutUint32(b[4:], uint32(len(payload)))
+	binary.BigEndian.PutUint32(b[4:], uint32(len(payload))) // #nosec G115 -- ≤ MaxPayload via PaddedLen
 	copy(b[InnerHeaderSize:], payload)
 	clear(b[InnerHeaderSize+len(payload):])
 	return dst, nil

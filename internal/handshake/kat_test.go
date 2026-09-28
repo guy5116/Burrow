@@ -8,6 +8,7 @@ import (
 	"crypto/mlkem"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"io"
 	"os"
 	"strings"
@@ -229,7 +230,7 @@ func TestNoiseXKVectors(t *testing.T) {
 			}
 		}
 	}
-	if err := sc.Err(); err != nil && err != io.EOF {
+	if err := sc.Err(); err != nil && !errors.Is(err, io.EOF) {
 		t.Fatal(err)
 	}
 	if blocks != 4 {

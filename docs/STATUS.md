@@ -1,22 +1,20 @@
 # STATUS — read this first
 
 ## Current phase
-Phase 0 — Skeleton (CLAUDE.md §16).
+Phase 1 — Secure text over direct TCP (CLAUDE.md §16). Phase 0 is complete: see docs/phases/PHASE-0.md.
 
 ## Done
-- go.mod (`github.com/guy5116/burrow`, go 1.24, toolchain go1.27.1), Makefile, .golangci.yml, CI.
-- internal/secret, internal/buf, internal/wire (100% cov, 17 fuzz targets), internal/text,
-  internal/identity, internal/invite, KATs in internal/handshake (Noise XK vectors, HKDF, HMAC, ML-KEM).
+- Phase 0 in full (wire, secret, buf, text, identity, invite, store, KATs, docs, CI, lint).
 
 ## Mid-flight
-- internal/store: not started.
+- (nothing)
 
 ## Next step
-- internal/store (header, lock, blobs, identity blob, directory-swap passphrase change, recovery, tests, fuzz),
-  then docs (PROTOCOL.md + docs-check, THREAT_MODEL, SECURITY, DEPENDENCIES), lint, PHASE-0.md.
+- `internal/handshake`: Noise XK + ML-KEM bootstrap → root key, `Authorize` callback, msg1
+  replay LRU, fixed message lengths, deadlines. Tests first (§13.2/§13.3 handshake cases),
+  then `internal/session` (chains, frame AEAD, rekey state machine, multiplexer).
 
 ## Open questions for the user
-- §0.3 placeholders adopted without confirmation (autonomous session): module path
-  `github.com/guy5116/burrow` (note: the GitHub remote is spelled `Burrow`; Go module
-  paths are case-sensitive, so the repo should be renamed to lowercase or the module
-  path changed), default port 47337, Bubble Tea **v2** (`github.com/charmbracelet/bubbletea/v2`).
+- §0.3 placeholders adopted without confirmation: module path `github.com/guy5116/burrow`
+  (the GitHub remote is spelled `Burrow` — rename the repo to lowercase or change the
+  module path), default port 47337, Bubble Tea v2 (`github.com/charmbracelet/bubbletea/v2`).

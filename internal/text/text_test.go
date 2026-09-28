@@ -20,14 +20,14 @@ func TestSanitize(t *testing.T) {
 		{"a\nb", Name, "a b"},
 		{"a\rb", Multiline, "a�b"},
 		{"a\x00b\x7fc\u0085d", Multiline, "a�b�c�d"},
-		{"x‮y⁦z‪", Multiline, "x�y�z�"},
-		{"  ​‎‏⁠⁤\uFEFF؜᠎", Multiline, strings.Repeat("�", 10)},
+		{"x\u202Ey\u2066z\u202A", Multiline, "x�y�z�"},
+		{"\u2028\u2029\u200B\u200E\u200F\u2060\u2064\uFEFF\u061C\u180E", Multiline, strings.Repeat("�", 10)},
 		{"\U000E0001\U000E007F", Multiline, "��"},
-		{"‌‌x", Multiline, "‌‌x"},         // ZWNJ kept
-		{"👩‍👩‍👧", SingleLine, "👩‍👩‍👧"},    // ZWJ family kept
-		{"a‍‍‍‍b", Multiline, "a‍‍b"},     // run capped at 2
-		{"a‍b", Name, "ab"},               // removed from names
-		{"é́́́́́x", Multiline, "é́́́x"}, // marks capped at 4
+		{"\u200C\u200Cx", Multiline, "\u200C\u200Cx"},               // ZWNJ kept
+		{"👩\u200D👩\u200D👧", SingleLine, "👩\u200D👩\u200D👧"},          // ZWJ family kept
+		{"a\u200D\u200D\u200D\u200Db", Multiline, "a\u200D\u200Db"}, // run capped at 2
+		{"a\u200Db", Name, "ab"},                                    // removed from names
+		{"é́́́́́x", Multiline, "é́́́x"},                           // marks capped at 4
 		{"é́́́́", Multiline, "é́́́"},
 		{"́́́́́", Multiline, "́́́́"}, // no base
 		{"é⃝⃝⃝⃝⃝a", Multiline, "é⃝⃝⃝⃝a"},
@@ -52,14 +52,14 @@ func TestNormalize(t *testing.T) {
 	cases := [][2]string{
 		{"Alice", "alice"},
 		{"  Alice   Smith ", "alice smith"},
-		{"ＡＬＩＣＥ", "alice"},    // fullwidth → NFKC
-		{"Ａlice‍", "alice"},   // Cf removed
-		{"al­ice", "alice"},   // soft hyphen (Cf)
-		{"ali️ce", "alice"},   // variation selector
-		{"ﬁsh", "fish"},       // ligature
-		{"Straße", "strasse"}, // full case fold
-		{"a b", "a b"},        // nbsp collapses (NFKC → space)
-		{"​", ""},             // ZWSP is Cf → empty
+		{"ＡＬＩＣＥ", "alice"},       // fullwidth → NFKC
+		{"Ａlice\u200D", "alice"}, // Cf removed
+		{"al\u00ADice", "alice"}, // soft hyphen (Cf)
+		{"ali️ce", "alice"},      // variation selector
+		{"ﬁsh", "fish"},          // ligature
+		{"Straße", "strasse"},    // full case fold
+		{"a b", "a b"},           // nbsp collapses (NFKC → space)
+		{"\u200B", ""},           // ZWSP is Cf → empty
 		{"a\t\n b", "a b"},
 	}
 	for _, c := range cases {
@@ -125,7 +125,7 @@ func checkClean(t *testing.T, s string, f Field) {
 }
 
 func FuzzSanitize(f *testing.F) {
-	for _, s := range []string{"hello", "a\r\nb", "‮", "👩‍👩", "é́́́́", "\xff", ""} {
+	for _, s := range []string{"hello", "a\r\nb", "\u202E", "👩\u200D👩", "é́́́́", "\xff", ""} {
 		f.Add([]byte(s), uint8(0))
 		f.Add([]byte(s), uint8(2))
 	}
@@ -150,7 +150,7 @@ func FuzzSanitize(f *testing.F) {
 }
 
 func FuzzNormalize(f *testing.F) {
-	for _, s := range []string{"Alice", "ＡＬＩＣＥ", "Straße", "a­b", " x  y "} {
+	for _, s := range []string{"Alice", "ＡＬＩＣＥ", "Straße", "a\u00ADb", " x  y "} {
 		f.Add(s)
 	}
 	f.Fuzz(func(t *testing.T, s string) {

@@ -63,12 +63,12 @@ func (i *Invite) Encode() (string, error) {
 		return "", err
 	}
 	b := make([]byte, 0, fixedLen+len(i.Addr))
-	b = append(b, version, i.Kind, byte(len(i.Addr)))
+	b = append(b, version, i.Kind, byte(len(i.Addr))) // #nosec G115 -- ≤ maxAddrLen via validate
 	b = append(b, i.Addr...)
 	b = binary.BigEndian.AppendUint16(b, i.Port)
 	b = append(b, i.PubKey[:]...)
 	b = append(b, i.Token[:]...)
-	b = binary.BigEndian.AppendUint64(b, uint64(i.Expiry.Unix()))
+	b = binary.BigEndian.AppendUint64(b, uint64(i.Expiry.Unix())) // #nosec G115 -- i64 on the wire
 	var flags byte
 	if i.MultiUse {
 		flags |= flagMulti
@@ -111,7 +111,7 @@ func Parse(s string) (*Invite, error) {
 	inv.Port = binary.BigEndian.Uint16(p)
 	copy(inv.PubKey[:], p[2:34])
 	copy(inv.Token[:], p[34:50])
-	inv.Expiry = time.Unix(int64(binary.BigEndian.Uint64(p[50:58])), 0)
+	inv.Expiry = time.Unix(int64(binary.BigEndian.Uint64(p[50:58])), 0) // #nosec G115 -- i64 on the wire
 	flags := p[58]
 	if flags&^flagMulti != 0 {
 		return nil, ErrInvalid

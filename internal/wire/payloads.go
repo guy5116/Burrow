@@ -23,7 +23,7 @@ func AppendHello(dst []byte, h Hello) ([]byte, error) {
 	}
 	dst = binary.BigEndian.AppendUint64(dst, h.Features)
 	dst = binary.BigEndian.AppendUint64(dst, h.MaxImage)
-	dst = append(dst, byte(len(h.Name)))
+	dst = append(dst, byte(len(h.Name))) // #nosec G115 -- ≤ MaxHelloName checked above
 	return append(dst, h.Name...), nil
 }
 
@@ -108,7 +108,7 @@ func AppendText(dst []byte, t Text) ([]byte, error) {
 		return dst, ErrTooLarge
 	}
 	dst = binary.BigEndian.AppendUint64(dst, t.MsgID)
-	dst = binary.BigEndian.AppendUint64(dst, uint64(t.SentAt))
+	dst = binary.BigEndian.AppendUint64(dst, uint64(t.SentAt)) // #nosec G115 -- two's complement i64 on the wire
 	return append(dst, t.Text...), nil
 }
 
@@ -120,7 +120,7 @@ func DecodeText(p []byte) (Text, error) {
 	if len(p)-16 > MaxTextBytes {
 		return Text{}, ErrTooLarge
 	}
-	t := Text{MsgID: binary.BigEndian.Uint64(p), SentAt: int64(binary.BigEndian.Uint64(p[8:])), Text: p[16:]}
+	t := Text{MsgID: binary.BigEndian.Uint64(p), SentAt: int64(binary.BigEndian.Uint64(p[8:])), Text: p[16:]} // #nosec G115 -- i64 on the wire
 	if !utf8.Valid(t.Text) {
 		return Text{}, ErrUTF8
 	}
@@ -175,7 +175,7 @@ func AppendImgOffer(dst []byte, o ImgOffer) ([]byte, error) {
 	dst = binary.BigEndian.AppendUint32(dst, o.Width)
 	dst = binary.BigEndian.AppendUint32(dst, o.Height)
 	dst = append(dst, o.Hash[:]...)
-	dst = binary.BigEndian.AppendUint16(dst, uint16(len(o.Caption)))
+	dst = binary.BigEndian.AppendUint16(dst, uint16(len(o.Caption))) // #nosec G115 -- ≤ MaxCaptionBytes checked above
 	return append(dst, o.Caption...), nil
 }
 
