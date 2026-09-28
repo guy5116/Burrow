@@ -3,10 +3,9 @@
 Peer-to-peer, end-to-end-encrypted, one-to-one chat for text and images. No servers, no
 accounts, no third parties. Written in Go.
 
-**Status: Phases 1–3 are complete.** Text and images work between `burrow` CLIs and the
-`burrow-gui` desktop app with the full handshake, per-message forward secrecy, periodic
-rekeys, metadata-stripped images and resumable transfers. Tor and LAN discovery (Phase 4)
-are next. See `docs/STATUS.md`
+**Status: Phases 1–4 are complete.** Text and images work between `burrow` CLIs and the
+`burrow-gui` desktop app over direct TCP or Tor onion services, with optional LAN
+discovery and optional encrypted history. Hardening and release (Phase 5) is next. See `docs/STATUS.md`
 for the current step and `CLAUDE.md` for the full design.
 
 ## Quick start (two machines on one LAN or VPN)
@@ -41,11 +40,17 @@ anyone who ever held your public key; protocol fingerprinting by deep packet ins
 traffic analysis (timing and coarse sizes); your IP address from your peer in direct-TCP
 mode (use the Tor transport once it exists). Full list in `docs/THREAT_MODEL.md`.
 
-## Connectivity
+## Connectivity and the trade-offs
 
-Direct TCP requires that one side be reachable: same LAN, a port forward, or a VPN such
-as WireGuard or Tailscale. Hostnames work but reveal the peer's hostname to your DNS
-resolver; IP literals and onion addresses are preferred.
+| Mode | Set with | Hides your IP from the peer | Needs | Trade-off |
+|---|---|---|---|---|
+| Direct TCP (default) | `transport = "tcp"` | no | one side reachable: same LAN, a port forward, or a VPN such as WireGuard/Tailscale | fastest; your IP and the peer's are visible to each other and to the network path |
+| Tor onion service | `transport = "tor"` (or `"both"`) plus a system `tor` binary | yes, both ways | nothing to forward; tor bootstraps in seconds to minutes | slower and higher latency; Tor sees connection timing but never content or identities |
+| LAN discovery (mDNS) | `mdns = true` | n/a | same LAN | announces that *a* Burrow instance exists (random name, keyed tag); only your contacts can tell it is you. Off by default because it is a presence beacon |
+
+Hostnames in invites work but reveal the peer's hostname to your DNS resolver; IP
+literals and onion addresses are preferred. History is off by default; `history = true`
+stores messages encrypted at rest in opaque files, and `burrow burn` wipes them.
 
 ## Building
 

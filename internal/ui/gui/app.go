@@ -93,8 +93,21 @@ func (a *App) startEngine(st *store.Store) {
 	ecfg := core.Config{ListenPort: a.cfg.ListenPort, DisplayName: a.cfg.DisplayName, Typing: a.cfg.Typing,
 		NoTimestamp: !a.cfg.Timestamps, AutoReconnect: a.cfg.AutoReconnect, DataDir: a.paths.Data,
 		ImageDir: a.cfg.ImageDir, MaxImage: uint64(a.cfg.MaxImageMiB) << 20, Paranoid: a.cfg.ParanoidImages,
-		AutoAcceptFromVerified: a.cfg.AutoAcceptFromVerified}
-	e, err := core.New(ecfg, st, core.Transports(":"+strconv.Itoa(int(a.cfg.ListenPort))), a.log)
+		AutoAcceptFromVerified: a.cfg.AutoAcceptFromVerified, MDNS: a.cfg.MDNS, History: a.cfg.History}
+	listen := ":" + strconv.Itoa(int(a.cfg.ListenPort))
+	var torOpts *core.TorOptions
+	if a.cfg.Transport == "tor" || a.cfg.Transport == "both" {
+		key, err := st.LoadOnionKey()
+		if err != nil {
+			dialog.ShowError(err, a.win)
+			return
+		}
+		torOpts = &core.TorOptions{Key: key, Port: a.cfg.ListenPort, Exe: a.cfg.TorExe}
+		if a.cfg.Transport == "tor" {
+			listen = ""
+		}
+	}
+	e, err := core.New(ecfg, st, core.Transports(listen, torOpts), a.log)
 	if err != nil {
 		dialog.ShowError(err, a.win)
 		return

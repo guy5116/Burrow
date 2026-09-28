@@ -20,6 +20,7 @@ type Controller struct {
 	Names      Names
 	Current    *core.PeerID // selected conversation
 	InviteHost string       // default host for /invite
+	Onion      string       // our onion address when Tor is running
 	Typing     bool
 
 	mu      sync.Mutex
@@ -126,7 +127,7 @@ const Help = `/connect <invite|contact>   connect (an invite string starts with 
 /to <contact>               select the conversation for plain text lines
 /msg <contact> <text>       send to a specific contact
 /contacts                   list contacts (✓ verified, * online)
-/invite [multi] [host]      create an invite (default single-use, 1 h)
+/invite [multi] [tor] [host] create an invite (default single-use, 1 h; tor = onion invite)
 /safety <contact>           show the safety number to compare out of band
 /verify <contact>           mark verified after comparing safety numbers
 /rename <contact> <name>    set a nickname
@@ -139,6 +140,7 @@ const Help = `/connect <invite|contact>   connect (an invite string starts with 
 /transfers                  list pending offers
 /view <n>                   show a received image inline (Kitty/iTerm2), n from /images
 /images                     list received images
+/history [n]                show the last n stored messages (needs history = true)
 /typing on|off              typing indicators (off by default)
 /id                         show your fingerprint
 /quit                       exit`
@@ -166,7 +168,31 @@ func (c *Controller) Exec(ctx context.Context, line string) (out []string, quit 
 		return strings.Split(Help, "\n"), false
 	case "id":
 		id := c.E.Identity()
-		return []string{"your fingerprint: " + id.Display}, false
+		out = []string{"your fingerprint: " + id.Display}
+		if c.Onion != "" {
+			out = append(out, "your onion address: "+c.Onion)
+		}
+		return out, false
+	case "history":
+		if c.Current == nil {
+			return fail(errors.New("no conversation selected; use /to <contact>"))
+		}
+		n, _ := strconv.Atoi(rest)
+		hist, err := c.E.History(*c.Current, n)
+		if err != nil {
+			return fail(err)
+		}
+		for _, h := range hist {
+			who := c.Names.Nick(h.Peer)
+			if h.Mine {
+				who = "me"
+			}
+			out = append(out, fmt.Sprintf("%s <%s> %s", h.At.Local().Format("2006-01-02 15:04"), who, h.Text))
+		}
+		if len(out) == 0 {
+			out = []string{"(no stored messages)"}
+		}
+		return out, false
 	case "connect":
 		if rest == "" {
 			return fail(errors.New("usage: /connect <invite|contact>"))
@@ -230,6 +256,11 @@ func (c *Controller) Exec(ctx context.Context, line string) (out []string, quit 
 			switch f {
 			case "multi", "--multi-use":
 				opts.MultiUse = true
+			case "tor":
+				if c.Onion == "" {
+					return fail(errors.New("tor is not running (config: transport = tor or both)"))
+				}
+				opts.Host, opts.Kind = c.Onion, "tor"
 			default:
 				opts.Host = f
 			}

@@ -89,6 +89,7 @@ func (p *peer) handle(in session.Inbound) {
 		if tx.SentAt != 0 {
 			at = time.Unix(tx.SentAt, 0)
 		}
+		p.e.recordHistory(id, mid, false, body, p.e.now())
 		p.e.emit(MessageReceived{Peer: id, ID: mid, Text: body, SentAt: at})
 	case wire.TypeAck:
 		a, err := wire.DecodeAck(in.Payload)
@@ -127,12 +128,14 @@ func (p *peer) handle(in session.Inbound) {
 // flushQueue sends every pending message in order (after the HELLO exchange).
 func (p *peer) flushQueue() {
 	p.e.mu.Lock()
-	items := append([]*queued(nil), p.queue...)
+	var items []*queued
+	for _, q := range p.queue {
+		if q.status == StatusPending {
+			items = append(items, q)
+		}
+	}
 	p.e.mu.Unlock()
 	for _, q := range items {
-		if q.status != StatusPending {
-			continue
-		}
 		if err := p.send(q); err != nil {
 			return
 		}
@@ -148,7 +151,9 @@ func (p *peer) send(q *queued) error {
 		return err
 	}
 	p.e.mu.Lock()
-	q.status = StatusSent
+	if q.status == StatusPending {
+		q.status = StatusSent
+	}
 	p.e.mu.Unlock()
 	p.e.emit(MessageStatus{Peer: p.s.Peer(), ID: q.id, Status: StatusSent})
 	return nil

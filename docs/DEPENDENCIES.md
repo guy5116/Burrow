@@ -11,6 +11,8 @@ touch. Additions require asking the user (CLAUDE.md §14). Versions are pinned i
 | `golang.org/x/image` | v0.46.0 | media | WebP decoding, thumbnail scaling (`draw`) | image bytes after the size gates |
 | `golang.org/x/sys` | v0.48.0 | store (now), transport, cmd/* (later) | `flock`/exclusive open, socket options, core-dump limits | OS handles |
 | `github.com/flynn/noise` | v1.1.0 | handshake | Noise XK (small, mature; KAT-tested against its own cacophony vectors) | handshake messages only |
+| `github.com/cretz/bine` | v0.2.0 (frozen) | transport/tor | control a system tor: `ADD_ONION`, SOCKS dialer | tor control port, SOCKS |
+| `golang.org/x/net` (`dns/dnsmessage` only) | v0.59.0 | transport/mdns | building and parsing announcement packets | multicast UDP |
 | `go.uber.org/goleak` | v1.3.0 | tests only | goroutine leak detection | — |
 | `golang.org/x/term` | v0.46.0 | cmd/burrow | no-echo passphrase and invite prompts | the controlling tty |
 | `github.com/BurntSushi/toml` | v1.6.0 | store | `config.toml` | config file only |

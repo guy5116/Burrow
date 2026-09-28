@@ -52,6 +52,20 @@ macOS (`RLIMIT_CORE = 0`); Windows has no equivalent we set.
   profile ACL of `%APPDATA%`; no explicit ACLs are set.
 - One process at a time: `flock` on Unix, an exclusive open on Windows.
 
+## Onion service key
+
+The Tor transport's ed25519 key is generated with `crypto/rand`, stored inside the
+encrypted identity blob (blob version 2) and handed to tor over the control port with
+`ADD_ONION` at startup. Tor runs with a temporary data directory that is deleted on close;
+the key never lands there. Rotating identity therefore also rotates the onion address.
+
+## LAN discovery
+
+mDNS is off by default. When on, an instance announces a random per-session name, its
+port and `nonce || BLAKE2b-256("burrow/1 mdns" || nonce || pubkey)[:16]` every 30 s.
+Recognizing a contact costs one hash per stored contact; nobody is probed. Anyone on the
+LAN learns that some Burrow instance is present, not which one.
+
 ## Reconnect beacons
 
 Automatic reconnects reveal presence to the last known address. Burrow only reconnects after a

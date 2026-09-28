@@ -42,6 +42,10 @@ type Config struct {
 	AutoAcceptFromVerified bool
 	// ChunkDelay slows the receive-side file-writer (debug/tests only; never from config.toml).
 	ChunkDelay time.Duration
+	// MDNS announces this instance on the LAN and dials contacts it recognizes (off by default).
+	MDNS bool
+	// History stores messages encrypted at rest (off by default).
+	History bool
 }
 
 // Contact is a saved peer.

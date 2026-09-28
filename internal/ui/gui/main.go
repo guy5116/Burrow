@@ -44,6 +44,7 @@ func (a *App) buildMain() {
 			id := a.contacts[i].ID
 			a.sel = &id
 			a.ctl.Current = &id
+			a.loadHistory(id)
 			a.renderConversation()
 			a.updateStatus()
 		}
@@ -324,4 +325,18 @@ func (a *App) connectTarget(t core.Target) {
 			a.updateStatus()
 		})
 	}()
+}
+
+// loadHistory prefills a conversation from encrypted history (once, when enabled).
+func (a *App) loadHistory(id core.PeerID) {
+	if !a.cfg.History || len(a.msgs[id]) > 0 {
+		return
+	}
+	hist, err := a.e.History(id, 200)
+	if err != nil {
+		return
+	}
+	for _, h := range hist {
+		a.msgs[id] = append(a.msgs[id], &row{kind: rowText, text: h.Text, mine: h.Mine, status: core.StatusDelivered})
+	}
 }

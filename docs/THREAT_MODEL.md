@@ -39,7 +39,7 @@ invites; the fact that two specific peers talk, and when; partial transfers on d
 - Quantum de-anonymization of recorded handshakes: the initiator's identity and token in
   msg3 are protected only by X25519 (who talked, not what was said).
 - Quantum attacks on authentication in *new* sessions (revisit with ML-DSA in v2).
-- IP exposure to the peer in direct-TCP mode (use Tor, Phase 4).
+- IP exposure to the peer in direct-TCP mode (use the Tor transport to hide it).
 - Encoder fingerprints inside images in `strip` mode (`paranoid` mode removes them).
 - Store rollback from backups resurrecting a consumed single-use invite token.
 - Perfect memory zeroization under Go's GC or inside library objects; secrets in swap.

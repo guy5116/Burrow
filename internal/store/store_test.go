@@ -207,6 +207,9 @@ func TestTamperAndRelpathSwap(t *testing.T) {
 	if _, err := s.LoadIdentity(); !errors.Is(err, ErrBlob) {
 		t.Fatal(err)
 	}
+	if _, err := s.LoadOnionKey(); !errors.Is(err, ErrBlob) {
+		t.Fatal(err)
+	}
 }
 
 func TestHeader(t *testing.T) {
@@ -568,7 +571,7 @@ func TestErrorPaths(t *testing.T) {
 	if err := Recover(dir); err != nil || exists(filepath.Join(dir, oldDir)) {
 		t.Fatal("Recover did not remove store.old", err)
 	}
-	if b, err := s.ReadBlob(IdentityKey); err != nil || len(b) != 33 {
+	if b, err := s.ReadBlob(IdentityKey); err != nil || len(b) != 65 {
 		t.Fatal("store unusable after swap", err)
 	}
 	ents, _ := os.ReadDir(s.Dir())
@@ -638,5 +641,42 @@ func TestDefaultPathsEnv(t *testing.T) {
 	t.Setenv("APPDATA", "")
 	if _, err := DefaultPaths(); err == nil {
 		t.Fatal("expected error without a home directory")
+	}
+}
+
+func TestOnionKeyAndV1Upgrade(t *testing.T) {
+	dir := t.TempDir()
+	s := mustInit(t, dir, pass("pw"))
+	defer s.Close()
+	k1, err := s.LoadOnionKey()
+	if err != nil || len(k1) != 64 {
+		t.Fatal(err)
+	}
+	k2, _ := s.LoadOnionKey()
+	if string(k1) != string(k2) {
+		t.Fatal("onion key not stable")
+	}
+	id, _ := s.LoadIdentity()
+	pub := id.Public()
+	id.Clear()
+	// Downgrade to a v1 blob (no onion seed): identity still loads, onion key is generated and persisted.
+	b, _ := s.ReadBlob(IdentityKey)
+	v1 := append([]byte{identityBlobV1}, b[1:33]...)
+	if err := s.WriteBlob(IdentityKey, v1); err != nil {
+		t.Fatal(err)
+	}
+	id2, err := s.LoadIdentity()
+	if err != nil || id2.Public() != pub {
+		t.Fatal("v1 identity", err)
+	}
+	k3, err := s.LoadOnionKey()
+	if err != nil || string(k3) == string(k1) {
+		t.Fatal("v1 upgrade", err)
+	}
+	if b2, _ := s.ReadBlob(IdentityKey); len(b2) != 65 || b2[0] != identityBlobV2 {
+		t.Fatal("blob not upgraded")
+	}
+	if k4, _ := s.LoadOnionKey(); string(k4) != string(k3) {
+		t.Fatal("upgraded key not persisted")
 	}
 }

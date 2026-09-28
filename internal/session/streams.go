@@ -34,6 +34,7 @@ type stream struct {
 	chunks   uint32
 	next     uint32        // receiver: next expected chunk index
 	queue    chan outFrame // sender/receiver frames for the writer (cap TransferQueueCap)
+	done     chan struct{} // closed when the stream closes; late senders get ErrStreamState
 }
 
 // streamTable is the mutex-guarded per-stream state shared by reader, writer
@@ -79,6 +80,9 @@ func (t *streamTable) wasClosed(id uint16) bool {
 }
 
 func (t *streamTable) close(s *stream) {
+	if _, open := t.open[s.id]; open {
+		close(s.done)
+	}
 	delete(t.open, s.id)
 	t.closed[t.closedPos] = s.id
 	t.closedPos = (t.closedPos + 1) % len(t.closed)
@@ -110,7 +114,8 @@ func (s *Session) OpenStream(size uint64) (uint16, error) {
 	}
 	id := uint16(t.nextID) // #nosec G115 -- checked above
 	t.nextID += 2
-	st := &stream{id: id, outgoing: true, state: stOffered, size: size, chunks: chunksFor(size), queue: make(chan outFrame, wire.TransferQueueCap)}
+	st := &stream{id: id, outgoing: true, state: stOffered, size: size, chunks: chunksFor(size),
+		queue: make(chan outFrame, wire.TransferQueueCap), done: make(chan struct{})}
 	t.open[id] = st
 	return id, nil
 }
@@ -184,18 +189,26 @@ func (s *Session) SendStream(ctx context.Context, id uint16, typ wire.FrameType,
 			return ErrStreamLimit
 		}
 	}
-	q := st.queue
-	if _, stillOpen := t.open[id]; !stillOpen {
-		s.closedQueues[id] = q // terminal frame still has to go out
-	}
-	t.mu.Unlock()
 	f := outFrame{typ: typ, stream: id, payload: append([]byte(nil), payload...)}
-	select {
-	case q <- f:
-	case <-ctx.Done():
-		return ctx.Err()
-	case <-s.closed:
-		return ErrClosed
+	if _, stillOpen := t.open[id]; !stillOpen {
+		// Our own terminal frame (REJECT/RESULT): it goes out on a fresh queue
+		// so that nothing queued behind it on the closed stream can follow.
+		q := make(chan outFrame, 1)
+		q <- f
+		s.closedQueues[id] = q
+		t.mu.Unlock()
+	} else {
+		q := st.queue
+		t.mu.Unlock()
+		select {
+		case q <- f:
+		case <-st.done:
+			return ErrStreamState // closed while we waited (peer cancelled/rejected)
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-s.closed:
+			return ErrClosed
+		}
 	}
 	select {
 	case s.transferWake <- struct{}{}:
@@ -320,15 +333,12 @@ func (s *Session) onStreamFrame(in wire.Inner) error {
 		if _, err := wire.DecodeImgCancel(in.Payload); err != nil {
 			return ErrProtocol
 		}
-		// Reply with exactly one IMG_CANCEL and close.
+		// Reply with exactly one IMG_CANCEL and close. The echo goes out on a
+		// fresh queue; anything still queued on the stream is never sent.
 		t.close(st)
-		s.closedQueues[st.id] = st.queue
-		echo := outFrame{typ: wire.TypeImgCancel, stream: st.id, payload: wire.AppendImgCancel(nil, wire.CancelUser)}
-		select {
-		case st.queue <- echo:
-		default:
-			return ErrProtocol // queue stuck: the writer is stalled
-		}
+		q := make(chan outFrame, 1)
+		q <- outFrame{typ: wire.TypeImgCancel, stream: st.id, payload: wire.AppendImgCancel(nil, wire.CancelUser)}
+		s.closedQueues[st.id] = q
 		select {
 		case s.transferWake <- struct{}{}:
 		default:
@@ -372,7 +382,8 @@ func (s *Session) onOffer(in wire.Inner, now time.Time) error {
 		}
 		return nil
 	}
-	st := &stream{id: in.Stream, outgoing: false, state: stOffered, size: o.Size, chunks: chunksFor(o.Size), queue: make(chan outFrame, wire.TransferQueueCap)}
+	st := &stream{id: in.Stream, outgoing: false, state: stOffered, size: o.Size, chunks: chunksFor(o.Size),
+		queue: make(chan outFrame, wire.TransferQueueCap), done: make(chan struct{})}
 	t.open[in.Stream] = st
 	return s.deliverLocked(in)
 }

@@ -35,7 +35,7 @@ func newApp(t *testing.T) *App {
 	a.cfg.ListenPort = 0
 	a.win = a.fa.NewWindow("test")
 	a.st = st
-	e, err := core.New(core.Config{ListenAddr: "127.0.0.1:0", DataDir: dir}, st, core.Transports("127.0.0.1:0"), a.log)
+	e, err := core.New(core.Config{ListenAddr: "127.0.0.1:0", DataDir: dir}, st, core.Transports("127.0.0.1:0", nil), a.log)
 	if err != nil {
 		t.Fatal(err)
 	}

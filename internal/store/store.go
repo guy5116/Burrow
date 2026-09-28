@@ -1,6 +1,7 @@
 package store
 
 import (
+	"crypto/ed25519"
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
@@ -100,7 +101,12 @@ func Init(dataDir string, passphrase []byte, opts Options) (*Store, error) {
 		return nil, err
 	}
 	defer id.Clear()
-	idBlob := encodeIdentity(id)
+	onionSeed, err := secret.Random(onionSeedLen)
+	if err != nil {
+		return nil, err
+	}
+	defer onionSeed.Clear()
+	idBlob := encodeIdentity(id, onionSeed.Bytes())
 	defer secret.Wipe(idBlob)
 
 	tmp := filepath.Join(dataDir, "store.init")
@@ -324,11 +330,17 @@ func (s *Store) ListBlobs(subdir string) ([]string, error) {
 	return out, nil
 }
 
-// Identity blob: version u8 = 1 || scalar[32]. Phase 4 adds the onion key.
-const identityBlobVersion = 1
+// Identity blob: version u8 = 2 || scalar[32] || onion seed[32]. Version 1
+// (Phase 0–3 stores) lacks the onion seed and is upgraded on first open.
+const (
+	identityBlobV1 = 1
+	identityBlobV2 = 2
+	onionSeedLen   = 32
+)
 
-func encodeIdentity(id *identity.Identity) []byte {
-	return append([]byte{identityBlobVersion}, id.Scalar()...)
+func encodeIdentity(id *identity.Identity, onionSeed []byte) []byte {
+	b := append([]byte{identityBlobV2}, id.Scalar()...)
+	return append(b, onionSeed...)
 }
 
 // LoadIdentity decrypts and returns the long-term identity.
@@ -338,10 +350,39 @@ func (s *Store) LoadIdentity() (*identity.Identity, error) {
 		return nil, err
 	}
 	defer secret.Wipe(b)
-	if len(b) != 33 || b[0] != identityBlobVersion {
-		return nil, ErrBlob
+	switch {
+	case len(b) == 33 && b[0] == identityBlobV1, len(b) == 65 && b[0] == identityBlobV2:
+		return identity.FromScalar(append([]byte(nil), b[1:33]...))
 	}
-	return identity.FromScalar(append([]byte(nil), b[1:]...))
+	return nil, ErrBlob
+}
+
+// LoadOnionKey returns the ed25519 private key of the onion service, generating
+// and persisting one (upgrading a v1 identity blob) when absent.
+func (s *Store) LoadOnionKey() (ed25519.PrivateKey, error) {
+	b, err := s.ReadBlob(IdentityKey)
+	if err != nil {
+		return nil, err
+	}
+	defer secret.Wipe(b)
+	switch {
+	case len(b) == 65 && b[0] == identityBlobV2:
+		return ed25519.NewKeyFromSeed(b[33:]), nil
+	case len(b) == 33 && b[0] == identityBlobV1:
+		seed, err := secret.Random(onionSeedLen)
+		if err != nil {
+			return nil, err
+		}
+		defer seed.Clear()
+		nb := append([]byte{identityBlobV2}, b[1:33]...)
+		nb = append(nb, seed.Bytes()...)
+		defer secret.Wipe(nb)
+		if err := s.WriteBlob(IdentityKey, nb); err != nil {
+			return nil, err
+		}
+		return ed25519.NewKeyFromSeed(seed.Bytes()), nil
+	}
+	return nil, ErrBlob
 }
 
 // swapStep is a test hook invoked before each step of the directory swap;

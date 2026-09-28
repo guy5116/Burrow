@@ -259,6 +259,7 @@ func (e *Engine) SendText(id PeerID, msg string) (MsgID, error) {
 		e.orphanQueues[id] = append(e.orphanQueues[id], q)
 	}
 	e.mu.Unlock()
+	e.recordHistory(id, q.id, true, clean, e.now())
 	e.emit(MessageStatus{Peer: id, ID: q.id, Status: StatusPending})
 	if p != nil {
 		go func() { _ = p.send(q) }()

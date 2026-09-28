@@ -25,11 +25,14 @@ type Config struct {
 	ImageDir               string `toml:"image_dir"`
 	MaxImageMiB            uint32 `toml:"max_image_mib"`
 	InviteHost             string `toml:"invite_host"`
+	Transport              string `toml:"transport"` // tcp | tor | both
+	TorExe                 string `toml:"tor_exe"`
+	History                bool   `toml:"history"`
 }
 
 // DefaultConfig returns the shipped defaults.
 func DefaultConfig() Config {
-	return Config{ListenPort: 47337, Timestamps: true, AutoReconnect: true, MaxImageMiB: 25}
+	return Config{ListenPort: 47337, Timestamps: true, AutoReconnect: true, MaxImageMiB: 25, Transport: "tcp"}
 }
 
 // ConfigFile is the file name under the config directory.
@@ -94,6 +97,12 @@ func (c *Config) Get(key string) (string, error) {
 		return strconv.Itoa(int(c.MaxImageMiB)), nil
 	case "invite_host":
 		return c.InviteHost, nil
+	case "transport":
+		return c.Transport, nil
+	case "tor_exe":
+		return c.TorExe, nil
+	case "history":
+		return strconv.FormatBool(c.History), nil
 	}
 	return "", ErrConfigKey
 }
@@ -144,6 +153,15 @@ func (c *Config) Set(key, value string) error {
 		c.MaxImageMiB = uint32(n)
 	case "invite_host":
 		c.InviteHost = value
+	case "transport":
+		if value != "tcp" && value != "tor" && value != "both" {
+			return errors.New("store: transport must be tcp, tor or both")
+		}
+		c.Transport = value
+	case "tor_exe":
+		c.TorExe = value
+	case "history":
+		return parseBool(&c.History)
 	default:
 		return ErrConfigKey
 	}
@@ -153,5 +171,6 @@ func (c *Config) Set(key, value string) error {
 // Keys lists the config keys in display order.
 func ConfigKeys() []string {
 	return []string{"listen_port", "display_name", "typing", "timestamps", "auto_reconnect",
-		"auto_accept_from_verified", "paranoid_images", "mdns", "open_links", "image_dir", "max_image_mib", "invite_host"}
+		"auto_accept_from_verified", "paranoid_images", "mdns", "open_links", "image_dir", "max_image_mib", "invite_host",
+		"transport", "tor_exe", "history"}
 }

@@ -9,6 +9,7 @@ import (
 	"image"
 	"net/url"
 	"strconv"
+	"strings"
 	"time"
 
 	"fyne.io/fyne/v2"
@@ -30,6 +31,9 @@ func parseURL(s string) (*url.URL, error) { return url.Parse(s) }
 func (a *App) showInviteDialog() {
 	host := widget.NewEntry()
 	host.SetText(a.cfg.InviteHost)
+	if onion := a.e.OnionAddress(); onion != "" {
+		host.SetText(onion)
+	}
 	host.PlaceHolder = "address peers dial (IP, hostname, .onion)"
 	ttl := widget.NewSelect([]string{"15m", "1h", "24h"}, nil)
 	ttl.SetSelected("1h")
@@ -40,7 +44,11 @@ func (a *App) showInviteDialog() {
 			return
 		}
 		d, _ := time.ParseDuration(ttl.Selected)
-		inv, err := a.e.CreateInvite(core.InviteOptions{Host: host.Text, TTL: d, MultiUse: multi.Checked})
+		opts := core.InviteOptions{Host: host.Text, TTL: d, MultiUse: multi.Checked}
+		if strings.HasSuffix(host.Text, ".onion") {
+			opts.Kind = "tor"
+		}
+		inv, err := a.e.CreateInvite(opts)
 		if err != nil {
 			a.errDialog(err)
 			return
@@ -133,12 +141,17 @@ func (a *App) showSettingsDialog() {
 	links.Checked = c.OpenLinks
 	reconnect := widget.NewCheck("Auto-reconnect to contacts", nil)
 	reconnect.Checked = c.AutoReconnect
+	transport := widget.NewSelect([]string{"tcp", "tor", "both"}, nil)
+	transport.SetSelected(c.Transport)
+	history := widget.NewCheck("Keep encrypted message history", nil)
+	history.Checked = c.History
 	pass := widget.NewButton("Change passphrase…", a.showPassphraseDialog)
 	items := []*widget.FormItem{
 		widget.NewFormItem("Listen port", port), widget.NewFormItem("Display name", name), widget.NewFormItem("Invite host", host),
 		widget.NewFormItem("Image folder", imgDir), widget.NewFormItem("", typing), widget.NewFormItem("", stamps),
 		widget.NewFormItem("", auto), widget.NewFormItem("", paranoid), widget.NewFormItem("", mdns), widget.NewFormItem("", links),
-		widget.NewFormItem("", reconnect), widget.NewFormItem("", pass),
+		widget.NewFormItem("", reconnect), widget.NewFormItem("Transport", transport), widget.NewFormItem("", history),
+		widget.NewFormItem("", pass),
 	}
 	dialog.ShowForm("Settings", "Save", "Cancel", items, func(ok bool) {
 		if !ok {
@@ -148,7 +161,8 @@ func (a *App) showSettingsDialog() {
 		for k, v := range map[string]string{"listen_port": port.Text, "display_name": name.Text, "invite_host": host.Text, "image_dir": imgDir.Text,
 			"typing": strconv.FormatBool(typing.Checked), "timestamps": strconv.FormatBool(stamps.Checked),
 			"auto_accept_from_verified": strconv.FormatBool(auto.Checked), "paranoid_images": strconv.FormatBool(paranoid.Checked),
-			"mdns": strconv.FormatBool(mdns.Checked), "open_links": strconv.FormatBool(links.Checked), "auto_reconnect": strconv.FormatBool(reconnect.Checked)} {
+			"mdns": strconv.FormatBool(mdns.Checked), "open_links": strconv.FormatBool(links.Checked), "auto_reconnect": strconv.FormatBool(reconnect.Checked),
+			"transport": transport.Selected, "history": strconv.FormatBool(history.Checked)} {
 			if err := n.Set(k, v); err != nil {
 				a.errDialog(err)
 				return

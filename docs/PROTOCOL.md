@@ -147,7 +147,13 @@ IP literal; for kind 2 a 56-character v3 `.onion`), and the checksum must match.
   (31 bytes). Accepted bounds: `1 ≤ t ≤ 16`, `8 MiB ≤ m ≤ 1 GiB`, `1 ≤ p ≤ 16`.
 - Blob: `"BRWS" || version u8 = 1 || nonce [24] || XChaCha20-Poly1305(file_key, nonce, ad, plaintext)`,
   `ad = "BRWS" || version || nonce || relpath`, `file_key = HKDF-Expand(sha256, master, "burrow/1 store " || relpath, 32)`.
-- Identity blob plaintext: `version u8 = 1 || scalar [32]`.
+- Identity blob plaintext: `version u8 = 2 || scalar [32] || onion_seed [32]` (ed25519 seed for
+  the Tor onion service). Version 1 (`version u8 = 1 || scalar [32]`) is accepted and upgraded.
+- History (optional): `history/index` holds `{next, count[]}`; `history/seg-N` holds a JSON
+  array of `{p, i, m, t, a}` records (peer hex, msg id, mine, text, unix seconds).
+- mDNS announcement (opt-in): PTR `_burrow._tcp.local` → `<random>._burrow._tcp.local`, SRV
+  with the port, TXT `n=<nonce hex>` and `t=<tag hex>` where
+  `tag = BLAKE2b-256("burrow/1 mdns" || nonce || pubkey)[:16]`.
 
 ## 9. Constants
 

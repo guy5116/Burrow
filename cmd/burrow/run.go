@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/guy5116/burrow/internal/core"
+	"github.com/guy5116/burrow/internal/store"
 	"github.com/guy5116/burrow/internal/ui/common"
 	"github.com/guy5116/burrow/internal/ui/tui"
 )
@@ -65,7 +66,11 @@ func (a *app) cmdRun(ctx context.Context, cmd string, args []string, stdin io.Re
 	if *listen != "" {
 		addr = *listen
 	}
-	e, err := core.New(ecfg, st, core.Transports(addr), a.log)
+	trs, err := a.transports(st, addr)
+	if err != nil {
+		return exitErr(stderr, err)
+	}
+	e, err := core.New(ecfg, st, trs, a.log)
 	if err != nil {
 		return exitErr(stderr, err)
 	}
@@ -85,7 +90,11 @@ func (a *app) cmdRun(ctx context.Context, cmd string, args []string, stdin io.Re
 		}
 	}
 	inviteHost, _ := a.inviteHost(*host)
+	if a.cfg.Transport == "tor" {
+		inviteHost = e.OnionAddress()
+	}
 	ctl := common.NewController(e, inviteHost)
+	ctl.Onion = e.OnionAddress()
 	var code int
 	if a.plain {
 		code = runPlain(ctx, ctl, target, a.json, stdin, stdout, stderr)
@@ -105,4 +114,20 @@ func targetOf(s string) core.Target {
 		return core.Target{Invite: s}
 	}
 	return core.Target{Name: s}
+}
+
+// transports builds the transport set from config.toml: tcp (default), tor, or both.
+func (a *app) transports(st *store.Store, listenAddr string) ([]core.Transport, error) {
+	var torOpts *core.TorOptions
+	if a.cfg.Transport == "tor" || a.cfg.Transport == "both" {
+		key, err := st.LoadOnionKey()
+		if err != nil {
+			return nil, err
+		}
+		torOpts = &core.TorOptions{Key: key, Port: a.cfg.ListenPort, Exe: a.cfg.TorExe}
+	}
+	if a.cfg.Transport == "tor" {
+		listenAddr = ""
+	}
+	return core.Transports(listenAddr, torOpts), nil
 }

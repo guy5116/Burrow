@@ -21,15 +21,8 @@ import (
 	"github.com/guy5116/burrow/internal/store"
 	"github.com/guy5116/burrow/internal/text"
 	"github.com/guy5116/burrow/internal/transport"
-	"github.com/guy5116/burrow/internal/transport/tcp"
 	"github.com/guy5116/burrow/internal/wire"
 )
-
-// Transports returns the transports for a listen address (":port" or
-// "host:port"); UIs pass the result to New without importing transport.
-func Transports(listenAddr string) []transport.Transport {
-	return []transport.Transport{tcp.New(listenAddr)}
-}
 
 // Errors returned by the API.
 var (
@@ -82,6 +75,8 @@ type Engine struct {
 	orphanQueues map[PeerID][]*queued
 	reconnects   map[PeerID]context.CancelFunc
 	transfers    map[TransferID]*transfer
+	histMu       sync.Mutex
+	mdnsSeen     map[[16]byte]bool
 }
 
 // New builds an engine over an unlocked store and the given transports.
@@ -151,6 +146,9 @@ func (e *Engine) Start(ctx context.Context) error {
 	e.started = true
 	e.listeners = listeners
 	e.mu.Unlock()
+	if e.cfg.MDNS {
+		e.runMDNS(e.listenPortOf())
+	}
 	<-e.ctx.Done()
 	for _, l := range listeners {
 		_ = l.Close()
@@ -170,6 +168,11 @@ func (e *Engine) Start(ctx context.Context) error {
 	wg.Wait()
 	e.sessCancel()
 	e.wg.Wait()
+	for _, tr := range e.trs {
+		if c, ok := tr.(interface{ Close() error }); ok {
+			_ = c.Close()
+		}
+	}
 	e.id.Clear()
 	close(e.done)
 	return nil

@@ -12,7 +12,7 @@ func TestConfig(t *testing.T) {
 		t.Fatal(c, err)
 	}
 	// Defaults audit (§17).
-	if c.Typing || !c.Timestamps || c.AutoAcceptFromVerified || c.MDNS || c.ParanoidImages || c.OpenLinks || c.DisplayName != "" || c.ListenPort != 47337 {
+	if c.Typing || !c.Timestamps || c.AutoAcceptFromVerified || c.MDNS || c.ParanoidImages || c.OpenLinks || c.DisplayName != "" || c.ListenPort != 47337 || c.History || c.Transport != "tcp" {
 		t.Fatalf("defaults %+v", c)
 	}
 	for _, k := range ConfigKeys() {
@@ -26,7 +26,7 @@ func TestConfig(t *testing.T) {
 	if err := c.Set("nope", "1"); !errors.Is(err, ErrConfigKey) {
 		t.Fatal(err)
 	}
-	for _, kv := range [][2]string{{"listen_port", "0"}, {"listen_port", "x"}, {"typing", "maybe"}, {"max_image_mib", "0"}, {"display_name", string(make([]byte, 33))}} {
+	for _, kv := range [][2]string{{"listen_port", "0"}, {"listen_port", "x"}, {"typing", "maybe"}, {"max_image_mib", "0"}, {"display_name", string(make([]byte, 33))}, {"transport", "udp"}, {"history", "sometimes"}} {
 		if err := c.Set(kv[0], kv[1]); err == nil {
 			t.Fatalf("Set(%s,%q) accepted", kv[0], kv[1])
 		}

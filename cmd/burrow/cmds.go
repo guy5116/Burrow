@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"io"
 	"net"
-	"os"
 	"path/filepath"
 	"strings"
 	"time"
@@ -137,8 +136,12 @@ func (a *app) cmdInvite(ctx context.Context, args []string, stdin io.Reader, std
 	multi := fs.Bool("multi-use", false, "allow up to 64 peers")
 	qr := fs.Bool("qr", false, "also print a QR code")
 	host := fs.String("host", "", "address peers should dial (IP literal, hostname, .onion)")
+	torFlag := fs.Bool("tor", false, "onion invite (only from inside a running `burrow listen` with transport=tor: use /invite there)")
 	if err := fs.Parse(args); err != nil {
 		return 2
+	}
+	if *torFlag {
+		return exitErr(stderr, errors.New("an onion address exists only while tor runs: start `burrow listen` and type /invite"))
 	}
 	h, err := a.inviteHost(*host)
 	if err != nil {
@@ -173,7 +176,8 @@ func (a *app) engineConfig() core.Config {
 	return core.Config{ListenPort: a.cfg.ListenPort, DisplayName: a.cfg.DisplayName, Typing: a.cfg.Typing,
 		NoTimestamp: !a.cfg.Timestamps, AutoReconnect: a.cfg.AutoReconnect,
 		DataDir: a.paths.Data, ImageDir: a.cfg.ImageDir, MaxImage: uint64(a.cfg.MaxImageMiB) << 20,
-		Paranoid: a.cfg.ParanoidImages, AutoAcceptFromVerified: a.cfg.AutoAcceptFromVerified}
+		Paranoid: a.cfg.ParanoidImages, AutoAcceptFromVerified: a.cfg.AutoAcceptFromVerified,
+		MDNS: a.cfg.MDNS, History: a.cfg.History}
 }
 
 func (a *app) cmdContacts(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
@@ -298,24 +302,13 @@ func (a *app) cmdBurn(stdin io.Reader, stdout, stderr io.Writer) int {
 		return exitErr(stderr, err)
 	}
 	defer st.Close()
-	n := 0
-	for _, sub := range []string{"partials", "history"} {
-		blobs, err := st.ListBlobs(sub)
-		if err != nil {
-			return exitErr(stderr, err)
-		}
-		for _, b := range blobs {
-			if err := st.DeleteBlob(b); err != nil {
-				return exitErr(stderr, err)
-			}
-			n++
-		}
+	e, err := core.New(a.engineConfig(), st, nil, a.log)
+	if err != nil {
+		return exitErr(stderr, err)
 	}
-	parts, _ := filepath.Glob(filepath.Join(a.paths.Data, "partials", "*.part"))
-	for _, p := range parts {
-		if err := os.Remove(p); err == nil {
-			n++
-		}
+	n, err := e.Burn()
+	if err != nil {
+		return exitErr(stderr, err)
 	}
 	fmt.Fprintf(stdout, "burned %d files\n", n)
 	return 0
