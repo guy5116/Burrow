@@ -20,8 +20,15 @@ import (
 	"github.com/guy5116/burrow/internal/store"
 	"github.com/guy5116/burrow/internal/text"
 	"github.com/guy5116/burrow/internal/transport"
+	"github.com/guy5116/burrow/internal/transport/tcp"
 	"github.com/guy5116/burrow/internal/wire"
 )
+
+// Transports returns the transports for a listen address (":port" or
+// "host:port"); UIs pass the result to New without importing transport.
+func Transports(listenAddr string) []transport.Transport {
+	return []transport.Transport{tcp.New(listenAddr)}
+}
 
 // Errors returned by the API.
 var (
@@ -118,6 +125,7 @@ func (e *Engine) Identity() Identity {
 // BYE to established peers (best effort), listeners closed, secrets cleared.
 func (e *Engine) Start(ctx context.Context) error {
 	e.ctx, e.cancel = context.WithCancel(ctx)
+	defer e.cancel()
 	e.sessCtx, e.sessCancel = context.WithCancel(context.Background())
 	var listeners []transport.Listener
 	for kind, tr := range e.trs {

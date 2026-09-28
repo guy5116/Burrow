@@ -165,7 +165,7 @@ func TestReplayedMsg1(t *testing.T) {
 }
 
 // sendRaw feeds bytes to a responder and returns its error and bytes written.
-func sendRaw(t *testing.T, r *identity.Identity, raw []byte) (error, int64) {
+func sendRaw(t *testing.T, r *identity.Identity, raw []byte) (int64, error) {
 	t.Helper()
 	ci, cr := net.Pipe()
 	rc := &countConn{Conn: cr}
@@ -174,18 +174,18 @@ func sendRaw(t *testing.T, r *identity.Identity, raw []byte) (error, int64) {
 	_, _ = ci.Write(raw)
 	err := <-done
 	_ = ci.Close()
-	return err, rc.written.Load()
+	return rc.written.Load(), err
 }
 
 func TestBadMsg1(t *testing.T) {
 	r := newID(t)
 	// wrong length prefix
 	hdr := []byte{0x04, 0xcf} // 1231
-	err, n := sendRaw(t, r, append(hdr, make([]byte, 1231)...))
+	n, err := sendRaw(t, r, append(hdr, make([]byte, 1231)...))
 	if !errors.Is(err, ErrLength) || n != 0 {
 		t.Fatal(err, n)
 	}
-	err, n = sendRaw(t, r, []byte{0xff, 0xff})
+	n, err = sendRaw(t, r, []byte{0xff, 0xff})
 	if !errors.Is(err, ErrLength) || n != 0 {
 		t.Fatal(err, n)
 	}
@@ -193,7 +193,7 @@ func TestBadMsg1(t *testing.T) {
 	raw := make([]byte, wire.HSLenPrefix+wire.HS1Len)
 	binary.BigEndian.PutUint16(raw, wire.HS1Len)
 	_, _ = rand.Read(raw[2:])
-	err, n = sendRaw(t, r, raw)
+	n, err = sendRaw(t, r, raw)
 	var he *Error
 	if !errors.As(err, &he) || he.Stage != "msg1" || errors.Is(err, ErrLength) || n != 0 {
 		t.Fatal(err, n)
@@ -215,7 +215,7 @@ func TestInvalidKEMKey(t *testing.T) {
 		t.Fatal(err)
 	}
 	binary.BigEndian.PutUint16(msg1, wire.HS1Len)
-	err, n := sendRaw(t, r, msg1)
+	n, err := sendRaw(t, r, msg1)
 	if !errors.Is(err, ErrBadKEM) || n != 0 {
 		t.Fatal(err, n)
 	}

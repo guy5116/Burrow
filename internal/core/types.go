@@ -72,9 +72,11 @@ type Invite struct {
 }
 
 // Target is what Connect dials: either an invite string or a saved contact.
+// Name is a UI-level contact name resolved by the UI before Connect.
 type Target struct {
 	Invite  string
 	Contact *PeerID
+	Name    string
 }
 
 // Message status values.

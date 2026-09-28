@@ -3,6 +3,7 @@ package core
 import (
 	"context"
 	"errors"
+	"net"
 	"strings"
 	"time"
 
@@ -138,6 +139,12 @@ func (e *Engine) CreateInvite(opts InviteOptions) (Invite, error) {
 	}
 	if opts.Port == 0 {
 		opts.Port = e.cfg.listenPort()
+		for _, a := range e.ListenAddrs() { // a bound listener (e.g. port 0 in tests) wins
+			if ta, ok := a.(*net.TCPAddr); ok && ta.Port > 0 {
+				opts.Port = uint16(ta.Port) // #nosec G115 -- port range
+				break
+			}
+		}
 	}
 	if opts.Kind == "" {
 		opts.Kind = transport.KindTCP

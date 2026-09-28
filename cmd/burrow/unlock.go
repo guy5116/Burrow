@@ -1,5 +1,3 @@
-//go:build cli_wip
-
 package main
 
 import (
@@ -27,7 +25,7 @@ func readSecret(prompt string, stdin io.Reader, stderr io.Writer, allowStdin boo
 		return b, err
 	}
 	if tty, err := os.OpenFile(ttyPath, os.O_RDWR, 0); err == nil {
-		defer tty.Close()
+		defer func() { _ = tty.Close() }()
 		fmt.Fprint(tty, prompt)
 		b, err := term.ReadPassword(int(tty.Fd()))
 		fmt.Fprintln(tty)

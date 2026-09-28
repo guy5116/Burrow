@@ -28,6 +28,7 @@ linters:
             - "!**/internal/session/**"
             - "!**/internal/store/**"
             - "!**/internal/media/**"
+            - "!**/internal/testpeer/**" # test-only independent reimplementation
           deny:
             - pkg: "golang.org/x/crypto"
               desc: "x/crypto only in identity, invite, handshake, session, store, media (CLAUDE.md §2.2)"
@@ -74,6 +75,11 @@ linters:
               desc: "never on the wire path (§1.3)"
             - pkg: "math/rand"
               desc: "crypto/rand only (§1.3)"
+    errcheck:
+      exclude-functions:
+        - fmt.Fprint
+        - fmt.Fprintf
+        - fmt.Fprintln
     gosec:
       excludes:
         - G304 # file paths are ours, validated in store

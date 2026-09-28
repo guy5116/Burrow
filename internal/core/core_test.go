@@ -194,7 +194,7 @@ func TestInviteFlowTextAckTyping(t *testing.T) {
 		t.Fatal("single-use invite not consumed")
 	}
 	// Text with status transitions and ACK.
-	mid, err := b.e.SendText(a.id(), "hello  ‮ world")
+	mid, err := b.e.SendText(a.id(), "hello  \u202E world")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -226,7 +226,7 @@ func TestInviteFlowTextAckTyping(t *testing.T) {
 		t.Fatal(err)
 	}
 	b.wait(t, "PeerVerified", isType[PeerVerified])
-	if err := b.e.RenameContact(a.id(), " Al‍ice \n"); err != nil {
+	if err := b.e.RenameContact(a.id(), " Al\u200Dice \n"); err != nil {
 		t.Fatal(err)
 	}
 	if c, _ := b.e.Contact(a.id()); c.Nickname != "Alice" || !c.Verified {
@@ -417,7 +417,7 @@ func TestSentRevertsToPendingAndResend(t *testing.T) {
 	inv := a.invite(t, false)
 	parsed, _ := invite.Parse(inv.String)
 	dial := func() *testpeer.Peer {
-		conn, err := net.Dial("tcp", net.JoinHostPort("127.0.0.1", itoa(a.port)))
+		conn, err := (&net.Dialer{}).DialContext(context.Background(), "tcp", net.JoinHostPort("127.0.0.1", itoa(a.port)))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -632,7 +632,7 @@ func TestAutoReconnect(t *testing.T) {
 func TestFailureRateLimit(t *testing.T) {
 	a := newNode(t, Config{})
 	for i := 0; i < wire.TCPFailuresPerMinute; i++ {
-		conn, err := net.Dial("tcp", net.JoinHostPort("127.0.0.1", itoa(a.port)))
+		conn, err := (&net.Dialer{}).DialContext(context.Background(), "tcp", net.JoinHostPort("127.0.0.1", itoa(a.port)))
 		if err != nil {
 			t.Fatal(err)
 		}

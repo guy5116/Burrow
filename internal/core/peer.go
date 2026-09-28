@@ -183,7 +183,9 @@ func (p *peer) onClosed() {
 	if known {
 		addrs = c.Addrs
 	}
-	replaced := p.replaced
+	// A BYE "replaced" from the peer means a newer session exists (ours or theirs): not a disconnect.
+	var be *session.ByeError
+	replaced := p.replaced || (errors.As(err, &be) && be.Reason == wire.ByeReplaced)
 	e.mu.Unlock()
 	for _, mid := range reverted {
 		e.emit(MessageStatus{Peer: id, ID: mid, Status: StatusPending})

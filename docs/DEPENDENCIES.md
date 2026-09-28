@@ -10,7 +10,13 @@ touch. Additions require asking the user (CLAUDE.md §14). Versions are pinned i
 | `golang.org/x/text` | v0.42.0 | text | NFKC normalization, case folding | peer strings (sanitized) |
 | `golang.org/x/sys` | v0.48.0 | store (now), transport, cmd/* (later) | `flock`/exclusive open, socket options, core-dump limits | OS handles |
 | `github.com/flynn/noise` | v1.1.0 | handshake | Noise XK (small, mature; KAT-tested against its own cacophony vectors) | handshake messages only |
-| `go.uber.org/goleak` | v1.3.0 | tests only (Phase 1) | goroutine leak detection | — |
+| `go.uber.org/goleak` | v1.3.0 | tests only | goroutine leak detection | — |
+| `golang.org/x/term` | v0.46.0 | cmd/burrow | no-echo passphrase and invite prompts | the controlling tty |
+| `github.com/BurntSushi/toml` | v1.6.0 | store | `config.toml` | config file only |
+| `charm.land/bubbletea/v2` | v2.0.10 | ui/tui | TUI framework (v2 moved to `charm.land`) | terminal |
+| `charm.land/bubbles/v2` | v2.2.1 | ui/tui | text input, viewport. Transitively pulls `github.com/atotto/clipboard` (pure Go; execs the platform clipboard tool on ctrl+v only) | terminal, clipboard on user action |
+| `charm.land/lipgloss/v2` | v2.0.6 | ui/tui | styling | terminal |
+| `github.com/skip2/go-qrcode` | v0.0.0-2020 (frozen) | cmd/burrow | `id --qr`, `invite --qr` | stdout |
 
 Planned (allowlisted, not yet imported): `golang.org/x/image` (WebP decode, Phase 2),
 `golang.org/x/term` (no-echo prompts, Phase 1), `golang.org/x/net/dns/dnsmessage` (mDNS,

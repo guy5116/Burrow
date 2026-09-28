@@ -24,7 +24,7 @@ func Run(t *testing.T, tr transport.Transport, addrFor func(net.Addr) transport.
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer ln.Close()
+	defer func() { _ = ln.Close() }()
 	addr := addrFor(ln.Addr())
 
 	t.Run("dial and exchange", func(t *testing.T) {
@@ -42,12 +42,12 @@ func Run(t *testing.T, tr transport.Transport, addrFor func(net.Addr) transport.
 		if err != nil {
 			t.Fatal(err)
 		}
-		defer c.Close()
+		defer func() { _ = c.Close() }()
 		s := <-accepted
 		if s == nil {
 			t.Fatal("accept failed")
 		}
-		defer s.Close()
+		defer func() { _ = s.Close() }()
 		k1 := tr.RateKey(s.RemoteAddr())
 		if k2 := tr.RateKey(s.RemoteAddr()); k1 != k2 {
 			t.Fatal("RateKey not deterministic")
@@ -66,9 +66,10 @@ func Run(t *testing.T, tr transport.Transport, addrFor func(net.Addr) transport.
 		}
 		// Deadlines are honored.
 		_ = c.SetReadDeadline(time.Now().Add(50 * time.Millisecond))
+		var ne net.Error
 		if _, err := c.Read(got); err == nil {
 			t.Fatal("expected deadline error")
-		} else if ne, ok := err.(net.Error); !ok || !ne.Timeout() {
+		} else if !errors.As(err, &ne) || !ne.Timeout() {
 			t.Fatalf("not a timeout: %v", err)
 		}
 		// Close is observed by the other side.

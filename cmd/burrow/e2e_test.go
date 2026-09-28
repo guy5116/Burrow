@@ -1,0 +1,207 @@
+package main
+
+import (
+	"bufio"
+	"context"
+	"encoding/json"
+	"io"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+)
+
+// proc is one `burrow --plain --json` child process.
+type proc struct {
+	t      *testing.T
+	cmd    *exec.Cmd
+	stdin  io.WriteCloser
+	mu     sync.Mutex
+	events []map[string]any
+	cond   *sync.Cond
+	home   string
+}
+
+var binPath string
+
+func TestMain(m *testing.M) {
+	dir, err := os.MkdirTemp("", "burrow-e2e")
+	if err != nil {
+		panic(err)
+	}
+	binPath = filepath.Join(dir, "burrow")
+	if out, err := exec.CommandContext(context.Background(), "go", "build", "-o", binPath, ".").CombinedOutput(); err != nil {
+		panic(string(out))
+	}
+	code := m.Run()
+	_ = os.RemoveAll(dir)
+	os.Exit(code)
+}
+
+func newProc(t *testing.T, home string, args ...string) *proc {
+	t.Helper()
+	if home == "" {
+		home = t.TempDir()
+		out, err := exec.CommandContext(context.Background(), binPath, "--config", home, "--data", home, "init", "--insecure-no-passphrase").CombinedOutput()
+		if err != nil {
+			t.Fatalf("init: %v\n%s", err, out)
+		}
+	}
+	full := append([]string{"--plain", "--json", "--config", home, "--data", home}, args...)
+	cmd := exec.CommandContext(context.Background(), binPath, full...)
+	cmd.Stderr = os.Stderr
+	stdin, _ := cmd.StdinPipe()
+	stdout, _ := cmd.StdoutPipe()
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	p := &proc{t: t, cmd: cmd, stdin: stdin, home: home}
+	p.cond = sync.NewCond(&p.mu)
+	go func() {
+		sc := bufio.NewScanner(stdout)
+		for sc.Scan() {
+			var m map[string]any
+			if json.Unmarshal(sc.Bytes(), &m) != nil {
+				continue
+			}
+			p.mu.Lock()
+			p.events = append(p.events, m)
+			p.cond.Broadcast()
+			p.mu.Unlock()
+		}
+	}()
+	t.Cleanup(func() { p.kill() })
+	return p
+}
+
+func (p *proc) kill() {
+	if p.cmd.Process != nil {
+		_ = p.cmd.Process.Kill()
+		_, _ = p.cmd.Process.Wait()
+	}
+}
+
+func (p *proc) send(line string) {
+	if _, err := io.WriteString(p.stdin, line+"\n"); err != nil {
+		p.t.Fatal(err)
+	}
+}
+
+// wait blocks until an event matching pred appears (searching from the start).
+func (p *proc) wait(what string, pred func(map[string]any) bool) map[string]any {
+	p.t.Helper()
+	deadline := time.Now().Add(20 * time.Second)
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for {
+		for _, ev := range p.events {
+			if pred(ev) {
+				return ev
+			}
+		}
+		if time.Now().After(deadline) {
+			var names []string
+			for _, ev := range p.events {
+				names = append(names, ev["event"].(string))
+			}
+			p.t.Fatalf("timeout waiting for %s; events: %s", what, strings.Join(names, " "))
+		}
+		timer := time.AfterFunc(100*time.Millisecond, p.cond.Broadcast)
+		p.cond.Wait()
+		timer.Stop()
+	}
+}
+
+func is(name string) func(map[string]any) bool {
+	return func(m map[string]any) bool { return m["event"] == name }
+}
+
+func TestEndToEndText(t *testing.T) {
+	if testing.Short() {
+		t.Skip("spawns processes")
+	}
+	a := newProc(t, "", "listen", "--listen", "127.0.0.1:0", "--host", "127.0.0.1")
+	ready := a.wait("Ready", is("Ready"))
+	addr := ready["listen"].([]any)[0].(string)
+	port := addr[strings.LastIndex(addr, ":")+1:]
+	a.send("/invite 127.0.0.1")
+	inv := a.wait("invite", func(m map[string]any) bool {
+		s, _ := m["text"].(string)
+		return m["event"] == "Output" && strings.HasPrefix(s, "burrow1:")
+	})["text"].(string)
+	if !strings.Contains(inv, "burrow1:") {
+		t.Fatal(inv)
+	}
+	_ = port
+
+	b := newProc(t, "", "listen", "--listen", "127.0.0.1:0")
+	b.wait("Ready", is("Ready"))
+	b.send("/connect " + inv)
+	b.wait("PeerConnected", is("PeerConnected"))
+	a.wait("PeerConnected", is("PeerConnected"))
+	a.wait("NewPeerViaInvite", is("NewPeerViaInvite"))
+	aFP := a.wait("Ready", is("Ready"))["fingerprint"].(string)
+	bFP := b.wait("Ready", is("Ready"))["fingerprint"].(string)
+
+	// Text both ways with delivery status.
+	b.send("hello from b")
+	got := a.wait("MessageReceived", is("MessageReceived"))
+	if got["text"] != "hello from b" || got["peer"] != bFP {
+		t.Fatalf("%v", got)
+	}
+	b.wait("delivered", func(m map[string]any) bool { return m["event"] == "MessageStatus" && m["status"] == "delivered" })
+	a.send("/msg " + bFP[:12] + " hi b")
+	if m := b.wait("MessageReceived", is("MessageReceived")); m["text"] != "hi b" || m["peer"] != aFP {
+		t.Fatalf("%v", m)
+	}
+
+	// Kill A abruptly; B queues; A restarts on the same port; B reconnects and delivers in order.
+	a.kill()
+	b.wait("PeerDisconnected", is("PeerDisconnected"))
+	b.send("queued one")
+	b.send("queued two")
+	b.wait("pending", func(m map[string]any) bool { return m["event"] == "MessageStatus" && m["status"] == "pending" })
+	a2 := newProc(t, a.home, "listen", "--listen", "127.0.0.1:"+port, "--host", "127.0.0.1")
+	a2.wait("Ready", is("Ready"))
+	b.wait("Reconnecting", is("Reconnecting"))
+	a2.wait("PeerConnected", is("PeerConnected"))
+	m1 := a2.wait("queued one", func(m map[string]any) bool { return m["event"] == "MessageReceived" && m["text"] == "queued one" })
+	m2 := a2.wait("queued two", func(m map[string]any) bool { return m["event"] == "MessageReceived" && m["text"] == "queued two" })
+	a2.mu.Lock()
+	i1, i2 := -1, -1
+	for i, ev := range a2.events {
+		if ev["id"] == m1["id"] {
+			i1 = i
+		}
+		if ev["id"] == m2["id"] {
+			i2 = i
+		}
+	}
+	a2.mu.Unlock()
+	if i1 < 0 || i2 < i1 {
+		t.Fatal("order not preserved")
+	}
+	b.wait("delivered after reconnect", func(m map[string]any) bool {
+		return m["event"] == "MessageStatus" && m["status"] == "delivered" && m["id"] == m2["id"]
+	})
+	// Contacts persisted across A's restart; safety numbers agree.
+	a2.send("/contacts")
+	a2.wait("contact listed", func(m map[string]any) bool {
+		s, _ := m["text"].(string)
+		return m["event"] == "Output" && strings.Contains(s, bFP[:8])
+	})
+	a2.send("/safety " + bFP[:12])
+	b.send("/safety " + aFP[:12])
+	sa := a2.wait("safety", func(m map[string]any) bool { s, _ := m["text"].(string); return len(s) == 23 && s[5] == ' ' })
+	sb := b.wait("safety", func(m map[string]any) bool { s, _ := m["text"].(string); return len(s) == 23 && s[5] == ' ' })
+	if sa["text"] != sb["text"] {
+		t.Fatalf("safety numbers differ: %v %v", sa["text"], sb["text"])
+	}
+	b.send("/quit")
+	a2.wait("PeerDisconnected", func(m map[string]any) bool { return m["event"] == "PeerDisconnected" && m["reason"] == "peer left" })
+	a2.send("/quit")
+	_ = a2.cmd.Wait()
+}

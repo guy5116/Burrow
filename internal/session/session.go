@@ -322,6 +322,11 @@ func (s *Session) Send(ctx context.Context, typ wire.FrameType, payload []byte) 
 	if !s.ready.Load() {
 		return ErrNotReady
 	}
+	select {
+	case <-s.closed:
+		return ErrClosed
+	default:
+	}
 	f := outFrame{typ: typ, stream: wire.StreamChat, payload: append([]byte(nil), payload...)}
 	select {
 	case s.chat <- f:
