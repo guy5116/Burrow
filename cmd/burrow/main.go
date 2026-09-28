@@ -1,5 +1,7 @@
-// Command burrow is the CLI/TUI for Burrow. Phase 0 ships the engine
-// skeleton only; subcommands arrive in Phase 1 (CLAUDE.md §9).
+//go:build !cli_wip
+
+// Command burrow is the CLI/TUI for Burrow. The real entry point is being
+// assembled in main_wip.go (build tag cli_wip) during Phase 1.
 package main
 
 import (
@@ -8,6 +10,7 @@ import (
 )
 
 func main() {
-	fmt.Fprintln(os.Stderr, "burrow: not yet functional (Phase 0 skeleton); see docs/STATUS.md")
+	harden()
+	fmt.Fprintln(os.Stderr, "burrow: CLI not yet wired (Phase 1 in progress); see docs/STATUS.md")
 	os.Exit(2)
 }

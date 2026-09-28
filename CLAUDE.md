@@ -1138,7 +1138,7 @@ Standard library first. Beyond it, only:
 | `golang.org/x/sys` | store, transport, cmd/* | Windows ACL checks, socket options, core-dump limits |
 | `golang.org/x/net` (`dns/dnsmessage` only) | transport/mdns (Phase 4) | mDNS packet building |
 | `github.com/flynn/noise` | handshake | Noise XK (small, mature) |
-| Bubble Tea + lipgloss + bubbles (`github.com/charmbracelet/bubbletea/v2`, `lipgloss/v2`, `bubbles/v2` — verified with `go list -m` in Phase 0) | ui/tui | TUI |
+| Bubble Tea + lipgloss + bubbles (`charm.land/bubbletea/v2`, `charm.land/lipgloss/v2`, `charm.land/bubbles/v2` — the v2 modules moved off github.com; verified with `go get` in Phase 1) | ui/tui | TUI |
 | `fyne.io/fyne/v2` | ui/gui (tag `gui`) | GUI |
 | `github.com/skip2/go-qrcode` | ui/gui, ui/tui, cmd/burrow (`id --qr`, `invite --qr` text QR) | invite QR — small and stable; accepted as frozen |
 | `github.com/BurntSushi/toml` | store | config |

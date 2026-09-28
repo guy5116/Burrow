@@ -25,6 +25,7 @@ cross:
 
 test:
 	$(GO) test -race -count=1 ./...
+	$(GO) test -count=1 -run 'Allocs' ./internal/...   # allocation budgets, measured without the race runtime
 
 test-short:
 	$(GO) test -race -short ./...

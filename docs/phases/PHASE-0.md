@@ -32,7 +32,7 @@
 ## Unspecified choices made (conservative option each time)
 
 - §0.3 placeholders were adopted without confirmation (autonomous session): module path
-  `github.com/guy5116/burrow`, port 47337, Bubble Tea **v2** (`github.com/charmbracelet/bubbletea/v2`,
+  `github.com/guy5116/burrow`, port 47337, Bubble Tea **v2** (`charm.land/bubbletea/v2`,
   v2.0.10 at the time; lipgloss/bubbles likewise v2). **The GitHub remote is spelled
   `Burrow`; Go module paths are case-sensitive, so rename the repo to lowercase or change
   the module path before publishing.**
