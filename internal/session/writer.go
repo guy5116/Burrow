@@ -66,6 +66,17 @@ func (s *Session) writeLoop() {
 			continue
 		default:
 		}
+		if f, ok := s.nextTransferFrame(); ok {
+			if err := s.writeTransfer(w, *fb, f); err != nil {
+				s.fail(err)
+				return
+			}
+			continue
+		}
+		if err := w.Flush(); err != nil { // queues drained: push out buffered chunks
+			s.fail(err)
+			return
+		}
 		select {
 		case <-s.ctx.Done():
 			return
@@ -79,8 +90,39 @@ func (s *Session) writeLoop() {
 				s.fail(err)
 				return
 			}
+		case <-s.transferWake:
 		}
 	}
+}
+
+// writeTransfer encrypts and buffers a transfer frame; it is flushed when the
+// queues drain or the 256 KiB buffer fills, so chat never waits behind more
+// than one chunk. Frames on closed streams (echoes, busy rejects) are dropped
+// from the closed-queue map once written.
+func (s *Session) writeTransfer(w *bufio.Writer, fb []byte, f outFrame) error {
+	inner, err := wire.EncodeInner(fb[wire.OuterLenSize:wire.OuterLenSize], f.typ, f.stream, f.payload)
+	if err != nil {
+		return err
+	}
+	frame, err := s.seal(s.send, fb, len(inner))
+	if err != nil {
+		return err
+	}
+	s.sendCounter.Store(s.send.counter)
+	if err := s.conn.SetWriteDeadline(s.now().Add(wire.WriteDeadline)); err != nil {
+		return err
+	}
+	if _, err := w.Write(frame); err != nil {
+		return err
+	}
+	s.lastWrittenAt.Store(s.now().UnixNano())
+	clear(fb[:len(frame)])
+	s.streams.mu.Lock()
+	if q, ok := s.closedQueues[f.stream]; ok && len(q) == 0 {
+		delete(s.closedQueues, f.stream)
+	}
+	s.streams.mu.Unlock()
+	return nil
 }
 
 // writeFrame encodes, encrypts under the current SEND chain, writes and

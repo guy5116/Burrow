@@ -129,8 +129,10 @@ func (s *Session) dispatch(in wire.Inner) error {
 			return nil // drop, do not close
 		}
 		s.typingTimes = append(s.typingTimes, now)
+	case wire.TypeImgOffer, wire.TypeImgAccept, wire.TypeImgReject, wire.TypeImgChunk, wire.TypeImgDone, wire.TypeImgResult, wire.TypeImgCancel:
+		return s.onStreamFrame(in)
 	default:
-		return ErrProtocol // image frames arrive in Phase 2
+		return ErrProtocol
 	}
 	msg := Inbound{Type: in.Type, Stream: in.Stream, Payload: append([]byte(nil), in.Payload...)}
 	select {

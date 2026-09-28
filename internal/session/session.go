@@ -138,6 +138,11 @@ type Session struct {
 	chat    chan outFrame
 	inbound chan Inbound
 
+	streams      *streamTable
+	transferWake chan struct{}
+	closedQueues map[uint16]chan outFrame // frames still to send on streams already closed
+	rrPos        int                      // writer round-robin position
+
 	peerHello wire.Hello
 	helloRecv chan struct{} // closed when the peer's HELLO validated
 	readyCh   chan struct{} // closed when both HELLOs are done (ours written, theirs validated)
@@ -174,14 +179,17 @@ func New(cfg Config) (*Session, error) {
 	}
 	s := &Session{
 		cfg: cfg, conn: cfg.Conn, log: cfg.Logger, now: cfg.Now,
-		root:      cfg.Root,
-		pending:   make(chan *pendingRekey, 1),
-		control:   make(chan ctrl, wire.ControlQueueCap),
-		chat:      make(chan outFrame, wire.ChatQueueCap),
-		inbound:   make(chan Inbound, wire.ChatQueueCap),
-		helloRecv: make(chan struct{}),
-		readyCh:   make(chan struct{}),
-		closed:    make(chan struct{}),
+		root:         cfg.Root,
+		pending:      make(chan *pendingRekey, 1),
+		control:      make(chan ctrl, wire.ControlQueueCap),
+		chat:         make(chan outFrame, wire.ChatQueueCap),
+		inbound:      make(chan Inbound, wire.ChatQueueCap),
+		streams:      newStreamTable(cfg.Initiator),
+		transferWake: make(chan struct{}, 1),
+		closedQueues: map[uint16]chan outFrame{},
+		helloRecv:    make(chan struct{}),
+		readyCh:      make(chan struct{}),
+		closed:       make(chan struct{}),
 	}
 	if cfg.Initiator {
 		s.send, s.recv = newChain(i2r, 0), newChain(r2i, 0)
