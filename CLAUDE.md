@@ -1006,7 +1006,7 @@ work for lists and dialogs).
 | Image transfer, gigabit LAN, end to end | ≥ 90 MB/s |
 | Heap allocations per steady-state frame (send and receive) | ≤ 8 small ones (stdlib `hmac.New`/AEAD construction); **zero** frame-sized allocations — those come from `internal/buf` pools |
 | CLI RSS, idle, one peer (after `debug.FreeOSMemory` post-unlock) | < 30 MiB |
-| GUI RSS, idle, one peer | < 150 MiB |
+| GUI RSS, idle, one peer | < 200 MiB (raised from 150 by the user on 2026-09-29: about 95 MiB is graphics driver memory) |
 | CLI startup to ready after passphrase unlock | < 300 ms |
 | Argon2id unlock (t=3, 64 MiB, p=4) | ~100–300 ms once per launch; acceptable |
 | Idle CPU | < 0.5 % |

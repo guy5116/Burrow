@@ -88,11 +88,10 @@ is an error, never a silent fallback. CI builds and tests the tagged variant.
 
 ## Known issues
 
-- **The desktop app misses the 150 MiB budget on the development machine: 172–179 MiB**
-  idle with one peer (AMD Radeon, Mesa radeonsi, Wayland). Breakdown: ≈ 79 MiB anonymous
-  (Go heap ≈ 25–30 MiB, the rest allocated by the graphics driver), ≈ 72 MiB file-backed
-  (shared libraries, mostly Mesa and LLVM), ≈ 23 MiB shared buffers. Garbage-collector
-  tuning (GOGC 25, a 32 MiB memory limit) saves about 6 MiB, so it was not added. The
-  part Burrow controls is small; the budget or the metric is the user's call.
+- The desktop app idles at 172–179 MiB with one peer on the development machine (AMD
+  Radeon, Mesa radeonsi, Wayland): ≈ 79 MiB anonymous (Go heap ≈ 25–30 MiB, the rest
+  allocated by the graphics driver), ≈ 72 MiB file-backed (shared libraries, mostly Mesa
+  and LLVM), ≈ 23 MiB shared buffers. The original 150 MiB budget was missed; **the user
+  raised it to 200 MiB on 2026-09-29** (CLAUDE.md §11). Other graphics drivers may differ.
 - History, when enabled, writes each received message on the engine goroutine (one
   fsync per message). Marked `ponytail:` in `internal/core/history.go`.

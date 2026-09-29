@@ -11,7 +11,8 @@ See docs/phases/PHASE-5.md and docs/RELEASE_CHECKLIST.md.
   first-time users, memguard build tag (approved by the user).
 - Engine is one goroutine (§2.3); sessions have exactly three; chunks go reader →
   file-writer; typing notices are the only events dropped for a slow screen.
-- Go 1.26 minimum (user decision, recorded in CLAUDE.md §1.2).
+- Go 1.26 minimum and a 200 MiB desktop app memory budget (user decisions, recorded in
+  CLAUDE.md §1.2 and §11).
 
 ## Mid-flight
 - (nothing)
@@ -22,8 +23,5 @@ See docs/phases/PHASE-5.md and docs/RELEASE_CHECKLIST.md.
   installed, the manual GUI plan, a look at Kitty inline thumbnails.
 
 ## Open questions for the user
-- Desktop app idle memory is 172–179 MiB on the development machine, over the 150 MiB
-  budget; about 95 MiB is graphics driver memory. Keep the budget, raise it, or measure
-  something else (for example memory excluding shared libraries)?
 - Earlier unconfirmed choices: §0.3 placeholders (module path, port 47337, Bubble Tea v2),
   reconnect policy, `/view` for inline images.

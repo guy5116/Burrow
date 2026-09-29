@@ -15,7 +15,7 @@ import (
 	"time"
 )
 
-// §11 budget for the desktop app: idle RSS with one peer < 150 MiB.
+// §11 budget for the desktop app: idle RSS with one peer < 200 MiB.
 // It opens a real window, so it only runs when asked:
 //
 //	BURROW_GUI_FOOTPRINT=1 go test -tags gui -run TestGUIFootprint ./cmd/burrow-gui/
@@ -118,7 +118,7 @@ func TestGUIFootprint(t *testing.T) {
 		}
 	}
 	t.Logf("desktop app idle with one peer: RSS %.1f MiB", float64(rss)/1024)
-	if rss == 0 || rss > 150*1024 {
-		t.Errorf("idle RSS %.1f MiB exceeds the 150 MiB budget", float64(rss)/1024)
+	if rss == 0 || rss > 200*1024 {
+		t.Errorf("idle RSS %.1f MiB exceeds the 200 MiB budget", float64(rss)/1024)
 	}
 }
