@@ -9,7 +9,7 @@ touch. Additions require asking the user (CLAUDE.md §14). Versions are pinned i
 | `golang.org/x/crypto` | v0.57.0 | identity, invite, handshake, session, store, media | argon2, blake2b, chacha20poly1305, curve25519 | key material, blobs |
 | `golang.org/x/text` | v0.42.0 | text | NFKC normalization, case folding | peer strings (sanitized) |
 | `golang.org/x/image` | v0.46.0 | media | WebP decoding, thumbnail scaling (`draw`) | image bytes after the size gates |
-| `golang.org/x/sys` | v0.48.0 | store (now), transport, cmd/* (later) | `flock`/exclusive open, socket options, core-dump limits | OS handles |
+| `golang.org/x/sys` | v0.48.0 | store, core | `flock`/exclusive open, core-dump limits, free disk space | OS handles |
 | `github.com/flynn/noise` | v1.1.0 | handshake | Noise XK (small, mature; KAT-tested against its own cacophony vectors) | handshake messages only |
 | `github.com/cretz/bine` | v0.2.0 (frozen) | transport/tor | control a system tor: `ADD_ONION`, SOCKS dialer | tor control port, SOCKS |
 | `golang.org/x/net` (`dns/dnsmessage` only) | v0.59.0 | transport/mdns | building and parsing announcement packets | multicast UDP |
@@ -20,14 +20,13 @@ touch. Additions require asking the user (CLAUDE.md §14). Versions are pinned i
 | `charm.land/bubbles/v2` | v2.2.1 | ui/tui | text input, viewport. Transitively pulls `github.com/atotto/clipboard` (pure Go; execs the platform clipboard tool on ctrl+v only) | terminal, clipboard on user action |
 | `charm.land/lipgloss/v2` | v2.0.6 | ui/tui | styling | terminal |
 | `github.com/skip2/go-qrcode` | v0.0.0-2020 (frozen) | cmd/burrow, ui/gui | `id --qr`, `invite --qr`, invite dialog | stdout / canvas |
+| `github.com/awnumar/memguard` | v0.23.0 | identity (tag `memguard` only) | locked, guarded, read-only memory for the identity scalar. Pure Go; pulls `github.com/awnumar/memcall` | the identity scalar |
 | `fyne.io/fyne/v2` | v2.8.1 | ui/gui, cmd/burrow-gui (tag `gui`) | desktop GUI. Transitive: go-text/typesetting (fonts), goldmark (unused markdown), oksvg/rasterx (icons), go-locale, go-i18n, gobmp, glfw (CGo) | window, clipboard, file chooser, `OpenURL` only behind `open_links` |
 
-Planned (allowlisted, not yet imported): `golang.org/x/image` (WebP decode, Phase 2),
-`golang.org/x/term` (no-echo prompts, Phase 1), `golang.org/x/net/dns/dnsmessage` (mDNS,
-Phase 4), Bubble Tea v2 + lipgloss v2 + bubbles v2 (`github.com/charmbracelet/*/v2`,
-Phase 1), `fyne.io/fyne/v2` (Phase 3), `github.com/skip2/go-qrcode` (frozen; Phase 1/3),
-`github.com/BurntSushi/toml` (config, Phase 1), `github.com/cretz/bine` (frozen; Phase 4),
-`github.com/awnumar/memguard` (Phase 5, ask first).
+Every module on the CLAUDE.md §14 allowlist is now in use; nothing is planned.
+
+memguard was added after the user approved it (CLAUDE.md §3.6 asked for that first). It is
+compiled only with `-tags memguard`; the default and release builds do not link it.
 
 Lint tools (installed by `make tools`, not linked into the binary): staticcheck v0.8.1,
 gosec v2.29.0, govulncheck v1.8.0, golangci-lint v2.14.0.

@@ -391,6 +391,7 @@ your contacts, `burrow passphrase` changes your passphrase, and
 ```
 make build        # CLI, no CGo
 make build-gui    # desktop GUI (needs CGo + OpenGL/X11 dev packages)
+go build -tags memguard ./cmd/burrow   # optional: identity key in locked memory (docs/SECURITY.md)
 make test         # go test -race ./...
 make lint         # gofmt, vet, staticcheck, gosec, govulncheck, golangci-lint (run `make tools` once)
 make docs-check   # docs/PROTOCOL.md constants match internal/wire

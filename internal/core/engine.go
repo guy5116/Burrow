@@ -105,6 +105,7 @@ func New(cfg Config, st *store.Store, trs []transport.Transport, logger *slog.Lo
 		id.Clear()
 		return nil, err
 	}
+	logger.Debug("identity loaded", "locked_memory", identity.Locked())
 	if cfg.DataDir == "" {
 		e.cfg.DataDir = filepath.Dir(st.Dir())
 	}

@@ -42,7 +42,6 @@ binary and the Tor network; run `BURROW_TOR_TEST=1 go test ./internal/transport/
 - Repeat the reproducible-build comparison on a second machine.
 - Run the Tor conformance test with tor installed.
 - Execute `docs/gui-test-plan.md` on all three OSes.
-- Decide on the optional `memguard` build tag (CLAUDE.md §3.6: ask first).
 - Look at an inline thumbnail on a real Kitty terminal (the escape sequences are unit
   tested, the rendering has not been seen).
 

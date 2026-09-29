@@ -21,6 +21,10 @@ jobs:
       - run: make test
       - run: make build-gui
       - run: make test-gui
+      - name: memguard build (identity key in locked memory)
+        run: |
+          go build -tags memguard ./cmd/burrow
+          go test -race -count=1 -short -tags memguard ./internal/identity ./internal/handshake ./internal/session ./internal/core
   lint:
     runs-on: ubuntu-latest
     steps:

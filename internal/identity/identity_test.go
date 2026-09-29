@@ -132,3 +132,30 @@ func TestMDNSTag(t *testing.T) {
 		t.Logf("MDNSTag allocs %v", a)
 	}
 }
+
+func TestStorageLifecycle(t *testing.T) {
+	src := unhex(t, "77076d0a7318a57d3c16c17251b26645df4c2f87ebc0992ab177fba51db92c2a")
+	want := append([]byte(nil), src...)
+	id, err := FromScalar(src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(src, make([]byte, 32)) {
+		t.Fatal("input not wiped")
+	}
+	if !bytes.Equal(id.Scalar(), want) {
+		t.Fatal("scalar not preserved in storage")
+	}
+	// The key must stay usable for many reads (handshakes and rekeys read it repeatedly).
+	for i := 0; i < 100; i++ {
+		if id.Scalar()[0] != want[0] {
+			t.Fatal("storage changed")
+		}
+	}
+	id.Clear()
+	id.Clear() // idempotent; with memguard the storage is unmapped, Scalar must not touch it
+	if !bytes.Equal(id.Scalar(), make([]byte, 32)) {
+		t.Fatal("scalar readable after Clear")
+	}
+	t.Logf("identity keys in locked memory: %v", Locked())
+}

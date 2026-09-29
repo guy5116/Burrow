@@ -70,11 +70,18 @@ func ParseFingerprint(s string) (PeerID, error) {
 	return p, nil
 }
 
-// Identity is a long-term keypair. The scalar lives in a secret buffer.
+// Identity is a long-term keypair. The scalar lives in storage provided by
+// hold: a wiped-on-release buffer by default, or memory that is locked against
+// swapping and surrounded by guard pages when built with -tags memguard.
 type Identity struct {
-	scalar *secret.Buffer
-	pub    PeerID
+	scalar  []byte
+	release func()
+	pub     PeerID
 }
+
+// ErrLock is returned when the scalar cannot be placed in locked memory
+// (memguard builds): usually RLIMIT_MEMLOCK is too low.
+var ErrLock = errors.New("identity: cannot lock memory for the identity key")
 
 // Generate creates a fresh identity from crypto/rand.
 func Generate() (*Identity, error) {
@@ -82,7 +89,7 @@ func Generate() (*Identity, error) {
 	if err != nil {
 		return nil, err
 	}
-	return fromBuffer(s)
+	return fromBytes(s.Bytes())
 }
 
 // FromScalar builds an identity from a stored 32-byte scalar. The input is
@@ -92,16 +99,21 @@ func FromScalar(scalar []byte) (*Identity, error) {
 		secret.Wipe(scalar)
 		return nil, errors.New("identity: scalar must be 32 bytes")
 	}
-	return fromBuffer(secret.From(scalar))
+	return fromBytes(scalar)
 }
 
-func fromBuffer(s *secret.Buffer) (*Identity, error) {
-	pub, err := curve25519.X25519(s.Bytes(), curve25519.Basepoint)
+// fromBytes moves b into its final storage (wiping b) and derives the public key.
+func fromBytes(b []byte) (*Identity, error) {
+	scalar, release, err := hold(b)
 	if err != nil {
-		s.Clear()
 		return nil, err
 	}
-	id := &Identity{scalar: s}
+	pub, err := curve25519.X25519(scalar, curve25519.Basepoint)
+	if err != nil {
+		release()
+		return nil, err
+	}
+	id := &Identity{scalar: scalar, release: release}
 	copy(id.pub[:], pub)
 	return id, nil
 }
@@ -110,11 +122,17 @@ func fromBuffer(s *secret.Buffer) (*Identity, error) {
 func (id *Identity) Public() PeerID { return id.pub }
 
 // Scalar exposes the private scalar for the handshake. Do not retain or copy
-// it; it becomes zero after Clear.
-func (id *Identity) Scalar() []byte { return id.scalar.Bytes() }
+// it; it reads as zeros after Clear.
+func (id *Identity) Scalar() []byte { return id.scalar }
 
-// Clear wipes the private scalar.
-func (id *Identity) Clear() { id.scalar.Clear() }
+// Clear wipes the private scalar and frees its storage. Safe to call twice.
+func (id *Identity) Clear() {
+	if id.release != nil {
+		id.release()
+		id.release = nil
+	}
+	id.scalar = make([]byte, curve25519.ScalarSize)
+}
 
 // SafetyNumber is twelve 5-digit groups derived from both public keys.
 type SafetyNumber [12]uint32

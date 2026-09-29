@@ -39,7 +39,8 @@ What we cannot wipe:
   references promptly; the garbage collector reclaims them on its own schedule.
 - Copies made by the Go runtime: stack growth may copy a frame holding a secret, and
   values that escape to the heap are reclaimed, not zeroed.
-- Swap: without `memguard` (optional, Phase 5) secrets may be paged to disk.
+- Swap: in the default build secrets may be paged to disk. The `memguard` build (below)
+  locks the identity key; every other secret is still ordinary memory.
   `debug.FreeOSMemory()` after Argon2 returns its 64 MiB to the OS but does not scrub it.
 - Secrets are never stored in Go strings (immutable, unwipeable).
 
@@ -71,6 +72,26 @@ Core dumps are disabled at startup by both `burrow` and `burrow-gui`
 - On Unix, directories are `0700` and files `0600`. On Windows we rely on the per-user
   profile ACL of `%APPDATA%`; no explicit ACLs are set.
 - One process at a time: `flock` on Unix, an exclusive open on Windows.
+
+## Locked memory for the identity key (`-tags memguard`)
+
+Building with `go build -tags memguard ./cmd/burrow` (or `./cmd/burrow-gui` with
+`-tags gui,memguard`) keeps the long-term identity scalar in memory managed by
+`github.com/awnumar/memguard`:
+
+- locked with `mlock`/`VirtualLock`, so the key is not written to swap;
+- placed between guard pages and made read-only, so stray writes and overruns fault
+  instead of corrupting or leaking it;
+- wiped and unmapped on `Clear`.
+
+If the memory cannot be locked (for example `RLIMIT_MEMLOCK` is too low), creating or
+loading the identity fails with an error. It never falls back to ordinary memory silently.
+
+What this does **not** change: the scalar is still copied transiently by
+`x/crypto/curve25519` and referenced by `flynn/noise` during a handshake; the store's
+master key, chain keys, message keys and the onion key stay in ordinary (wiped-after-use)
+memory; hibernation writes all memory to disk regardless of `mlock`. The release binaries
+built by `make release` are the default build; the memguard build is opt-in.
 
 ## Onion service key
 

@@ -42,5 +42,6 @@ invites; the fact that two specific peers talk, and when; partial transfers on d
 - IP exposure to the peer in direct-TCP mode (use the Tor transport to hide it).
 - Encoder fingerprints inside images in `strip` mode (`paranoid` mode removes them).
 - Store rollback from backups resurrecting a consumed single-use invite token.
-- Perfect memory zeroization under Go's GC or inside library objects; secrets in swap.
+- Perfect memory zeroization under Go's GC or inside library objects; secrets in swap
+  (the opt-in `memguard` build keeps the identity key out of swap, nothing else).
 - Denial of service beyond rate limiting and hard caps.
