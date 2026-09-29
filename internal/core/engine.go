@@ -471,6 +471,11 @@ func (e *Engine) establish(conn net.Conn, kind transport.Kind, res *handshake.Re
 			_ = e.saveInvites()
 		}
 		if inviteID != "" || token != nil {
+			// Only the side that issued the invite knows its id; the side that used
+			// one records none ("peer" above only marks "create the contact").
+			if res.Initiator {
+				inviteID = ""
+			}
 			newContact, collision = e.addContactLocked(res.Peer, name, inviteID)
 		}
 	} else if c := e.contacts[res.Peer]; c.Blocked {

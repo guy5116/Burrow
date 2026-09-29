@@ -15,14 +15,18 @@ type Names struct{ E *core.Engine }
 
 // Label returns "nick (fp8)" or the short fingerprint for an unknown peer.
 func (n Names) Label(id core.PeerID) string {
-	if c, err := n.E.Contact(id); err == nil && c.Nickname != "" {
-		mark := ""
-		if c.Verified {
-			mark = "✓"
-		}
-		return fmt.Sprintf("%s%s (%s)", c.Nickname, mark, id.Short())
+	c, err := n.E.Contact(id)
+	if err != nil {
+		return id.Short()
 	}
-	return id.Short()
+	mark := ""
+	if c.Verified {
+		mark = "✓"
+	}
+	if c.Nickname == "" || c.Nickname == id.Short() {
+		return id.Short() + mark // an unnamed contact: do not print the same code twice
+	}
+	return fmt.Sprintf("%s%s (%s)", c.Nickname, mark, id.Short())
 }
 
 // Nick returns just the nickname (or short fingerprint).
@@ -49,7 +53,11 @@ func (n Names) Line(ev core.Event) string {
 		}
 		return fmt.Sprintf("! could not establish a secure session with %s: %s", who, e.Reason)
 	case core.NewPeerViaInvite:
-		return fmt.Sprintf("* new contact %s via invite %s — UNVERIFIED until you compare safety numbers (/safety)", n.Label(e.Peer), e.InviteID)
+		how := "added from the invite you used"
+		if e.InviteID != "" {
+			how = "joined with your invite " + e.InviteID
+		}
+		return fmt.Sprintf("* new contact %s %s — UNVERIFIED until you compare safety numbers (/safety)", n.Label(e.Peer), how)
 	case core.InviteConsumed:
 		return fmt.Sprintf("* invite %s used", e.ID)
 	case core.NameCollision:
@@ -151,7 +159,7 @@ func (n Names) JSON(ev core.Event) map[string]any {
 		m["stage"], m["reason"] = e.Stage, e.Reason
 	case core.NewPeerViaInvite:
 		peer(e.Peer)
-		m["invite_id"] = e.InviteID
+		m["invite_id"], m["own_invite"] = e.InviteID, e.InviteID != ""
 	case core.InviteConsumed:
 		m["invite_id"] = e.ID
 	case core.NameCollision:

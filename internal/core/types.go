@@ -151,6 +151,8 @@ type HandshakeFailed struct {
 }
 
 // NewPeerViaInvite: a contact was created from an invite (either side).
+// InviteID names our own invite; it is empty on the side that used someone
+// else's invite.
 type NewPeerViaInvite struct {
 	Peer     PeerID
 	Nickname string

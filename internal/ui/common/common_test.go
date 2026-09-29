@@ -460,3 +460,48 @@ func TestKittyInline(t *testing.T) {
 		}
 	}
 }
+
+func TestLabelsAndInviteWording(t *testing.T) {
+	a := newNode(t, core.Config{}) // no display names: contacts get their short fingerprint as name
+	b := newNode(t, core.Config{})
+	inv := strings.Split(exec(t, a.ctl, "/invite 127.0.0.1"), "\n")[1]
+	out := exec(t, b.ctl, "/connect "+inv)
+	aShort, bShort := a.e.Identity().ID.Short(), b.e.Identity().ID.Short()
+	if out != "* connected to "+aShort+"; now talking to them" {
+		t.Fatalf("%q", out)
+	}
+	if got := b.ctl.Names.Label(a.e.Identity().ID); got != aShort {
+		t.Fatalf("unnamed contact label %q", got)
+	}
+	// Each side words the new contact from its own point of view.
+	mine := a.wait(t, func(ev core.Event) bool { _, ok := ev.(core.NewPeerViaInvite); return ok }).(core.NewPeerViaInvite)
+	theirs := b.wait(t, func(ev core.Event) bool { _, ok := ev.(core.NewPeerViaInvite); return ok }).(core.NewPeerViaInvite)
+	if mine.InviteID == "" || theirs.InviteID != "" {
+		t.Fatalf("invite ids: issuer %q, user %q", mine.InviteID, theirs.InviteID)
+	}
+	la, lb := a.ctl.Names.Line(mine), b.ctl.Names.Line(theirs)
+	if !strings.Contains(la, "new contact "+bShort+" joined with your invite "+mine.InviteID) {
+		t.Fatal(la)
+	}
+	if !strings.Contains(lb, "new contact "+aShort+" added from the invite you used") || strings.Contains(lb, "peer") {
+		t.Fatal(lb)
+	}
+	if strings.Count(la, bShort) != 1 || strings.Count(lb, aShort) != 1 {
+		t.Fatal("short fingerprint printed twice")
+	}
+	if a.ctl.Names.JSON(mine)["own_invite"] != true || b.ctl.Names.JSON(theirs)["own_invite"] != false {
+		t.Fatal("own_invite flag")
+	}
+	// Verified and renamed contacts keep the usual forms.
+	_ = exec(t, b.ctl, "/verify "+aShort)
+	if got := b.ctl.Names.Label(a.e.Identity().ID); got != aShort+"✓" {
+		t.Fatal(got)
+	}
+	_ = exec(t, b.ctl, "/rename "+aShort+" Alice")
+	if got := b.ctl.Names.Label(a.e.Identity().ID); got != "Alice✓ ("+aShort+")" {
+		t.Fatal(got)
+	}
+	if c, _ := b.e.Contact(a.e.Identity().ID); c.InviteID != "" {
+		t.Fatalf("the invite user stored an invite id: %q", c.InviteID)
+	}
+}
