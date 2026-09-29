@@ -62,6 +62,7 @@ type Engine struct {
 	sessCancel context.CancelFunc
 	wg         sync.WaitGroup
 	events     chan Event
+	ready      chan struct{} // closed once the listeners are up
 	done       chan struct{}
 	doneOnce   sync.Once
 
@@ -82,6 +83,7 @@ type Engine struct {
 
 	// Owned by the engine goroutine.
 	started      bool
+	stopping     bool // shutdown has begun: no new goroutine may join wg
 	contacts     map[PeerID]*Contact
 	invites      map[[16]byte]*inviteRec
 	reserved     map[[16]byte]PeerID // single-use tokens reserved at msg3
@@ -90,9 +92,11 @@ type Engine struct {
 	pending      int                        // handshakes in progress
 	listeners    []transport.Listener
 	orphanQueues map[PeerID][]*queued // a contact's message queue while no session is live
-	reconnects   map[PeerID]context.CancelFunc
+	reconnects   map[PeerID]*reconnect
 	transfers    map[TransferID]*transfer
-	mdnsSeen     map[[16]byte]bool
+	dedup        map[PeerID]*dedup // received TEXT ids per contact; outlives the sessions
+	mdnsSeen     map[[16]byte]bool // announcement nonces already examined
+	histCh       chan histRec      // to the history writer (nil when history is off)
 }
 
 // New builds an engine over an unlocked store and the given transports and
@@ -107,11 +111,11 @@ func New(cfg Config, st *store.Store, trs []transport.Transport, logger *slog.Lo
 		return nil, err
 	}
 	e := &Engine{cfg: cfg, st: st, id: id, trs: map[transport.Kind]transport.Transport{}, log: logger,
-		clock: time.Now, events: make(chan Event, eventsCap), done: make(chan struct{}), replay: handshake.NewReplayLRU(),
+		clock: time.Now, events: make(chan Event, eventsCap), ready: make(chan struct{}), done: make(chan struct{}), replay: handshake.NewReplayLRU(),
 		limiters: map[transport.Kind]*handshake.FailureLimiter{}, reserved: map[[16]byte]PeerID{}, peers: map[PeerID]*peer{},
-		bySession: map[*session.Session]*peer{}, orphanQueues: map[PeerID][]*queued{}, reconnects: map[PeerID]context.CancelFunc{},
-		transfers: map[TransferID]*transfer{},
-		cmds:      make(chan func()), inbound: make(chan session.Inbound, wire.ChatQueueCap), closedS: make(chan *session.Session),
+		bySession: map[*session.Session]*peer{}, orphanQueues: map[PeerID][]*queued{}, reconnects: map[PeerID]*reconnect{},
+		transfers: map[TransferID]*transfer{}, dedup: map[PeerID]*dedup{}, mdnsSeen: map[[16]byte]bool{},
+		cmds: make(chan func()), inbound: make(chan session.Inbound, wire.ChatQueueCap), closedS: make(chan *session.Session),
 		emitCh: make(chan Event), stop: make(chan struct{}), loopDone: make(chan struct{})}
 	e.ctx, e.cancel = context.WithCancel(context.Background())
 	e.sessCtx, e.sessCancel = context.WithCancel(context.Background())
@@ -133,6 +137,11 @@ func New(cfg Config, st *store.Store, trs []transport.Transport, logger *slog.Lo
 		e.cfg.DataDir = filepath.Dir(st.Dir())
 	}
 	e.cleanPartials()
+	if cfg.History {
+		e.histCh = make(chan histRec, historyQueue)
+		e.wg.Add(1)
+		go e.historyWriter()
+	}
 	go e.loop()
 	return e, nil
 }
@@ -210,6 +219,36 @@ func (e *Engine) do(fn func()) {
 	}
 }
 
+// spawnL starts fn as a goroutine that shutdown waits for. It refuses once
+// shutdown has begun, so nothing joins the wait group while Start is waiting
+// on it.
+func (e *Engine) spawnL(fn func()) bool {
+	if e.stopping {
+		return false
+	}
+	e.wg.Add(1)
+	go func() {
+		defer e.wg.Done()
+		fn()
+	}()
+	return true
+}
+
+// spawn is spawnL for other goroutines. first, when not nil, runs on the
+// engine goroutine just before fn starts, and only if it starts.
+func (e *Engine) spawn(first, fn func()) (ok bool) {
+	e.do(func() {
+		if ok = !e.stopping; !ok {
+			return
+		}
+		if first != nil {
+			first()
+		}
+		e.spawnL(fn)
+	})
+	return ok
+}
+
 // queueL queues an event from code running on the engine goroutine.
 func (e *Engine) queueL(ev Event) { e.out = append(e.out, ev) }
 
@@ -250,6 +289,7 @@ func (e *Engine) Start(ctx context.Context) error {
 	e.do(func() {
 		e.started = true
 		e.listeners = listeners
+		close(e.ready)
 	})
 	if e.cfg.MDNS {
 		e.runMDNS(e.listenPortOf())
@@ -264,12 +304,12 @@ func (e *Engine) Start(ctx context.Context) error {
 	}
 	var sessions []*session.Session
 	e.do(func() {
-		e.started = false
+		e.started, e.stopping = false, true
 		for _, p := range e.peers {
 			sessions = append(sessions, p.s)
 		}
-		for _, cancel := range e.reconnects {
-			cancel()
+		for _, r := range e.reconnects {
+			r.cancel()
 		}
 	})
 	var wg sync.WaitGroup
@@ -284,12 +324,17 @@ func (e *Engine) Start(ctx context.Context) error {
 	return nil
 }
 
+// Ready closes once Start has the listeners up.
+func (e *Engine) Ready() <-chan struct{} { return e.ready }
+
 // Close stops the engine goroutine, closes transports that need it and wipes
 // the identity. Start calls it on the way out; engines that were never
 // started call it directly.
 func (e *Engine) Close() {
 	e.cancel()
 	e.sessCancel()
+	e.do(func() { e.stopping = true })
+	e.wg.Wait()
 	e.stopOnce.Do(func() { close(e.stop) })
 	<-e.loopDone
 	e.doneOnce.Do(func() {
@@ -357,13 +402,18 @@ func (e *Engine) acceptLoop(tr transport.Transport, ln transport.Listener) {
 
 // serve runs the responder side of one inbound connection.
 func (e *Engine) serve(tr transport.Transport, conn net.Conn, key string, lim *handshake.FailureLimiter) {
-	var token *[16]byte
+	var token *[16]byte // the invite token this connection was admitted with, if any
+	var peer PeerID
 	res, err := handshake.Respond(e.ctx, conn, e.id, func(p PeerID, tok *[16]byte) handshake.Decision {
-		token = tok
-		return e.authorize(p, tok)
+		d, used := e.authorize(p, tok)
+		if used {
+			token, peer = tok, p
+		}
+		return d
 	}, e.replay)
 	if err != nil {
 		_ = conn.Close()
+		e.releaseToken(peer, token)
 		lim.Fail(key, e.now())
 		e.log.Debug("inbound handshake failed", "stage", stageOf(err))
 		return
@@ -381,9 +431,12 @@ func stageOf(err error) string {
 	return "unknown"
 }
 
-// authorize implements §4.6 for the responder. Called on a handshake goroutine.
-func (e *Engine) authorize(p PeerID, tok *[16]byte) handshake.Decision {
-	d := handshake.Reject
+// authorize implements §4.6 for the responder. Called on a handshake
+// goroutine. used reports that p was admitted because of tok (and, for a
+// single-use invite, that tok is now reserved for p). A known contact uses
+// no token, whatever it presents.
+func (e *Engine) authorize(p PeerID, tok *[16]byte) (d handshake.Decision, used bool) {
+	d = handshake.Reject
 	e.do(func() {
 		if c, ok := e.contacts[p]; ok {
 			if !c.Blocked {
@@ -395,28 +448,37 @@ func (e *Engine) authorize(p PeerID, tok *[16]byte) handshake.Decision {
 			return
 		}
 		inv, ok := e.invites[*tok]
-		if !ok || !e.now().Before(inv.Expiry) {
+		if !ok || !e.now().Before(inv.Expiry) || !e.roomForL(inv) {
 			return
 		}
-		if len(e.contacts) >= wire.MaxContacts || (inv.MultiUse && inv.Uses >= wire.MaxContactsPerInvite) {
+		if _, taken := e.reserved[*tok]; taken && !inv.MultiUse {
 			return
 		}
 		if !inv.MultiUse {
-			if _, taken := e.reserved[*tok]; taken {
-				return
-			}
 			e.reserved[*tok] = p
 		}
-		d = handshake.Accept
+		d, used = handshake.Accept, true
 	})
-	return d
+	return d, used
 }
 
-func (e *Engine) releaseToken(tok *[16]byte) {
+// roomForL reports whether one more contact may be created from inv.
+func (e *Engine) roomForL(inv *inviteRec) bool {
+	return len(e.contacts) < wire.MaxContacts && (!inv.MultiUse || inv.Uses < wire.MaxContactsPerInvite)
+}
+
+// releaseToken gives up the reservation p holds on tok, and no one else's.
+func (e *Engine) releaseToken(p PeerID, tok *[16]byte) {
 	if tok == nil {
 		return
 	}
-	e.do(func() { delete(e.reserved, *tok) })
+	e.do(func() { e.releaseTokenL(p, tok) })
+}
+
+func (e *Engine) releaseTokenL(p PeerID, tok *[16]byte) {
+	if tok != nil && e.reserved[*tok] == p {
+		delete(e.reserved, *tok)
+	}
 }
 
 // Connect dials an invite or a saved contact and returns once the session is
@@ -525,13 +587,20 @@ func (e *Engine) dial(ctx context.Context, addr transport.Address, peerID PeerID
 		e.emit(HandshakeFailed{Peer: peerID, Stage: stageOf(err), Reason: "handshake failed"})
 		return err
 	}
-	if err := e.establish(conn, addr.Kind, res, nil, inviteID); err != nil {
+	err = e.establish(conn, addr.Kind, res, nil, inviteID)
+	if errors.Is(err, errLostGlare) {
+		return nil // both sides dialed at once and the other session was kept: connected all the same
+	}
+	if err != nil {
 		e.emit(HandshakeFailed{Peer: peerID, Stage: "hello", Reason: reasonOf(err)})
 		return err
 	}
 	e.do(func() { e.rememberAddrL(peerID, addr) })
 	return nil
 }
+
+// errLostGlare: a simultaneous dial was resolved in favour of the other session.
+var errLostGlare = errors.New("core: lost simultaneous-dial glare")
 
 // reasonOf is the user-facing wording for a failed HELLO exchange (§3.3).
 func reasonOf(err error) string {
@@ -543,7 +612,8 @@ func reasonOf(err error) string {
 
 // establish wraps an authenticated conn in a session, runs the HELLO exchange
 // on the calling (handshake) goroutine, then asks the engine goroutine to
-// register the peer. token is the responder-side presented token.
+// register the peer. token is the invite token the peer was admitted with
+// (responder side).
 func (e *Engine) establish(conn net.Conn, kind transport.Kind, res *handshake.Result, token *[16]byte, inviteID string) error {
 	hello := wire.Hello{Name: []byte(e.cfg.DisplayName), Features: wire.FeatureImages | wire.FeatureAnimatedGIF, MaxImage: e.cfg.maxImage()}
 	if e.cfg.Typing {
@@ -556,50 +626,47 @@ func (e *Engine) establish(conn net.Conn, kind transport.Kind, res *handshake.Re
 		Peer: res.Peer, Hello: hello, Logger: e.log, Inbound: e.inbound, OnClose: e.sessionClosed})
 	if err != nil {
 		_ = conn.Close()
-		e.releaseToken(token)
+		e.releaseToken(res.Peer, token)
 		return err
 	}
 	s.Start(e.sessCtx)
 	select {
 	case <-s.Ready():
 	case <-s.Done():
-		e.releaseToken(token)
+		e.releaseToken(res.Peer, token)
 		return s.Err()
 	case <-time.After(wire.HandshakeTimeout):
-		s.Close(wire.ByeLocalError)
-		e.releaseToken(token)
+		s.Drop()
+		e.releaseToken(res.Peer, token)
 		return errors.New("core: HELLO timeout")
 	}
 	name, err := text.Sanitize(s.PeerHello().Name, text.Name)
 	if err != nil {
-		s.Close(wire.ByeLocalError)
-		e.releaseToken(token)
+		s.Drop()
+		e.releaseToken(res.Peer, token)
 		return err
 	}
 	var old *session.Session
-	reason := uint8(wire.ByeLocalError)
-	e.do(func() { old, reason, err = e.registerL(s, kind, res, token, inviteID, name) })
-	if err != nil {
-		s.Close(reason)
-		return err
-	}
-	if old != nil {
+	e.do(func() { old, err = e.registerL(s, kind, res, token, inviteID, name) })
+	switch {
+	case errors.Is(err, errLostGlare):
+		s.Close(wire.ByeReplaced)
+	case err != nil:
+		s.Drop() // silently, like any connection we do not want (§4.6)
+	case old != nil:
 		old.Close(wire.ByeReplaced)
 	}
-	return nil
+	return err
 }
 
 // registerL applies token consumption, contact creation, the name-collision
 // check and the replacement/glare rules, installs the peer and lets its frames
-// flow. It returns the session this one replaces, if any. On error the caller
-// closes s with the returned BYE reason.
-func (e *Engine) registerL(s *session.Session, kind transport.Kind, res *handshake.Result, token *[16]byte, inviteID, name string) (*session.Session, uint8, error) {
-	if token != nil {
-		defer delete(e.reserved, *token)
-	}
+// flow. It returns the session this one replaces, if any.
+func (e *Engine) registerL(s *session.Session, kind transport.Kind, res *handshake.Result, token *[16]byte, inviteID, name string) (*session.Session, error) {
+	defer e.releaseTokenL(res.Peer, token)
 	select {
 	case <-s.Done(): // died after its HELLO; its OnClose has fired or will find nothing
-		return nil, wire.ByeLocalError, s.Err()
+		return nil, s.Err()
 	default:
 	}
 	// Token consumption and contact creation (§4.6), both HELLOs validated.
@@ -609,18 +676,19 @@ func (e *Engine) registerL(s *session.Session, kind transport.Kind, res *handsha
 	c, known := e.contacts[res.Peer]
 	switch {
 	case known && c.Blocked:
-		return nil, wire.ByeLocalError, ErrBlocked
+		return nil, ErrBlocked
 	case !known:
 		if token == nil && inviteID == "" {
-			return nil, wire.ByeLocalError, ErrUnknownContact // authorize rejects these; be safe
+			return nil, ErrUnknownContact // authorize rejects these; be safe
 		}
 		if len(e.contacts) >= wire.MaxContacts {
-			return nil, wire.ByeResourceLimit, ErrContactLimit
+			return nil, ErrContactLimit
 		}
 		if token != nil {
+			// Checked again: handshakes that ran side by side all passed authorize.
 			inv, ok := e.invites[*token]
-			if !ok || !e.now().Before(inv.Expiry) {
-				return nil, wire.ByeLocalError, errors.New("core: invite vanished during handshake")
+			if !ok || !e.now().Before(inv.Expiry) || !e.roomForL(inv) {
+				return nil, errors.New("core: invite used up or gone during the handshake")
 			}
 			inv.Uses++
 			consumedID, inviteID = inv.ID, inv.ID
@@ -637,35 +705,24 @@ func (e *Engine) registerL(s *session.Session, kind transport.Kind, res *handsha
 		newContact, collision = e.addContactL(res.Peer, name, inviteID)
 	}
 	// Replacement / glare (§12).
-	var replaced *session.Session
-	if old, ok := e.peers[res.Peer]; ok {
-		if e.now().Sub(old.since) < wire.GlareWindow {
-			// True simultaneous dial: keep the session whose initiator has the smaller key.
-			keepNew := initiatorKey(e.id.Public(), res.Peer, res.Initiator) < initiatorKey(e.id.Public(), res.Peer, old.s.Initiator())
-			if !keepNew {
-				return nil, wire.ByeReplaced, errors.New("core: lost simultaneous-dial glare")
-			}
-		}
-		old.replaced = true
-		replaced = old.s
+	old := e.peers[res.Peer]
+	if old != nil && losesGlare(e.id.Public(), res.Peer, res.Initiator, old.s.Initiator(), e.now().Sub(old.since)) {
+		return nil, errLostGlare
 	}
 	p := newPeer(e, s, kind)
 	e.peers[res.Peer] = p
 	e.bySession[s] = p
 	e.contacts[res.Peer].Online = true
-	if replaced != nil {
-		// Unacknowledged messages of the replaced session move over right away.
-		old := e.bySession[replaced]
-		for _, q := range old.queue {
-			q.status = StatusPending
-		}
-		p.queue = append(p.queue, old.queue...)
-		old.queue = nil
+	var replaced *session.Session
+	if old != nil {
+		old.replaced, replaced = true, old.s
+		e.revertSentL(old) // unacknowledged messages move over right away
+		p.queue, old.queue = old.queue, nil
 	}
 	p.queue = append(p.queue, e.orphanQueues[res.Peer]...)
 	delete(e.orphanQueues, res.Peer)
-	if cancel := e.reconnects[res.Peer]; cancel != nil {
-		cancel()
+	if r := e.reconnects[res.Peer]; r != nil {
+		r.cancel()
 		delete(e.reconnects, res.Peer)
 	}
 	if newContact != nil {
@@ -680,7 +737,7 @@ func (e *Engine) registerL(s *session.Session, kind transport.Kind, res *handsha
 	e.queueL(PeerConnected{Peer: res.Peer, Initiator: res.Initiator, Transport: kind, Name: name})
 	s.Attach()
 	e.sendPendingL(p)
-	return replaced, 0, nil
+	return replaced, nil
 }
 
 // sessionClosed is the session's OnClose hook: it tells the engine goroutine.
@@ -689,6 +746,16 @@ func (e *Engine) sessionClosed(s *session.Session) {
 	case e.closedS <- s:
 	case <-e.loopDone:
 	}
+}
+
+// losesGlare reports whether a new session gives way to the one we have. That
+// is so only after a simultaneous dial: the two sessions were dialed from
+// opposite sides, the old one is younger than the glare window, and its
+// initiator has the smaller key. Both sides reach the same verdict. Two
+// sessions from the same initiator are a redial, and the newer one wins.
+func losesGlare(self, peer PeerID, newInitiator, oldInitiator bool, oldAge time.Duration) bool {
+	return newInitiator != oldInitiator && oldAge < wire.GlareWindow &&
+		initiatorKey(self, peer, oldInitiator) < initiatorKey(self, peer, newInitiator)
 }
 
 // initiatorKey returns the public key of the initiator of a session between us and peer.

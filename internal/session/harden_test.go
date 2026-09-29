@@ -156,7 +156,7 @@ func TestPushControlCtx(t *testing.T) {
 	if err := s.pushControlCtx(ctrl{kind: ctrlRekeyDone, chain: ck}); !errors.Is(err, ErrClosed) {
 		t.Fatal(err)
 	}
-	if ck.Bytes()[0] != 0 && ck.Bytes()[1] != 0 {
+	if !bytes.Equal(ck.Bytes(), make([]byte, len(ck.Bytes()))) {
 		// cleared buffers read as zero
 		t.Fatal("chain key not cleared on failure")
 	}
@@ -532,7 +532,7 @@ full:
 
 func TestChunkSink(t *testing.T) {
 	a := newAdv(t, false, true)
-	sink := make(chan []byte, 4)
+	sink := make(chan Chunk, 4)
 	if err := a.s.SetChunkSink(2, sink); !errors.Is(err, ErrStreamState) {
 		t.Fatal("sink on an unknown stream", err)
 	}
@@ -542,10 +542,10 @@ func TestChunkSink(t *testing.T) {
 	_ = a.p.SendFrame(wire.TypeImgChunk, 2, c0)
 	_ = a.p.SendFrame(wire.TypeImgChunk, 2, c1)
 	_ = a.p.SendFrame(wire.TypeImgDone, 2, nil)
-	if d := <-sink; len(d) != wire.ChunkData || d[0] != 7 {
+	if d := (<-sink).Data(); len(d) != wire.ChunkData || d[0] != 7 {
 		t.Fatal(len(d))
 	}
-	if d := <-sink; !bytes.Equal(d, []byte{1, 2, 3, 4, 5}) {
+	if d := (<-sink).Data(); !bytes.Equal(d, []byte{1, 2, 3, 4, 5}) {
 		t.Fatal(d)
 	}
 	a.recvType(t, wire.TypeImgDone) // DONE still goes to the owner; chunks never did

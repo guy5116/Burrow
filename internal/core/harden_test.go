@@ -33,7 +33,7 @@ func TestSmallMappings(t *testing.T) {
 	}
 	for err, want := range map[error]bool{nil: false, session.ErrClosed: false, session.ErrProtocol: false,
 		&session.ByeError{Reason: wire.ByeUserQuit}: false, &session.ByeError{Reason: wire.ByeShutdown}: false,
-		&session.ByeError{Reason: wire.ByeReplaced}: false, &session.ByeError{Reason: wire.ByeLocalError}: true,
+		&session.ByeError{Reason: wire.ByeReplaced}: true, &session.ByeError{Reason: wire.ByeLocalError}: true,
 		&session.ByeError{Reason: wire.ByeResourceLimit}: true, errors.New("reset by peer"): true} {
 		if shouldReconnect(err) != want {
 			t.Errorf("shouldReconnect(%v)", err)
@@ -214,7 +214,7 @@ func TestPartialCleanupRules(t *testing.T) {
 	write := func(id string, peer PeerID) {
 		tr := &transfer{peer: peer, size: 10}
 		raw, _ := hex.DecodeString(id)
-		copy(tr.id[:], raw)
+		copy(tr.partID[:], raw)
 		if err := a.e.writeMeta(tr, 0); err != nil {
 			t.Fatal(err)
 		}

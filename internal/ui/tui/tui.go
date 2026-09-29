@@ -338,7 +338,7 @@ func (m *model) view(arg string) tea.Cmd {
 		}
 	}
 	return func() tea.Msg {
-		img, err := core.DecodeImage(imgs[n-1], 800)
+		img, err := core.DecodeImage(context.Background(), imgs[n-1], 800)
 		if err != nil {
 			return outMsg{lines: []string{"! cannot decode image: " + err.Error()}}
 		}
@@ -369,7 +369,7 @@ func (m *model) inline(peer core.PeerID, path string, kind common.TermImage) tea
 	}
 	id := m.nextImage
 	return func() tea.Msg {
-		img, err := core.DecodeImage(path, 320)
+		img, err := core.DecodeImage(context.Background(), path, 320)
 		if err != nil {
 			return nil
 		}

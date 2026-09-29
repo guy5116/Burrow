@@ -8,6 +8,8 @@ import (
 	"os"
 	"path/filepath"
 	"runtime/debug"
+	"strings"
+	"sync"
 
 	"golang.org/x/crypto/argon2"
 
@@ -18,12 +20,14 @@ import (
 // Directory and file names under the data directory.
 const (
 	StoreDir    = "store"
+	initDir     = "store.init" // a store being created; removed by recovery
 	newDir      = "store.new"
 	oldDir      = "store.old"
 	headerFile  = "master.hdr"
 	keyFile     = "master.key"
-	lockFile    = "lock"
-	IdentityKey = "identity" // blob relpath
+	lockFile    = "lock"       // inside store/: the lock of versions before the store lock moved; still honoured
+	dataLock    = "store.lock" // in the data directory: the lock
+	IdentityKey = "identity"   // blob relpath
 )
 
 // Errors reported to the user.
@@ -37,14 +41,52 @@ var (
 	// but store.old (encrypted under the previous key) could not be deleted;
 	// Recover removes it at the next start.
 	ErrOldStoreRemains = errors.New("store: passphrase changed, but the old store copy could not be removed")
+	// ErrClosed is returned by every operation on a store that was closed, or
+	// that closed itself because a passphrase change left it unusable.
+	ErrClosed = errors.New("store: closed")
 )
 
-// Store is an unlocked store. One process holds it at a time.
+// Store is an unlocked store. One process holds it at a time: the lock is
+// <data>/store.lock, beside the directories that a passphrase change renames,
+// so it is held across the whole change and across recovery.
 type Store struct {
-	dir    string // <data>/store
+	mu     sync.RWMutex // blob operations share it; passphrase change and Close take it alone
+	dir    string       // <data>/store
 	hdr    Header
-	master *secret.Buffer
+	master *secret.Buffer // nil once closed
 	lock   *os.File
+}
+
+// lockData takes the store lock for dataDir and repairs an interrupted
+// passphrase change. Nothing under dataDir is touched before the lock is
+// held, so a second process can never disturb one that is running.
+func lockData(dataDir string) (*os.File, error) {
+	if !exists(dataDir) {
+		return nil, ErrNoStore
+	}
+	lock, err := acquireLock(filepath.Join(dataDir, dataLock))
+	if err != nil {
+		return nil, err
+	}
+	// A process of an older version locks store/lock (or the copy that a
+	// passphrase change has moved aside) and does not know this lock.
+	for _, d := range []string{StoreDir, oldDir} {
+		legacy := filepath.Join(dataDir, d, lockFile)
+		if !exists(legacy) {
+			continue
+		}
+		l, err := acquireLock(legacy)
+		if err != nil {
+			_ = releaseLock(lock)
+			return nil, err
+		}
+		_ = releaseLock(l)
+	}
+	if err := recoverSwap(dataDir); err != nil {
+		_ = releaseLock(lock)
+		return nil, err
+	}
+	return lock, nil
 }
 
 // Options for Init and ChangePassphrase.
@@ -61,23 +103,27 @@ func (o Options) kdf() Argon2 {
 }
 
 // Mode reads the header and reports which unlock mode the store uses, so a UI
-// knows whether to prompt for a passphrase. Runs recovery first.
+// knows whether to prompt for a passphrase. It fails with ErrInUse when
+// another process holds the store.
 func Mode(dataDir string) (uint8, error) {
-	if err := Recover(dataDir); err != nil {
+	lock, err := lockData(dataDir)
+	if err != nil {
 		return 0, err
 	}
-	b, err := os.ReadFile(filepath.Join(dataDir, StoreDir, headerFile))
+	defer func() { _ = releaseLock(lock) }()
+	h, err := readHeader(filepath.Join(dataDir, StoreDir))
+	return h.Mode, err
+}
+
+func readHeader(dir string) (Header, error) {
+	b, err := os.ReadFile(filepath.Join(dir, headerFile)) // #nosec G304 -- our store directory
 	if errors.Is(err, os.ErrNotExist) {
-		return 0, ErrNoStore
+		return Header{}, ErrNoStore
 	}
 	if err != nil {
-		return 0, err
+		return Header{}, err
 	}
-	h, err := ParseHeader(b)
-	if err != nil {
-		return 0, err
-	}
-	return h.Mode, nil
+	return ParseHeader(b)
 }
 
 // Init creates a new store with a fresh identity. passphrase == nil selects
@@ -85,16 +131,33 @@ func Mode(dataDir string) (uint8, error) {
 // refuses to run while store/, store.new/ or store.old/ exists.
 func Init(dataDir string, passphrase []byte, opts Options) (*Store, error) {
 	defer secret.Wipe(passphrase)
+	if passphrase != nil && len(passphrase) == 0 {
+		return nil, ErrPassphraseEmpty
+	}
+	if exists(filepath.Join(dataDir, StoreDir)) {
+		return nil, ErrExists // said before the lock is tried: "exists" is the better answer than "in use"
+	}
+	if err := os.MkdirAll(dataDir, dirPerm); err != nil {
+		return nil, err
+	}
+	lock, err := acquireLock(filepath.Join(dataDir, dataLock))
+	if err != nil {
+		return nil, err
+	}
+	s, err := initLocked(dataDir, passphrase, opts)
+	if err != nil {
+		_ = releaseLock(lock)
+		return nil, err
+	}
+	s.lock = lock
+	return s, nil
+}
+
+func initLocked(dataDir string, passphrase []byte, opts Options) (*Store, error) {
 	for _, d := range []string{StoreDir, newDir, oldDir} {
 		if exists(filepath.Join(dataDir, d)) {
 			return nil, ErrExists
 		}
-	}
-	if passphrase != nil && len(passphrase) == 0 {
-		return nil, ErrPassphraseEmpty
-	}
-	if err := os.MkdirAll(dataDir, dirPerm); err != nil {
-		return nil, err
 	}
 	id, err := identity.Generate()
 	if err != nil {
@@ -109,7 +172,7 @@ func Init(dataDir string, passphrase []byte, opts Options) (*Store, error) {
 	idBlob := encodeIdentity(id, onionSeed.Bytes())
 	defer secret.Wipe(idBlob)
 
-	tmp := filepath.Join(dataDir, "store.init")
+	tmp := filepath.Join(dataDir, initDir)
 	_ = os.RemoveAll(tmp)
 	master, hdr, err := buildStore(tmp, passphrase, opts.kdf(), map[string][]byte{IdentityKey: idBlob})
 	if err != nil {
@@ -117,25 +180,22 @@ func Init(dataDir string, passphrase []byte, opts Options) (*Store, error) {
 		return nil, err
 	}
 	dir := filepath.Join(dataDir, StoreDir)
-	if err := os.Rename(tmp, dir); err != nil {
+	if err = rename(tmp, dir); err == nil {
+		err = syncDir(dataDir)
+	}
+	if err != nil {
 		master.Clear()
 		_ = os.RemoveAll(tmp)
 		return nil, err
 	}
-	if err := syncDir(dataDir); err != nil {
-		master.Clear()
-		return nil, err
-	}
-	lock, err := acquireLock(filepath.Join(dir, lockFile))
-	if err != nil {
-		master.Clear()
-		return nil, err
-	}
-	return &Store{dir: dir, hdr: hdr, master: master, lock: lock}, nil
+	return &Store{dir: dir, hdr: hdr, master: master}, nil
 }
 
+// rename is os.Rename; tests replace it to make a step of the swap fail.
+var rename = os.Rename
+
 // buildStore writes a complete store directory at dir: header, master.key for
-// ModeNone, every blob, and a lock file; then fsyncs the tree. Returns the master key.
+// ModeNone and every blob; then fsyncs the tree. Returns the master key.
 func buildStore(dir string, passphrase []byte, kdf Argon2, blobs map[string][]byte) (*secret.Buffer, Header, error) {
 	if err := os.MkdirAll(dir, dirPerm); err != nil {
 		return nil, Header{}, err
@@ -173,10 +233,6 @@ func buildStore(dir string, passphrase []byte, kdf Argon2, blobs map[string][]by
 			return nil, Header{}, err
 		}
 	}
-	if err := writeFileAtomic(filepath.Join(dir, lockFile), nil); err != nil {
-		master.Clear()
-		return nil, Header{}, err
-	}
 	if err := syncTree(dir); err != nil {
 		master.Clear()
 		return nil, Header{}, err
@@ -200,85 +256,120 @@ func writeBlob(dir string, master *secret.Buffer, rel string, pt []byte) error {
 		return err
 	}
 	p := filepath.Join(dir, filepath.FromSlash(rel))
-	if err := os.MkdirAll(filepath.Dir(p), dirPerm); err != nil {
-		return err
+	// Only the sub-directory is created, never the store itself: if the store
+	// directory is gone, writing must fail rather than start an empty one.
+	if sub := filepath.Dir(p); sub != dir {
+		if err := os.Mkdir(sub, dirPerm); err != nil && !errors.Is(err, os.ErrExist) {
+			return err
+		}
 	}
 	return writeFileAtomic(p, blob)
 }
 
-// Open runs recovery, parses the header, derives or loads the master key,
-// takes the exclusive lock and verifies the key by opening the identity blob.
-// passphrase is wiped. For a ModePassphrase store an empty passphrase yields
+// Open takes the lock, runs recovery, parses the header, derives or loads the
+// master key and verifies it by opening the identity blob. passphrase is
+// wiped. For a ModePassphrase store an empty passphrase yields
 // ErrPassphraseRequired; for ModeNone it is ignored.
 func Open(dataDir string, passphrase []byte) (*Store, error) {
 	defer secret.Wipe(passphrase)
-	if err := Recover(dataDir); err != nil {
-		return nil, err
-	}
-	dir := filepath.Join(dataDir, StoreDir)
-	hb, err := os.ReadFile(filepath.Join(dir, headerFile))
-	if errors.Is(err, os.ErrNotExist) {
-		return nil, ErrNoStore
-	}
+	lock, err := lockData(dataDir)
 	if err != nil {
 		return nil, err
 	}
-	hdr, err := ParseHeader(hb)
+	s, err := openLocked(filepath.Join(dataDir, StoreDir), passphrase)
+	if err != nil {
+		_ = releaseLock(lock)
+		return nil, err
+	}
+	s.lock = lock
+	return s, nil
+}
+
+func openLocked(dir string, passphrase []byte) (*Store, error) {
+	hdr, err := readHeader(dir)
 	if err != nil {
 		return nil, err
 	}
-	lock, err := acquireLock(filepath.Join(dir, lockFile))
-	if err != nil {
-		return nil, err
-	}
+	removeTemps(dir)
 	var master *secret.Buffer
 	switch hdr.Mode {
 	case ModeNone:
-		kb, err := os.ReadFile(filepath.Join(dir, keyFile))
+		kb, err := os.ReadFile(filepath.Join(dir, keyFile)) // #nosec G304 -- our store directory
 		if err != nil || len(kb) != MasterKeyLen {
-			_ = releaseLock(lock)
 			return nil, ErrBlob
 		}
 		master = secret.From(kb)
 	default:
 		if len(passphrase) == 0 {
-			_ = releaseLock(lock)
 			return nil, ErrPassphraseRequired
 		}
 		master = deriveMaster(passphrase, hdr)
 	}
-	s := &Store{dir: dir, hdr: hdr, master: master, lock: lock}
+	s := &Store{dir: dir, hdr: hdr, master: master}
 	idb, err := s.ReadBlob(IdentityKey)
 	if err != nil {
-		s.Close()
+		master.Clear()
 		return nil, err
 	}
 	secret.Wipe(idb)
 	return s, nil
 }
 
-// Close wipes the master key and releases the lock.
+// removeTemps deletes what an interrupted atomic write left behind.
+func removeTemps(dir string) {
+	_ = filepath.WalkDir(dir, func(p string, d os.DirEntry, err error) error {
+		if err == nil && !d.IsDir() && strings.HasPrefix(d.Name(), tempPrefix) {
+			_ = os.Remove(p)
+		}
+		return nil
+	})
+}
+
+// Close wipes the master key and releases the lock. Operations on a closed
+// store fail with ErrClosed.
 func (s *Store) Close() {
 	if s == nil {
 		return
 	}
-	s.master.Clear()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.closeLocked()
+}
+
+func (s *Store) closeLocked() {
+	if s.master != nil {
+		s.master.Clear()
+		s.master = nil
+	}
 	_ = releaseLock(s.lock)
 	s.lock = nil
 }
 
 // Mode returns the unlock mode of the open store.
-func (s *Store) Mode() uint8 { return s.hdr.Mode }
+func (s *Store) Mode() uint8 {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.hdr.Mode
+}
 
 // Dir returns the store directory.
 func (s *Store) Dir() string { return s.dir }
 
 // ReadBlob decrypts the blob at relpath. Callers wipe the result when it holds secrets.
 func (s *Store) ReadBlob(relpath string) ([]byte, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.readBlob(relpath)
+}
+
+func (s *Store) readBlob(relpath string) ([]byte, error) {
+	if s.master == nil {
+		return nil, ErrClosed
+	}
 	if !validRelPath(relpath) {
 		return nil, ErrRelPath
 	}
-	b, err := os.ReadFile(filepath.Join(s.dir, filepath.FromSlash(relpath)))
+	b, err := os.ReadFile(filepath.Join(s.dir, filepath.FromSlash(relpath))) // #nosec G304 -- relpath is validated
 	if err != nil {
 		return nil, err
 	}
@@ -287,23 +378,38 @@ func (s *Store) ReadBlob(relpath string) ([]byte, error) {
 
 // WriteBlob atomically writes an encrypted blob at relpath.
 func (s *Store) WriteBlob(relpath string, plaintext []byte) error {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.master == nil {
+		return ErrClosed
+	}
 	return writeBlob(s.dir, s.master, relpath, plaintext)
 }
 
 // DeleteBlob removes a blob; a missing blob is not an error.
 func (s *Store) DeleteBlob(relpath string) error {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.master == nil {
+		return ErrClosed
+	}
 	if !validRelPath(relpath) {
 		return ErrRelPath
 	}
-	err := os.Remove(filepath.Join(s.dir, filepath.FromSlash(relpath)))
-	if err != nil && !errors.Is(err, os.ErrNotExist) {
+	p := filepath.Join(s.dir, filepath.FromSlash(relpath))
+	if err := os.Remove(p); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
-	return syncDir(filepath.Dir(filepath.Join(s.dir, filepath.FromSlash(relpath))))
+	return syncDir(filepath.Dir(p))
 }
 
 // ListBlobs returns the relpaths of blobs directly under subdir (e.g. "partials").
 func (s *Store) ListBlobs(subdir string) ([]string, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.master == nil {
+		return nil, ErrClosed
+	}
 	if subdir != "" && !validRelPath(subdir) {
 		return nil, ErrRelPath
 	}
@@ -323,7 +429,7 @@ func (s *Store) ListBlobs(subdir string) ([]string, error) {
 		if subdir != "" {
 			rel = subdir + "/" + rel
 		}
-		if validRelPath(rel) && (subdir != "" || rel != headerFile && rel != keyFile && rel != lockFile) {
+		if validRelPath(rel) { // the header, key and lock files are not valid blob names
 			out = append(out, rel)
 		}
 	}
@@ -391,11 +497,18 @@ var swapStep = func(int) error { return nil }
 
 // ChangePassphrase re-encrypts every blob under a new master key (new
 // passphrase, or ModeNone when newPassphrase is nil) using the atomic
-// directory swap of §7. The store stays open and usable afterwards.
+// directory swap of §7. Nothing else reads or writes the store meanwhile. The
+// store stays open and usable afterwards; if the change fails half way and
+// cannot be undone, the store closes itself, and the next Open repairs it.
 func (s *Store) ChangePassphrase(newPassphrase []byte, opts Options) error {
 	defer secret.Wipe(newPassphrase)
 	if newPassphrase != nil && len(newPassphrase) == 0 {
 		return ErrPassphraseEmpty
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.master == nil {
+		return ErrClosed
 	}
 	dataDir := filepath.Dir(s.dir)
 	nd, od := filepath.Join(dataDir, newDir), filepath.Join(dataDir, oldDir)
@@ -413,10 +526,10 @@ func (s *Store) ChangePassphrase(newPassphrase []byte, opts Options) error {
 		}
 		rel, _ := filepath.Rel(s.dir, p)
 		rel = filepath.ToSlash(rel)
-		if rel == headerFile || rel == keyFile || rel == lockFile || !validRelPath(rel) {
-			return nil
+		if !validRelPath(rel) {
+			return nil // header, key, lock, temporary files
 		}
-		pt, err := s.ReadBlob(rel)
+		pt, err := s.readBlob(rel)
 		if err != nil {
 			return err
 		}
@@ -426,7 +539,19 @@ func (s *Store) ChangePassphrase(newPassphrase []byte, opts Options) error {
 		return err
 	}
 
-	if err := swapStep(0); err != nil {
+	// A failing swapStep stands for the process dying at that point: no
+	// cleanup happens, and the store is unusable until recovery has run.
+	crash := func(step int, master *secret.Buffer) error {
+		err := swapStep(step)
+		if err != nil {
+			if master != nil {
+				master.Clear()
+			}
+			s.closeLocked()
+		}
+		return err
+	}
+	if err := crash(0, nil); err != nil {
 		return err
 	}
 	master, hdr, err := buildStore(nd, newPassphrase, opts.kdf(), blobs)
@@ -434,37 +559,39 @@ func (s *Store) ChangePassphrase(newPassphrase []byte, opts Options) error {
 		_ = os.RemoveAll(nd)
 		return err
 	}
-	if err := swapStep(1); err != nil { // store.new complete, nothing renamed yet
-		master.Clear()
+	if err := crash(1, master); err != nil { // store.new complete, nothing renamed yet
 		return err
 	}
-	if err := os.Rename(s.dir, od); err != nil {
+	if err = rename(s.dir, od); err == nil {
+		err = syncDir(dataDir)
+	}
+	if err != nil {
 		master.Clear()
+		_ = rename(od, s.dir) // if the rename itself failed there is nothing to undo
 		_ = os.RemoveAll(nd)
 		return err
 	}
-	_ = syncDir(dataDir)
-	if err := swapStep(2); err != nil { // store.old + store.new, no store
-		master.Clear()
+	if err := crash(2, master); err != nil { // store.old + store.new, no store
 		return err
 	}
-	if err := os.Rename(nd, s.dir); err != nil {
-		master.Clear()
-		return err
+	if err = rename(nd, s.dir); err == nil {
+		err = syncDir(dataDir)
 	}
-	_ = syncDir(dataDir)
-	if err := swapStep(3); err != nil { // store + store.old
-		master.Clear()
-		return err
-	}
-	// Take the new lock before releasing the old one (Windows cannot delete an open file).
-	lock, err := acquireLock(filepath.Join(s.dir, lockFile))
 	if err != nil {
 		master.Clear()
+		// Back to the old store. If that fails too, this process must not
+		// write another byte: recovery at the next start sorts it out.
+		_ = rename(s.dir, nd)
+		if rename(od, s.dir) != nil {
+			s.closeLocked()
+		} else {
+			_ = os.RemoveAll(nd)
+		}
 		return err
 	}
-	_ = releaseLock(s.lock)
-	s.lock = lock
+	if err := crash(3, master); err != nil { // store + store.old
+		return err
+	}
 	s.master.Clear()
 	s.master, s.hdr = master, hdr
 	if err := os.RemoveAll(od); err != nil {
@@ -473,31 +600,40 @@ func (s *Store) ChangePassphrase(newPassphrase []byte, opts Options) error {
 	return syncDir(dataDir)
 }
 
-// Recover repairs an interrupted directory swap (§7). It is safe to call at
-// every startup and requires no key.
+// Recover repairs an interrupted directory swap (§7). It requires no key. It
+// fails with ErrInUse while another process holds the store, whose
+// directories it must not touch.
 func Recover(dataDir string) error {
+	lock, err := lockData(dataDir)
+	if errors.Is(err, ErrNoStore) {
+		return nil // no data directory: nothing to repair
+	}
+	if err != nil {
+		return err
+	}
+	return releaseLock(lock)
+}
+
+// recoverSwap is Recover for a caller that holds the lock.
+func recoverSwap(dataDir string) error {
 	st, nd, od := filepath.Join(dataDir, StoreDir), filepath.Join(dataDir, newDir), filepath.Join(dataDir, oldDir)
-	_ = os.RemoveAll(filepath.Join(dataDir, "store.init"))
+	_ = os.RemoveAll(filepath.Join(dataDir, initDir))
 	hasStore, hasNew, hasOld := exists(st), exists(nd), exists(od)
 	if !hasStore {
 		switch {
 		case hasNew && hasOld:
 			// The new store was complete before the first rename: roll forward.
-			if err := os.Rename(nd, st); err != nil {
+			if err := rename(nd, st); err != nil {
 				return err
 			}
 		case hasOld:
-			if err := os.Rename(od, st); err != nil {
-				return err
-			}
-		case hasNew:
-			// Unreachable from the swap sequence; store.new alone is incomplete by construction.
-			if err := os.RemoveAll(nd); err != nil {
+			if err := rename(od, st); err != nil {
 				return err
 			}
 		}
 	}
-	// With store/ in place, any leftover is stale.
+	// With store/ in place (or nothing to save), any leftover is stale.
+	// store.new alone is incomplete by construction.
 	if err := os.RemoveAll(nd); err != nil {
 		return err
 	}

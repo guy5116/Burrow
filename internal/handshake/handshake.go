@@ -43,7 +43,8 @@ type Result struct {
 	Token *[wire.InviteTokenSz]byte
 }
 
-// Error reports the stage at which a handshake failed. It never contains peer data.
+// Error reports the stage at which a handshake failed. Err may be a network
+// error that names the remote address: log the Stage, never the text.
 type Error struct {
 	Stage string
 	Err   error
@@ -167,22 +168,27 @@ func Initiate(ctx context.Context, conn net.Conn, self *identity.Identity, peer 
 // written anything after msg2 (and nothing at all before msg1 verifies); the
 // caller closes conn silently. replay may be nil (tests only).
 func Respond(ctx context.Context, conn net.Conn, self *identity.Identity, auth Authorizer, replay *ReplayLRU) (*Result, error) {
+	start := time.Now()
 	stop := armDeadline(ctx, conn, wire.HandshakeTimeout)
 	defer stop()
-	if err := conn.SetReadDeadline(time.Now().Add(wire.HandshakeMsg1Wait)); err != nil {
+	if err := conn.SetReadDeadline(start.Add(wire.HandshakeMsg1Wait)); err != nil {
 		return nil, fail("msg1", err)
 	}
 	msg1, err := readHS(conn, wire.HS1Len)
 	if err != nil {
 		return nil, fail("msg1", err)
 	}
-	if err := conn.SetReadDeadline(time.Now().Add(wire.HandshakeTimeout)); err != nil {
+	// Back to the one deadline for the whole handshake, counted from accept.
+	if err := conn.SetReadDeadline(start.Add(wire.HandshakeTimeout)); err != nil {
+		return nil, fail("msg1", err)
+	}
+	if err := ctx.Err(); err != nil { // the line above may have undone a cancellation
 		return nil, fail("msg1", err)
 	}
 	// Cost ordering: replay check (map lookup) before any DH.
 	var epub [wire.X25519Size]byte
 	copy(epub[:], msg1)
-	if replay != nil && replay.Seen(epub) {
+	if replay != nil && replay.Contains(epub) {
 		return nil, fail("msg1", ErrReplay)
 	}
 
@@ -200,6 +206,9 @@ func Respond(ctx context.Context, conn net.Conn, self *identity.Identity, auth A
 	pt1, _, _, err := hs.ReadMessage(nil, msg1)
 	if err != nil {
 		return nil, fail("msg1", err)
+	}
+	if replay != nil && !replay.Add(epub) {
+		return nil, fail("msg1", ErrReplay)
 	}
 	var hs1 wire.HS1
 	if err := wire.DecodeHS1(pt1, &hs1); err != nil {

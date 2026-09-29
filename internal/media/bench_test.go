@@ -2,6 +2,7 @@ package media
 
 import (
 	"bytes"
+	"context"
 	"image"
 	"io"
 	"os"
@@ -53,7 +54,7 @@ func BenchmarkPrepare(b *testing.B) {
 	}
 	b.SetBytes(int64(len(data)))
 	for i := 0; i < b.N; i++ {
-		if _, err := Prepare(path, ModeStrip, 0); err != nil {
+		if _, err := Prepare(context.Background(), path, ModeStrip, 0); err != nil {
 			b.Fatal(err)
 		}
 	}

@@ -294,7 +294,7 @@ func (a *App) imageBubble(r *row) fyne.CanvasObject {
 	img.SetMinSize(fyne.NewSize(256, 192))
 	path := r.path
 	go func() {
-		th, err := core.DecodeImage(path, 512)
+		th, err := core.DecodeImage(context.Background(), path, 512)
 		fyne.Do(func() {
 			if err != nil {
 				img.Hide()
@@ -357,7 +357,7 @@ func (a *App) showViewer(path string) {
 	}
 	w.SetContent(container.NewBorder(container.NewHBox(toggle, widget.NewLabel(path)), nil, nil, nil, scroll))
 	go func() {
-		decoded, err := core.DecodeImage(path, 0)
+		decoded, err := core.DecodeImage(context.Background(), path, 0)
 		fyne.Do(func() {
 			if err != nil {
 				dialog.ShowError(err, w)

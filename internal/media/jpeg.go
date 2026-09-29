@@ -18,7 +18,6 @@ const (
 	mAPP0  = 0xE0
 	mAPP1  = 0xE1
 	mAPP14 = 0xEE
-	mCOM   = 0xFE
 )
 
 // minimal JFIF APP0: length 16, "JFIF\0", 1.01, no units, 1×1, no thumbnail.
@@ -28,9 +27,14 @@ func isSOF(m byte) bool {
 	return m >= 0xC0 && m <= 0xCF && m != mDHT && m != 0xC8 && m != mDAC
 }
 
-// jpegKeep says whether a segment survives strip mode.
-func jpegKeep(m byte) bool {
-	return isSOF(m) || m == mDQT || m == mDHT || m == mDAC || m == mDRI || m == mSOS || m == mAPP14
+// jpegKeep says whether a segment survives strip mode. APP14 is kept only in
+// the shape of the Adobe transform segment (needed for correct colours):
+// under that marker anything else could carry arbitrary bytes.
+func jpegKeep(m byte, payload []byte) bool {
+	if m == mAPP14 {
+		return len(payload) == 12 && string(payload[:5]) == "Adobe"
+	}
+	return isSOF(m) || m == mDQT || m == mDHT || m == mDAC || m == mDRI || m == mSOS
 }
 
 // stripJPEG streams r to w keeping only structural segments. It returns the
@@ -97,7 +101,7 @@ func stripJPEG(w io.Writer, r io.Reader) (orientation int, err error) {
 			if len(payload) >= 6 && string(payload[:6]) == "Exif\x00\x00" && orientation == 0 {
 				orientation = exifOrientation(payload[6:])
 			}
-		case jpegKeep(m):
+		case jpegKeep(m, payload):
 			if _, err := bw.Write([]byte{0xFF, m, lb[0], lb[1]}); err != nil {
 				return 0, err
 			}

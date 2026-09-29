@@ -4,7 +4,9 @@
 package media
 
 import (
+	"bufio"
 	"bytes"
+	"context"
 	"errors"
 	"image"
 	"image/color"
@@ -101,21 +103,38 @@ func bytesPerPixel(m color.Model) int {
 
 // Probe sniffs and gates an image without decoding pixels. For GIF it
 // pre-scans the block structure to count frames and sum frame areas.
-func Probe(data []byte) (Info, error) {
-	f, err := Sniff(data)
+func Probe(data []byte) (Info, error) { return probe(bytes.NewReader(data)) }
+
+// probe is Probe over a file or buffer. It reads headers and, for GIF, walks
+// the block structure; the image is never held in memory.
+func probe(r io.ReadSeeker) (Info, error) {
+	rewind := func() (io.Reader, error) {
+		_, err := r.Seek(0, io.SeekStart)
+		return bufio.NewReader(r), err
+	}
+	rd, err := rewind()
 	if err != nil {
+		return Info{}, err
+	}
+	head := make([]byte, SniffLen)
+	n, _ := io.ReadFull(rd, head)
+	f, err := Sniff(head[:n])
+	if err != nil {
+		return Info{}, err
+	}
+	if rd, err = rewind(); err != nil {
 		return Info{}, err
 	}
 	var cfg image.Config
 	switch f {
 	case wire.FormatPNG:
-		cfg, err = png.DecodeConfig(bytes.NewReader(data))
+		cfg, err = png.DecodeConfig(rd)
 	case wire.FormatJPEG:
-		cfg, err = jpeg.DecodeConfig(bytes.NewReader(data))
+		cfg, err = jpeg.DecodeConfig(rd)
 	case wire.FormatWebP:
-		cfg, err = webp.DecodeConfig(bytes.NewReader(data))
+		cfg, err = webp.DecodeConfig(rd)
 	case wire.FormatGIF:
-		cfg, err = gif.DecodeConfig(bytes.NewReader(data))
+		cfg, err = gif.DecodeConfig(rd)
 	}
 	if err != nil {
 		return Info{}, ErrCorrupt
@@ -127,40 +146,63 @@ func Probe(data []byte) (Info, error) {
 		return Info{}, ErrTooLarge
 	}
 	info := Info{Format: f, Width: cfg.Width, Height: cfg.Height, Frames: 1}
-	switch f {
-	case wire.FormatGIF:
-		frames, area, err := gifPrescan(data)
-		if err != nil {
+	if f != wire.FormatGIF && f != wire.FormatWebP {
+		return info, nil
+	}
+	if rd, err = rewind(); err != nil {
+		return Info{}, err
+	}
+	if f == wire.FormatWebP {
+		if animated, err := webpAnimated(rd); err != nil {
 			return Info{}, err
-		}
-		if frames > wire.MaxGIFFrames || area > wire.MaxImagePixels {
-			return Info{}, ErrTooLarge
-		}
-		info.Frames, info.Animated = frames, frames > 1
-	case wire.FormatWebP:
-		if webpAnimated(data) {
+		} else if animated {
 			return Info{}, ErrAnimated
 		}
+		return info, nil
 	}
+	frames, _, err := gifPrescan(rd)
+	if err != nil {
+		return Info{}, err
+	}
+	info.Frames, info.Animated = frames, frames > 1
 	return info, nil
 }
 
 // decodeSem allows two full-size decodes at a time process-wide.
 var decodeSem = make(chan struct{}, wire.MaxConcurrentDecode)
 
+// acquire takes a decode slot, waiting while two decodes are running.
+func acquire(ctx context.Context) error {
+	select {
+	case decodeSem <- struct{}{}:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func release() { <-decodeSem }
+
 // Decode gates then decodes with the stdlib decoders only (x/image/webp for
-// WebP). Animated GIFs return the first frame. It blocks while two decodes
-// are already running.
-func Decode(data []byte) (image.Image, Info, error) {
+// WebP). Animated GIFs return the first frame. It waits for a decode slot.
+func Decode(ctx context.Context, data []byte) (image.Image, Info, error) {
 	info, err := Probe(data)
 	if err != nil {
 		return nil, info, err
 	}
-	decodeSem <- struct{}{}
-	defer func() { <-decodeSem }()
-	var img image.Image
+	if err := acquire(ctx); err != nil {
+		return nil, info, err
+	}
+	defer release()
+	img, err := decode(data, info.Format)
+	return img, info, err
+}
+
+// decode runs the decoder for a format. The caller has gated data with Probe
+// and holds a decode slot.
+func decode(data []byte, f Format) (img image.Image, err error) {
 	r := bytes.NewReader(data)
-	switch info.Format {
+	switch f {
 	case wire.FormatPNG:
 		img, err = png.Decode(r)
 	case wire.FormatJPEG:
@@ -171,27 +213,9 @@ func Decode(data []byte) (image.Image, Info, error) {
 		img, err = gif.Decode(r)
 	}
 	if err != nil {
-		return nil, info, ErrCorrupt
-	}
-	return img, info, nil
-}
-
-// DecodeGIF gates then decodes every frame (bounded by the pre-scan).
-func DecodeGIF(data []byte) (*gif.GIF, error) {
-	info, err := Probe(data)
-	if err != nil {
-		return nil, err
-	}
-	if info.Format != wire.FormatGIF {
-		return nil, ErrUnsupported
-	}
-	decodeSem <- struct{}{}
-	defer func() { <-decodeSem }()
-	g, err := gif.DecodeAll(bytes.NewReader(data))
-	if err != nil {
 		return nil, ErrCorrupt
 	}
-	return g, nil
+	return img, nil
 }
 
 // Thumbnail scales img to fit within max×max (never upscales).

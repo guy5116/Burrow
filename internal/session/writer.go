@@ -67,7 +67,9 @@ func (s *Session) writeLoop() {
 		default:
 		}
 		if f, ok := s.nextTransferFrame(); ok {
-			if err := s.writeTransfer(w, *fb, f); err != nil {
+			err := s.writeTransfer(w, *fb, f)
+			buf.Put(f.pooled)
+			if err != nil {
 				s.fail(err)
 				return
 			}
@@ -159,6 +161,9 @@ func (s *Session) handleCtrl(w *bufio.Writer, fb []byte, c ctrl) error {
 		}
 		return s.startRekey(w, fb)
 	case ctrlSendPing:
+		if s.pingNonce.Load() != s.pongNonce.Load() {
+			return nil // discarded: a PING is outstanding (§4.5)
+		}
 		nonce, err := randomNonce()
 		if err != nil {
 			return err

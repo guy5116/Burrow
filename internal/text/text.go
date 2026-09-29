@@ -57,7 +57,8 @@ func Sanitize(b []byte, f Field) (string, error) {
 			}
 			continue
 		case r == 0x200C || r == 0x200D:
-			marks = 0
+			// A joiner is not a base character: it leaves the mark count alone,
+			// or marks could be stacked without limit between joiners.
 			if f == Name {
 				continue
 			}
@@ -68,11 +69,11 @@ func Sanitize(b []byte, f Field) (string, error) {
 			sb.WriteRune(r)
 			continue
 		case unicode.Is(unicode.Mn, r) || unicode.Is(unicode.Me, r):
-			joiners = 0
 			marks++
 			if marks > maxCombiningRun {
-				continue
+				continue // dropped: it must not end a joiner run either
 			}
+			joiners = 0
 			sb.WriteRune(r)
 			continue
 		case forbidden(r):

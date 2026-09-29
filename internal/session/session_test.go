@@ -144,7 +144,7 @@ func TestPingPong(t *testing.T) {
 	}
 	// The controller sends a PING after PingInterval of silence.
 	p.i.lastWrittenAt.Store(time.Now().Add(-wire.PingInterval - time.Second).UnixNano())
-	var fs time.Time
+	var fs schedule
 	if err := p.i.tick(time.Now(), &fs); err != nil {
 		t.Fatal(err)
 	}
@@ -238,7 +238,7 @@ func TestRekeyRequestAndSchedule(t *testing.T) {
 	}
 	// Initiator's controller starts a rekey at the counter threshold.
 	p.i.sendCounter.Store(wire.RekeyInitCounter)
-	var fs time.Time
+	var fs schedule
 	if err := p.i.tick(time.Now(), &fs); err != nil {
 		t.Fatal(err)
 	}
@@ -315,7 +315,7 @@ func TestByeAndClose(t *testing.T) {
 
 func TestFailSafes(t *testing.T) {
 	p := newPair(t, time.Hour)
-	var fs time.Time
+	var fs schedule
 	now := time.Now()
 	// rekeyInFlight for > 30 s
 	p.i.rekeyInFlight.Store(true)
@@ -348,7 +348,7 @@ func TestFailSafes(t *testing.T) {
 		p.i.control <- ctrl{kind: ctrlKind(99)}
 	}
 	p.i.sendCounter.Store(wire.RekeyInitCounter)
-	if err := p.i.tick(now, &fs); err != nil || fs.IsZero() {
+	if err := p.i.tick(now, &fs); err != nil || fs.fullSince.IsZero() {
 		t.Fatal("full queue not noted", err)
 	}
 	if err := p.i.tick(now.Add(wire.ControlQueueStall), &fs); !errors.Is(err, ErrProtocol) {
@@ -468,5 +468,52 @@ func BenchmarkSealOpen(b *testing.B) {
 		if _, err := r.open(recv, frame[4:]); err != nil {
 			b.Fatal(err)
 		}
+	}
+}
+
+// While the writer is busy the controller asks for each thing once, however
+// many ticks pass, so the control queue cannot fill (§2.3).
+func TestControllerDoesNotRepeatItself(t *testing.T) {
+	for _, initiator := range []bool{true, false} {
+		s := &Session{control: make(chan ctrl, wire.ControlQueueCap), cfg: Config{Initiator: initiator}}
+		s.ctx, s.cancel = context.WithCancel(context.Background())
+		now := time.Now()
+		old := now.Add(-wire.RekeyRequestInterval - time.Second).UnixNano()
+		s.sendSwitchedAt.Store(old)
+		s.recvSwitchedAt.Store(old)
+		s.lastWrittenAt.Store(old)
+		var sched schedule
+		for n := 0; n < 20; n++ {
+			if err := s.tick(now, &sched); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if len(s.control) != 2 { // one rekey (or request) and one PING
+			t.Fatalf("initiator=%v: %d commands queued", initiator, len(s.control))
+		}
+		s.cancel()
+	}
+}
+
+// The writer sends no second PING while one is unanswered, even when two
+// commands reach it.
+func TestWriterSendsOnePing(t *testing.T) {
+	a := newAdv(t, true, true)
+	for n := 0; n < 3; n++ {
+		if err := a.s.pushControl(ctrl{kind: ctrlSendPing}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	ping := a.recv(t, wire.TypePing)
+	_ = a.s.pushControl(ctrl{kind: ctrlPong, payload: wire.AppendPong(nil, 1)})
+	if in := a.recv(t, wire.TypePong); in.Type != wire.TypePong { // the next frame is not a PING
+		t.Fatal(in.Type)
+	}
+	if err := a.p.SendFrame(wire.TypePong, wire.StreamControl, ping.Payload); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(50 * time.Millisecond)
+	if a.s.Err() != nil {
+		t.Fatal(a.s.Err())
 	}
 }

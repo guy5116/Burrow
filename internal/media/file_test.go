@@ -2,6 +2,7 @@ package media
 
 import (
 	"bytes"
+	"context"
 	"crypto/rand"
 	"errors"
 	"os"
@@ -19,7 +20,7 @@ func TestPrepareFileAndStream(t *testing.T) {
 	if err := os.WriteFile(path, data, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	p, err := PrepareFile(path, 0)
+	p, err := PrepareFile(context.Background(), path, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -28,7 +29,7 @@ func TestPrepareFileAndStream(t *testing.T) {
 	}
 	var got bytes.Buffer
 	chunks := uint32(0)
-	err = Stream(p, func(i uint32, c []byte) error {
+	err = Stream(context.Background(), p, func(i uint32, c []byte) error {
 		if i != chunks {
 			t.Fatalf("chunk %d out of order", i)
 		}
@@ -42,7 +43,7 @@ func TestPrepareFileAndStream(t *testing.T) {
 	// The file changes between the passes.
 	data[5] ^= 1
 	_ = os.WriteFile(path, data, 0o600)
-	if err := Stream(p, func(uint32, []byte) error { return nil }); !errors.Is(err, ErrDiverged) {
+	if err := Stream(context.Background(), p, func(uint32, []byte) error { return nil }); !errors.Is(err, ErrDiverged) {
 		t.Fatal(err)
 	}
 }
@@ -51,18 +52,18 @@ func TestPrepareFileRefusals(t *testing.T) {
 	dir := t.TempDir()
 	big := filepath.Join(dir, "big.zip")
 	_ = os.WriteFile(big, make([]byte, 2048), 0o600)
-	if _, err := PrepareFile(big, 1024); !errors.Is(err, ErrTooLarge) {
+	if _, err := PrepareFile(context.Background(), big, 1024); !errors.Is(err, ErrTooLarge) {
 		t.Fatal(err)
 	}
 	empty := filepath.Join(dir, "empty.pdf")
 	_ = os.WriteFile(empty, nil, 0o600)
-	if _, err := PrepareFile(empty, 0); !errors.Is(err, ErrEmpty) {
+	if _, err := PrepareFile(context.Background(), empty, 0); !errors.Is(err, ErrEmpty) {
 		t.Fatal(err)
 	}
-	if _, err := PrepareFile(dir, 0); !errors.Is(err, ErrUnsupported) {
+	if _, err := PrepareFile(context.Background(), dir, 0); !errors.Is(err, ErrUnsupported) {
 		t.Fatal(err)
 	}
-	if _, err := PrepareFile(filepath.Join(dir, "missing"), 0); !errors.Is(err, os.ErrNotExist) {
+	if _, err := PrepareFile(context.Background(), filepath.Join(dir, "missing"), 0); !errors.Is(err, os.ErrNotExist) {
 		t.Fatal(err)
 	}
 }

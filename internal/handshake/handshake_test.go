@@ -162,6 +162,64 @@ func TestReplayedMsg1(t *testing.T) {
 	if rc2.written.Load() != 0 {
 		t.Fatal("wrote on replay")
 	}
+	// Garbage from someone without the responder's key must not push the
+	// recorded msg1 out of the cache: only verified messages are recorded.
+	junk := make([]byte, wire.HSLenPrefix+wire.HS1Len)
+	binary.BigEndian.PutUint16(junk, wire.HS1Len)
+	for n := 0; n < 8; n++ {
+		binary.BigEndian.PutUint32(junk[wire.HSLenPrefix:], uint32(n+1))
+		ci, cr := net.Pipe()
+		go func() { _, _ = ci.Write(junk) }()
+		if _, err := Respond(context.Background(), cr, r, acceptAll, lru); err == nil {
+			t.Fatal("garbage msg1 accepted")
+		}
+		_, _ = ci.Close(), cr.Close()
+	}
+	if len(lru.set) != 1 {
+		t.Fatalf("%d entries recorded, want only the verified one", len(lru.set))
+	}
+}
+
+// The whole responder handshake has one deadline, counted from accept.
+func TestHandshakeDeadlineIsTotal(t *testing.T) {
+	if testing.Short() {
+		t.Skip("waits for the handshake deadline")
+	}
+	i, r := newID(t), newID(t)
+	ci, cr := net.Pipe()
+	defer func() { _, _ = ci.Close(), cr.Close() }()
+	go func() { // a valid msg1, sent late, and then silence
+		time.Sleep(wire.HandshakeMsg1Wait - time.Second)
+		_, _ = Initiate(context.Background(), ci, i, r.Public(), nil)
+	}()
+	start := time.Now()
+	_, err := Respond(context.Background(), cr, r, func(identity.PeerID, *[16]byte) Decision { return Reject }, nil)
+	if took := time.Since(start); err == nil || took > wire.HandshakeTimeout+time.Second {
+		t.Fatal(err, took)
+	}
+}
+
+// flynn/noise generates the handshake ephemeral itself; we wipe it through
+// LocalEphemeral, which only works while that aliases the library's own slice.
+func TestEphemeralIsWiped(t *testing.T) {
+	id := newID(t)
+	pub := id.Public()
+	hs, err := noise.NewHandshakeState(noise.Config{CipherSuite: suite, Pattern: noise.HandshakeXK, Initiator: true,
+		Random: rand.Reader, Prologue: []byte(wire.Prologue), PeerStatic: pub[:],
+		StaticKeypair: noise.DHKey{Private: id.Scalar(), Public: pub[:]}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, _, err := hs.WriteMessage(nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Equal(hs.LocalEphemeral().Private, make([]byte, 32)) {
+		t.Fatal("no ephemeral was generated")
+	}
+	wipeEphemeral(hs)
+	if !bytes.Equal(hs.LocalEphemeral().Private, make([]byte, 32)) {
+		t.Fatal("the ephemeral scalar is still in the handshake state")
+	}
 }
 
 // sendRaw feeds bytes to a responder and returns its error and bytes written.
@@ -293,17 +351,17 @@ func TestMsg1Deadline(t *testing.T) {
 func TestReplayLRU(t *testing.T) {
 	l := NewReplayLRU()
 	var k [32]byte
-	if l.Seen(k) || !l.Seen(k) {
+	if l.Contains(k) || !l.Add(k) || !l.Contains(k) || l.Add(k) {
 		t.Fatal("basic")
 	}
 	for i := 1; i <= wire.Msg1ReplayLRU; i++ {
 		binary.BigEndian.PutUint32(k[:], uint32(i))
-		if l.Seen(k) {
+		if l.Contains(k) || !l.Add(k) {
 			t.Fatal("fresh key seen")
 		}
 	}
 	// the very first key (all zero) has been evicted
-	if l.Seen([32]byte{}) {
+	if l.Contains([32]byte{}) {
 		t.Fatal("eviction")
 	}
 	if len(l.set) != wire.Msg1ReplayLRU {

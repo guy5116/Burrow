@@ -21,12 +21,24 @@ func NewReplayLRU() *ReplayLRU {
 	return &ReplayLRU{set: make(map[[wire.X25519Size]byte]struct{}, wire.Msg1ReplayLRU)}
 }
 
-// Seen reports whether pub was seen before and records it otherwise.
-func (l *ReplayLRU) Seen(pub [wire.X25519Size]byte) bool {
+// Contains reports whether pub belongs to a msg1 that verified before. It is
+// the cheap check made before any DH.
+func (l *ReplayLRU) Contains(pub [wire.X25519Size]byte) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	_, ok := l.set[pub]
+	return ok
+}
+
+// Add records the ephemeral of a msg1 that has verified, and reports false
+// when it was already there (a replay that raced the first copy). Only
+// verified messages are recorded: otherwise anyone, without the responder's
+// key, could push the real entries out with garbage.
+func (l *ReplayLRU) Add(pub [wire.X25519Size]byte) bool {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	if _, ok := l.set[pub]; ok {
-		return true
+		return false
 	}
 	if l.full {
 		delete(l.set, l.ring[l.pos])
@@ -37,7 +49,7 @@ func (l *ReplayLRU) Seen(pub [wire.X25519Size]byte) bool {
 	if l.pos == len(l.ring) {
 		l.pos, l.full = 0, true
 	}
-	return false
+	return true
 }
 
 // FailureLimiter counts handshake failures per key in a sliding window and

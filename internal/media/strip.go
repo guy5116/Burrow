@@ -1,8 +1,8 @@
 package media
 
 import (
-	"bufio"
 	"bytes"
+	"context"
 	"crypto/subtle"
 	"hash"
 	"image"
@@ -43,6 +43,8 @@ type Prepared struct {
 	Mode     Mode
 	Path     string
 	Ext      string // ModeRaw only: the extension offered to the peer
+
+	orientation int // EXIF orientation found by pass 1; above 1 means re-encode
 }
 
 // FormatFile marks a transfer that is not an image: the bytes travel as they are.
@@ -69,7 +71,11 @@ func FileExt(path string) string {
 
 // PrepareFile is pass 1 for a file that is not an image: it hashes the bytes
 // as they are. Nothing inside the file is removed or changed.
-func PrepareFile(path string, maxSize uint64) (Prepared, error) {
+func PrepareFile(ctx context.Context, path string, maxSize uint64) (Prepared, error) {
+	limit := uint64(wire.MaxTransferSize)
+	if maxSize > 0 {
+		limit = min(limit, maxSize)
+	}
 	st, err := os.Stat(path)
 	switch {
 	case err != nil:
@@ -78,15 +84,15 @@ func PrepareFile(path string, maxSize uint64) (Prepared, error) {
 		return Prepared{}, ErrUnsupported
 	case st.Size() == 0:
 		return Prepared{}, ErrEmpty
-	case uint64(st.Size()) > wire.MaxTransferSize, maxSize > 0 && uint64(st.Size()) > maxSize: // #nosec G115 -- a size is not negative
+	case uint64(st.Size()) > limit: // #nosec G115 -- a size is not negative
 		return Prepared{}, ErrTooLarge // refused before reading a byte
 	}
 	h, _ := blake2b.New256(nil)
 	cw := &countWriter{w: h}
-	if err := copyFile(cw, path); err != nil {
+	if err := copyFile(ctx, cw, path, limit); err != nil {
 		return Prepared{}, err
 	}
-	if maxSize > 0 && cw.n > maxSize { // it grew while we read
+	if cw.n > limit { // it grew while we read
 		return Prepared{}, ErrTooLarge
 	}
 	p := Prepared{Format: FormatFile, Size: cw.n, Mode: ModeRaw, Path: path, Ext: FileExt(path)}
@@ -94,17 +100,34 @@ func PrepareFile(path string, maxSize uint64) (Prepared, error) {
 	return p, nil
 }
 
-func copyFile(w io.Writer, path string) error {
+// ctxReader fails with the context's error once the context is done, so a
+// pass over a large file can be cancelled.
+type ctxReader struct {
+	ctx context.Context
+	r   io.Reader
+}
+
+func (c ctxReader) Read(p []byte) (int, error) {
+	if err := c.ctx.Err(); err != nil {
+		return 0, err
+	}
+	return c.r.Read(p)
+}
+
+// copyFile copies at most limit+1 bytes of path to w, so that a file that
+// keeps growing still ends and the caller can tell it went over.
+func copyFile(ctx context.Context, w io.Writer, path string, limit uint64) error {
 	f, err := os.Open(path) // #nosec G304 -- user-chosen file
 	if err != nil {
 		return err
 	}
 	defer func() { _ = f.Close() }()
-	_, err = io.Copy(w, f)
+	_, err = io.Copy(w, io.LimitReader(ctxReader{ctx, f}, int64(min(limit, wire.MaxTransferSize))+1)) // #nosec G115 -- bounded by MaxTransferSize
 	return err
 }
 
-// ProbeFile sniffs and gates a file without decoding pixels.
+// ProbeFile sniffs and gates a file without decoding pixels or holding the
+// file in memory.
 func ProbeFile(path string) (Info, error) {
 	f, err := os.Open(path) // #nosec G304 -- user-chosen file
 	if err != nil {
@@ -127,31 +150,34 @@ func ProbeFile(path string) (Info, error) {
 	if st.Size() > int64(wire.MaxImageDecodeBytes) {
 		return Info{}, ErrTooLarge
 	}
-	data, err := readAll(io.NewSectionReader(f, 0, st.Size()), int64(wire.MaxImageDecodeBytes))
-	if err != nil {
-		return Info{}, err
-	}
-	return Probe(data)
+	return probe(f)
 }
 
 // Prepare runs pass 1 over path: gates, strips (or re-encodes), hashes, and
 // records size and format for the offer. Nothing is written to disk and, in
 // strip mode without rotation, the file is never held in memory.
-func Prepare(path string, mode Mode, maxSize uint64) (Prepared, error) {
+func Prepare(ctx context.Context, path string, mode Mode, maxSize uint64) (Prepared, error) {
 	info, err := ProbeFile(path)
 	if err != nil {
 		return Prepared{}, err
 	}
-	p := Prepared{Width: info.Width, Height: info.Height, Animated: info.Animated, Mode: mode, Path: path}
-	o := orientationOfFile(path, info)
-	if orientationSwaps(o) {
-		p.Width, p.Height = info.Height, info.Width
-	}
+	p := Prepared{Format: info.Format, Width: info.Width, Height: info.Height, Animated: info.Animated, Mode: mode, Path: path}
 	h, _ := blake2b.New256(nil)
 	cw := &countWriter{w: h}
-	p.Format, err = process(path, info, mode, o, cw)
-	if err != nil {
-		return Prepared{}, err
+	// The lossless strip also reveals the orientation. When the image has to
+	// be re-encoded after all, its output is thrown away.
+	if p.orientation, err = strip(ctx, path, info.Format, cw); err != nil {
+		return Prepared{}, cancelled(ctx, err)
+	}
+	if p.reencodes() {
+		h.Reset()
+		cw.n = 0
+		if p.Format, err = reencode(ctx, path, mode, p.orientation, cw); err != nil {
+			return Prepared{}, cancelled(ctx, err)
+		}
+		if orientationSwaps(p.orientation) {
+			p.Width, p.Height = info.Height, info.Width
+		}
 	}
 	if maxSize > 0 && cw.n > maxSize {
 		return Prepared{}, ErrTooLarge
@@ -161,28 +187,48 @@ func Prepare(path string, mode Mode, maxSize uint64) (Prepared, error) {
 	return p, nil
 }
 
-// Stream runs pass 2: strips again while handing ChunkData-sized chunks to
-// sink (the last one shorter). If the output diverges from pass 1, it returns
-// ErrDiverged after the last chunk.
-func Stream(p Prepared, sink func(index uint32, chunk []byte) error) error {
+// cancelled returns the context's error when the context has ended: the
+// parsers report a read that was cut short as a malformed file.
+func cancelled(ctx context.Context, err error) error {
+	if cerr := ctx.Err(); cerr != nil {
+		return cerr
+	}
+	return err
+}
+
+// reencodes reports whether the image is decoded and encoded again instead of
+// being stripped losslessly.
+func (p Prepared) reencodes() bool { return p.Mode == ModeParanoid || p.orientation > 1 }
+
+// Stream runs pass 2: it produces the same bytes as pass 1 and hands them to
+// sink in chunks of the shape the offer implies. The moment the output stops
+// matching pass 1 (the file changed) it returns ErrDiverged; sink never sees
+// a chunk the offer did not announce.
+func Stream(ctx context.Context, p Prepared, sink func(index uint32, chunk []byte) error) error {
 	h, _ := blake2b.New256(nil)
-	ck := &chunker{sink: sink}
-	format, err := FormatFile, error(nil)
-	if p.Mode == ModeRaw {
-		err = copyFile(io.MultiWriter(h, ck), p.Path)
-	} else {
+	ck := &chunker{sink: sink, size: p.Size}
+	out := io.MultiWriter(h, ck)
+	format, orientation := p.Format, p.orientation
+	var err error
+	switch {
+	case p.Mode == ModeRaw:
+		err = copyFile(ctx, out, p.Path, p.Size)
+	case p.reencodes():
+		format, err = reencode(ctx, p.Path, p.Mode, p.orientation, out)
+	default:
 		var info Info
 		if info, err = ProbeFile(p.Path); err == nil {
-			format, err = process(p.Path, info, p.Mode, orientationOfFile(p.Path, info), io.MultiWriter(h, ck))
+			format = info.Format
+			orientation, err = strip(ctx, p.Path, info.Format, out)
 		}
 	}
 	if err != nil {
-		return err
+		return cancelled(ctx, err)
 	}
 	if err := ck.flush(); err != nil {
 		return err
 	}
-	if format != p.Format || ck.total != p.Size || subtle.ConstantTimeCompare(h.Sum(nil), p.Hash[:]) != 1 {
+	if format != p.Format || orientation != p.orientation || subtle.ConstantTimeCompare(h.Sum(nil), p.Hash[:]) != 1 {
 		return ErrDiverged
 	}
 	return nil
@@ -223,73 +269,68 @@ type errBase string
 
 func (e errBase) Error() string { return string(e) }
 
-// process writes the stripped or re-encoded image to w and returns the output format.
-func process(path string, info Info, mode Mode, orientation int, w io.Writer) (Format, error) {
-	if mode == ModeParanoid || orientation > 1 {
-		return reencode(path, info, mode, orientation, w)
-	}
+// strip writes the image at path to w without its metadata, losslessly, and
+// returns the EXIF orientation it found (0 if none).
+func strip(ctx context.Context, path string, format Format, w io.Writer) (orientation int, err error) {
 	f, err := os.Open(path) // #nosec G304 -- user-chosen file
 	if err != nil {
 		return 0, err
 	}
 	defer func() { _ = f.Close() }()
-	r := bufio.NewReaderSize(f, 64<<10)
-	switch info.Format {
+	r := ctxReader{ctx, f}
+	switch format {
 	case wire.FormatJPEG:
-		_, err = stripJPEG(w, r)
+		return stripJPEG(w, r)
 	case wire.FormatPNG:
-		_, err = stripPNG(w, r)
+		return stripPNG(w, r)
 	case wire.FormatWebP:
-		_, err = stripWebP(w, r)
+		return stripWebP(w, ctxSeeker{r, f})
 	case wire.FormatGIF:
-		err = stripGIF(w, r)
-	default:
-		err = ErrUnsupported
+		return 0, stripGIF(w, r)
 	}
-	return info.Format, err
+	return 0, ErrUnsupported
 }
 
-// orientationOfFile runs the streaming stripper with a discarded output to
-// learn the EXIF orientation without decoding pixels.
-func orientationOfFile(path string, info Info) int {
-	f, err := os.Open(path) // #nosec G304 -- user-chosen file
-	if err != nil {
-		return 0
-	}
-	defer func() { _ = f.Close() }()
-	r := bufio.NewReaderSize(f, 64<<10)
-	var o int
-	switch info.Format {
-	case wire.FormatJPEG:
-		o, _ = stripJPEG(io.Discard, r)
-	case wire.FormatPNG:
-		o, _ = stripPNG(io.Discard, r)
-	case wire.FormatWebP:
-		o, _ = stripWebP(io.Discard, r)
-	}
-	return o
+// ctxSeeker is a ctxReader that can rewind (stripWebP reads its input twice).
+type ctxSeeker struct {
+	ctxReader
+	io.Seeker
 }
 
 func orientationSwaps(o int) bool { return o >= 5 && o <= 8 }
 
-// reencode decodes (bounded by the gates and the decode semaphore), applies
-// the orientation, and encodes: PNG → PNG, JPEG → JPEG q92, WebP → PNG, GIF →
-// GIF (animated keeps its frames and delays, nothing else). Paranoid mode
-// always produces PNG except for animated GIFs.
-func reencode(path string, info Info, mode Mode, orientation int, w io.Writer) (Format, error) {
-	data, err := os.ReadFile(path) // #nosec G304 -- user-chosen file; size gated by ProbeFile
+// reencode decodes the image at path, applies the orientation, and encodes:
+// PNG → PNG, JPEG → JPEG q92, WebP → PNG, GIF → GIF (animated keeps its frames
+// and delays, nothing else). Paranoid mode always produces PNG except for
+// animated GIFs. The bytes that are decoded are the bytes that were gated,
+// and one decode slot is held from the decode to the end of the encode.
+func reencode(ctx context.Context, path string, mode Mode, orientation int, w io.Writer) (Format, error) {
+	f, err := os.Open(path) // #nosec G304 -- user-chosen file
 	if err != nil {
 		return 0, err
 	}
+	data, err := readAll(ctxReader{ctx, f}, int64(wire.MaxImageDecodeBytes))
+	_ = f.Close()
+	if err != nil {
+		return 0, err
+	}
+	info, err := Probe(data)
+	if err != nil {
+		return 0, err
+	}
+	if err := acquire(ctx); err != nil {
+		return 0, err
+	}
+	defer release()
 	if info.Format == wire.FormatGIF && info.Animated {
-		g, err := DecodeGIF(data)
+		g, err := gif.DecodeAll(bytes.NewReader(data)) // bounded by the pre-scan in Probe
 		if err != nil {
-			return 0, err
+			return 0, ErrCorrupt
 		}
 		out := &gif.GIF{Image: g.Image, Delay: g.Delay, LoopCount: g.LoopCount, Disposal: g.Disposal, Config: g.Config}
 		return wire.FormatGIF, gif.EncodeAll(w, out)
 	}
-	img, _, err := Decode(data)
+	img, err := decode(data, info.Format)
 	if err != nil {
 		return 0, err
 	}
@@ -355,9 +396,12 @@ func (c *countWriter) Write(p []byte) (int, error) {
 	return n, err
 }
 
-// chunker cuts a stream into ChunkData-sized chunks.
+// chunker cuts a stream of exactly size bytes into ChunkData-sized chunks
+// (the last one shorter). Any other length is ErrDiverged, reported before a
+// chunk of the wrong shape reaches the sink.
 type chunker struct {
 	sink  func(index uint32, chunk []byte) error
+	size  uint64
 	buf   bytes.Buffer
 	index uint32
 	total uint64
@@ -366,9 +410,11 @@ type chunker struct {
 func (c *chunker) Write(p []byte) (int, error) {
 	n := len(p)
 	c.total += uint64(n) // #nosec G115 -- n ≥ 0
+	if c.total > c.size {
+		return 0, ErrDiverged
+	}
 	for len(p) > 0 {
-		room := wire.ChunkData - c.buf.Len()
-		take := min(room, len(p))
+		take := min(wire.ChunkData-c.buf.Len(), len(p))
 		c.buf.Write(p[:take])
 		p = p[take:]
 		if c.buf.Len() == wire.ChunkData {
@@ -387,8 +433,12 @@ func (c *chunker) emit() error {
 	return err
 }
 
+// flush emits the last, shorter chunk once the stream has ended.
 func (c *chunker) flush() error {
-	if c.buf.Len() == 0 {
+	switch {
+	case c.total != c.size:
+		return ErrDiverged
+	case c.buf.Len() == 0:
 		return nil
 	}
 	return c.emit()

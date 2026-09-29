@@ -1,7 +1,6 @@
 package core
 
 import (
-	"context"
 	"crypto/rand"
 	"net"
 
@@ -43,13 +42,7 @@ func (e *Engine) runMDNS(port uint16) {
 func (e *Engine) onAnnouncement(an mdns.Announcement) {
 	if id, ok := e.matchAnnouncement(an.Nonce, an.Tag); ok {
 		addr := transport.Address{Kind: transport.KindTCP, Host: an.IP.String(), Port: an.Port}
-		e.wg.Add(1)
-		go func() {
-			defer e.wg.Done()
-			ctx, cancel := context.WithCancel(e.ctx)
-			defer cancel()
-			_ = e.dial(ctx, addr, id, nil, "") // dial records the address on success
-		}()
+		e.spawn(nil, func() { _ = e.dial(e.ctx, addr, id, nil, "") }) // dial records the address on success
 	}
 }
 
@@ -57,21 +50,17 @@ func (e *Engine) onAnnouncement(an mdns.Announcement) {
 // any, and records the nonce so the same announcement is not dialed twice.
 func (e *Engine) matchAnnouncement(nonce, tag [16]byte) (id PeerID, ok bool) {
 	e.do(func() {
-		if e.mdnsSeen == nil {
-			e.mdnsSeen = map[[16]byte]bool{}
-		}
 		if e.mdnsSeen[nonce] {
 			return
 		}
+		// Every nonce is examined once, a stranger's too: repeating an
+		// announcement costs a map lookup, not a hash per contact.
+		if len(e.mdnsSeen) >= mdnsSeenMax {
+			clear(e.mdnsSeen)
+		}
+		e.mdnsSeen[nonce] = true
 		for cid, c := range e.contacts {
-			if c.Blocked || e.peers[cid] != nil {
-				continue
-			}
-			if identity.MDNSTag(nonce, cid) == tag {
-				e.mdnsSeen[nonce] = true
-				if len(e.mdnsSeen) > 4096 {
-					e.mdnsSeen = map[[16]byte]bool{nonce: true}
-				}
+			if !c.Blocked && e.peers[cid] == nil && identity.MDNSTag(nonce, cid) == tag {
 				id, ok = cid, true
 				return
 			}
@@ -79,6 +68,8 @@ func (e *Engine) matchAnnouncement(nonce, tag [16]byte) (id PeerID, ok bool) {
 	})
 	return id, ok
 }
+
+const mdnsSeenMax = 4096
 
 // listenPortOf finds the TCP listener's port for announcements.
 func (e *Engine) listenPortOf() uint16 {

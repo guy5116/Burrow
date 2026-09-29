@@ -582,11 +582,35 @@ func TestSimultaneousDialGlare(t *testing.T) {
 		t.Fatal(err)
 	}
 	b.wait(t, "text", func(ev Event) bool { m, ok := ev.(MessageReceived); return ok && m.Text == "glare ok" })
-	// Both kept the session whose initiator has the smaller key.
-	pa := a.peerOf(b.id())
-	wantAInit := string(a.id().Fingerprint()) < string(b.id().Fingerprint())
-	if pa != nil && pa.s.Initiator() != wantAInit {
-		t.Logf("note: glare resolved by reconnect rather than tie-break (allowed)")
+	// Which session survived depends on timing: the two dials may not have
+	// overlapped, or the sides may have healed by reconnecting (§12). The rule
+	// itself is checked in TestGlareRule.
+}
+
+func TestGlareRule(t *testing.T) {
+	small, big := PeerID{1}, PeerID{2}
+	for _, c := range []struct {
+		name               string
+		self, peer         PeerID
+		newInit, oldInit   bool
+		age                time.Duration
+		newSessionGivesWay bool
+	}{
+		{"we dialed second and have the smaller key", small, big, true, false, time.Second, false},
+		{"we dialed second and have the larger key", big, small, true, false, time.Second, true},
+		{"they dialed second and have the smaller key", big, small, false, true, time.Second, false},
+		{"they dialed second and have the larger key", small, big, false, true, time.Second, true},
+		{"outside the window the newer session wins", big, small, true, false, wire.GlareWindow, false},
+		{"a redial by us", big, small, true, true, time.Second, false},
+		{"a redial by them", small, big, false, false, time.Second, false},
+	} {
+		if got := losesGlare(c.self, c.peer, c.newInit, c.oldInit, c.age); got != c.newSessionGivesWay {
+			t.Errorf("%s: %v", c.name, got)
+		}
+		// The other side looks at the same two sessions and must agree.
+		if got := losesGlare(c.peer, c.self, !c.newInit, !c.oldInit, c.age); got != c.newSessionGivesWay {
+			t.Errorf("%s: the two sides disagree", c.name)
+		}
 	}
 }
 

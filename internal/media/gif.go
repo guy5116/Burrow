@@ -2,14 +2,16 @@ package media
 
 import (
 	"bufio"
-	"bytes"
 	"io"
+
+	"github.com/guy5116/burrow/internal/wire"
 )
 
 // gifPrescan walks the block structure without decoding LZW data and returns
-// the frame count and the sum of frame areas.
-func gifPrescan(data []byte) (frames, area int, err error) {
-	r := bufio.NewReader(bytes.NewReader(data))
+// the frame count and the sum of frame areas. It stops with ErrTooLarge as
+// soon as either passes its limit.
+func gifPrescan(rd io.Reader) (frames, area int, err error) {
+	r := bufio.NewReader(rd)
 	if _, err := skipGIFHeader(r, io.Discard); err != nil {
 		return 0, 0, err
 	}
@@ -36,7 +38,7 @@ func gifPrescan(data []byte) (frames, area int, err error) {
 			w, h := int(d[4])|int(d[5])<<8, int(d[6])|int(d[7])<<8
 			frames++
 			area += w * h
-			if frames > 4096 || area > 1<<31 {
+			if frames > wire.MaxGIFFrames || area > wire.MaxImagePixels {
 				return 0, 0, ErrTooLarge
 			}
 			if d[8]&0x80 != 0 {
@@ -82,25 +84,51 @@ func skipGIFHeader(r *bufio.Reader, w io.Writer) (int, error) {
 
 // skipSubBlocks copies data sub-blocks up to and including the terminator.
 func skipSubBlocks(r *bufio.Reader, w io.Writer) error {
+	var buf [1 + 255]byte // length byte + the largest sub-block
 	for {
 		n, err := r.ReadByte()
 		if err != nil {
 			return ErrCorrupt
 		}
-		if _, err := w.Write([]byte{n}); err != nil {
+		buf[0] = n
+		if _, err := io.ReadFull(r, buf[1:1+int(n)]); err != nil {
+			return ErrCorrupt
+		}
+		if _, err := w.Write(buf[:1+int(n)]); err != nil {
 			return err
 		}
 		if n == 0 {
 			return nil
 		}
-		buf := make([]byte, n)
-		if _, err := io.ReadFull(r, buf); err != nil {
-			return ErrCorrupt
-		}
-		if _, err := w.Write(buf); err != nil {
-			return err
-		}
 	}
+}
+
+// head keeps the first bytes written to it and counts all of them, so an
+// extension of any length can be examined without being held in memory.
+type head struct {
+	b []byte
+	n int
+}
+
+func (h *head) Write(p []byte) (int, error) {
+	h.n += len(p)
+	h.b = append(h.b, p[:min(len(p), cap(h.b)-len(h.b))]...)
+	return len(p), nil
+}
+
+// gifKeepExtension says whether an extension survives: a graphic control
+// block, or the NETSCAPE2.0 loop count, each only in its one legal shape.
+// Comments, plain text, other application data and anything hiding under
+// those two labels are dropped.
+func gifKeepExtension(label byte, body []byte) bool {
+	switch label {
+	case 0xF9: // one 4-byte sub-block and the terminator
+		return len(body) == 6 && body[0] == 4 && body[5] == 0
+	case 0xFF: // "NETSCAPE2.0", then sub-block {1, loop count u16}, terminator
+		return len(body) == 17 && body[0] == 11 && string(body[1:12]) == "NETSCAPE2.0" &&
+			body[12] == 3 && body[13] == 1 && body[16] == 0
+	}
+	return false
 }
 
 // stripGIF drops comment, plain-text and application extensions except
@@ -127,19 +155,15 @@ func stripGIF(w io.Writer, r io.Reader) error {
 			if err != nil {
 				return ErrCorrupt
 			}
-			var buf bytes.Buffer
-			if err := skipSubBlocks(br, &buf); err != nil {
+			ext := head{b: make([]byte, 0, 32)}
+			if err := skipSubBlocks(br, &ext); err != nil {
 				return err
 			}
-			keep := label == 0xF9 // graphic control
-			if label == 0xFF && buf.Len() >= 12 && bytes.HasPrefix(buf.Bytes()[1:], []byte("NETSCAPE2.0")) {
-				keep = true
-			}
-			if keep {
+			if ext.n == len(ext.b) && gifKeepExtension(label, ext.b) {
 				if _, err := bw.Write([]byte{0x21, label}); err != nil {
 					return err
 				}
-				if _, err := bw.Write(buf.Bytes()); err != nil {
+				if _, err := bw.Write(ext.b); err != nil {
 					return err
 				}
 			}

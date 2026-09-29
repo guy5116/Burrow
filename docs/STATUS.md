@@ -19,14 +19,30 @@ See docs/phases/PHASE-5.md and docs/RELEASE_CHECKLIST.md.
   before accepting. Protocol v1 amended in place (HELLO `max_file`, FILE_OFFER 0x27).
 
 ## Mid-flight
-- (nothing)
+Code review, round 1 of several (five independent reviewers, about 60 findings).
+- FIXED with tests: internal/media, text, identity, invite, handshake, session,
+  core, store (locking, swap, recovery, blob names).
+- NOT STARTED: internal/transport/tor (tor.go `start` kills its own tor process: the
+  bootstrap context is passed to tor.Start; data dir lands in the working directory;
+  tor output goes to stdout; onion key never wiped), mdns rate limit in `Browse`,
+  `store.LoadConfig` validation, scripts/cover.sh, bench/cmp, `make fuzz`, go mod tidy.
+- NOT STARTED: every user-interface finding (contact names with spaces in
+  `/msg` and `/rename`, forgeable verified mark in `Names.Label`, multi-line text forging
+  lines, data race on `Controller.Current`, unbounded scrollback, flags after the
+  target ignored, GUI shutdown on Quit, blocking calls on the Fyne thread, paths with
+  spaces in `/file`).
+- Docs not yet updated for this round: CLAUDE.md §7 (lock path), PROTOCOL.md,
+  SECURITY.md, THREAT_MODEL.md, PHASE-5.md.
+- `make lint`, `make test` (full), `make test-gui`, coverage and bench not run yet.
 
 ## Next step
-- Close the open items in docs/RELEASE_CHECKLIST.md: ≥ 1 h fuzzing per target, a green CI
-  run on all three OSes, reproducibility on a second machine, Tor conformance with tor
-  installed, the manual GUI plan, a look at Kitty inline thumbnails.
+- Finish the list above, run the full gate, then start review round 2 from scratch.
+  After a clean round: the readability and comments pass the user asked for.
 
 ## Open questions for the user
+- The store lock moved from `<data>/store/lock` to `<data>/store.lock` (the old path
+  cannot be held across a passphrase change, and not at all on Windows). CLAUDE.md §7
+  still names the old path. Confirm, or say which way to go.
 - File transfer choices made without asking (docs/phases/PHASE-5.md): no file name on
   the wire (extension only), v1 amended instead of v2, default limit 100 MiB, files
   saved in the image folder, auto-accept never for files.

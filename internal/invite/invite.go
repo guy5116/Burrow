@@ -170,17 +170,32 @@ func (i *Invite) validate() error {
 	}
 	switch i.Kind {
 	case KindTCP:
-		if net.ParseIP(i.Addr) == nil && !validHostname(i.Addr) {
+		if net.ParseIP(i.Addr) == nil && !dialableHostname(i.Addr) {
 			return ErrInvalid
 		}
 	case KindTor:
-		if !strings.HasSuffix(i.Addr, onionSuffix) || len(i.Addr) != onionV3Len+len(onionSuffix) || !validHostname(i.Addr) {
+		if !validOnion(i.Addr) {
 			return ErrInvalid
 		}
 	default:
 		return ErrInvalid
 	}
 	return nil
+}
+
+// dialableHostname accepts a hostname that may be handed to the system
+// resolver. An onion name must never be (it would reveal the service to the
+// resolver), and a name whose last label is all digits is a mistyped IP
+// address, not a host.
+func dialableHostname(h string) bool {
+	last := h[strings.LastIndexByte(h, '.')+1:]
+	return validHostname(h) && !strings.HasSuffix(h, onionSuffix) && strings.Trim(last, "0123456789") != ""
+}
+
+// validOnion accepts a v3 onion address: 56 base32 characters and ".onion".
+func validOnion(h string) bool {
+	name, ok := strings.CutSuffix(h, onionSuffix)
+	return ok && len(name) == onionV3Len && strings.Trim(name, "abcdefghijklmnopqrstuvwxyz234567") == ""
 }
 
 // validHostname accepts lowercase RFC 1123 hostnames: dot-separated labels of

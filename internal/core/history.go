@@ -16,6 +16,7 @@ const (
 	historyDir     = "history"
 	historyIndex   = "history/index"
 	historySegment = 256 // records per segment blob
+	historyQueue   = 256 // records waiting for the history writer
 )
 
 // HistoryEntry is one stored message.
@@ -33,6 +34,10 @@ type histRec struct {
 	Mine bool   `json:"m"`
 	Text string `json:"t"`
 	At   int64  `json:"a"`
+
+	// flushed marks a request instead of a record: the writer closes it when
+	// everything queued before it is on disk.
+	flushed chan struct{}
 }
 
 type histIndex struct {
@@ -51,13 +56,53 @@ func (e *Engine) loadHistIndex() histIndex {
 
 func segName(n int) string { return historyDir + "/seg-" + strconv.Itoa(n) }
 
-// recordHistory appends one message when history is enabled.
-// ponytail: received messages are written on the engine goroutine (one fsync
-// per message while history is on); give history its own writer goroutine if
-// that latency ever shows up.
-func (e *Engine) recordHistory(peer PeerID, id MsgID, mine bool, text string, at time.Time) {
-	if !e.cfg.History {
+// recordHistoryL queues one message for the history writer when history is
+// on. Disk work never happens on the engine goroutine; if the disk falls a
+// whole queue behind, the engine waits for it rather than lose a record.
+func (e *Engine) recordHistoryL(peer PeerID, id MsgID, mine bool, text string, at time.Time) {
+	if e.histCh == nil {
 		return
+	}
+	rec := histRec{Peer: hex.EncodeToString(peer[:]), ID: uint64(id), Mine: mine, Text: text, At: at.Unix()}
+	select {
+	case e.histCh <- rec:
+	case <-e.sessCtx.Done(): // shutting down: the writer has stopped
+	}
+}
+
+// historyWriter is the one goroutine that writes history. It stops once the
+// sessions have ended and what was queued is written.
+func (e *Engine) historyWriter() {
+	defer e.wg.Done()
+	for {
+		select {
+		case rec := <-e.histCh:
+			e.writeHistory(rec)
+		case <-e.sessCtx.Done():
+			for {
+				select {
+				case rec := <-e.histCh:
+					e.writeHistory(rec)
+				default:
+					return
+				}
+			}
+		}
+	}
+}
+
+// writeHistory appends first and whatever else is already queued, one
+// segment write per segment touched.
+func (e *Engine) writeHistory(first histRec) {
+	batch := []histRec{first}
+	for len(batch) < historySegment {
+		select {
+		case rec := <-e.histCh:
+			batch = append(batch, rec)
+			continue
+		default:
+		}
+		break
 	}
 	e.histMu.Lock()
 	defer e.histMu.Unlock()
@@ -68,25 +113,58 @@ func (e *Engine) recordHistory(peer PeerID, id MsgID, mine bool, text string, at
 			_ = json.Unmarshal(b, &recs)
 		}
 	}
-	recs = append(recs, histRec{Peer: hex.EncodeToString(peer[:]), ID: uint64(id), Mine: mine, Text: text, At: at.Unix()})
-	b, err := json.Marshal(recs)
-	if err != nil {
+	save := func() bool {
+		b, err := json.Marshal(recs)
+		if err == nil {
+			err = e.st.WriteBlob(segName(idx.Next), b)
+		}
+		if err != nil {
+			e.log.Warn("history write failed", "err", err.Error())
+			return false
+		}
+		for len(idx.Count) <= idx.Next {
+			idx.Count = append(idx.Count, 0)
+		}
+		idx.Count[idx.Next] = len(recs)
+		return true
+	}
+	dirty := false
+	for _, rec := range batch {
+		if rec.flushed != nil {
+			defer close(rec.flushed) // after the writes below
+			continue
+		}
+		recs, dirty = append(recs, rec), true
+		if len(recs) == historySegment {
+			if !save() {
+				return
+			}
+			idx.Next++
+			recs, dirty = nil, false
+		}
+	}
+	if dirty && !save() {
 		return
-	}
-	if err := e.st.WriteBlob(segName(idx.Next), b); err != nil {
-		e.log.Warn("history write failed", "err", err.Error())
-		return
-	}
-	for len(idx.Count) <= idx.Next {
-		idx.Count = append(idx.Count, 0)
-	}
-	idx.Count[idx.Next] = len(recs)
-	if len(recs) >= historySegment {
-		idx.Next++
-		idx.Count = append(idx.Count, 0)
 	}
 	if ib, err := json.Marshal(idx); err == nil {
 		_ = e.st.WriteBlob(historyIndex, ib)
+	}
+}
+
+// flushHistory waits until every message recorded so far is on disk.
+func (e *Engine) flushHistory() {
+	if e.histCh == nil {
+		return
+	}
+	flushed := make(chan struct{})
+	select {
+	case e.histCh <- histRec{flushed: flushed}:
+		select {
+		case <-flushed:
+		case <-e.done:
+		}
+	case <-e.sessCtx.Done(): // the writer empties the queue before it stops
+		e.wg.Wait()
 	}
 }
 
@@ -98,6 +176,7 @@ func (e *Engine) History(peer PeerID, limit int) ([]HistoryEntry, error) {
 	if limit <= 0 {
 		limit = 100
 	}
+	e.flushHistory()
 	e.histMu.Lock()
 	defer e.histMu.Unlock()
 	idx := e.loadHistIndex()
@@ -132,8 +211,18 @@ func (e *Engine) History(peer PeerID, limit int) ([]HistoryEntry, error) {
 // ErrHistoryOff is returned when history is disabled.
 var ErrHistoryOff = errors.New("core: history is off (config: history = true)")
 
-// Burn deletes all stored history and every partial transfer.
+// Burn deletes all stored history and every partial transfer that is not
+// being written right now. It returns the number of files removed.
 func (e *Engine) Burn() (int, error) {
+	e.flushHistory()
+	busy := map[string]bool{} // names of partials and sidecars of running downloads
+	e.do(func() {
+		for _, t := range e.transfers {
+			if t.partPath != "" {
+				busy[t.partPath], busy[e.metaRel(t.partID)] = true, true
+			}
+		}
+	})
 	e.histMu.Lock()
 	defer e.histMu.Unlock()
 	n := 0
@@ -143,6 +232,9 @@ func (e *Engine) Burn() (int, error) {
 			return n, err
 		}
 		for _, b := range blobs {
+			if busy[b] {
+				continue
+			}
 			if err := e.st.DeleteBlob(b); err != nil {
 				return n, err
 			}
@@ -151,7 +243,7 @@ func (e *Engine) Burn() (int, error) {
 	}
 	parts, _ := listParts(e.partialsPath())
 	for _, p := range parts {
-		if removeFile(p) == nil {
+		if !busy[p] && removeFile(p) == nil {
 			n++
 		}
 	}

@@ -48,6 +48,32 @@ func TestSanitize(t *testing.T) {
 	}
 }
 
+// Joiners and dropped marks are invisible: neither may be used to get around
+// the cap on the other.
+func TestSanitizeCapsCannotBeInterleaved(t *testing.T) {
+	count := func(s string, pred func(rune) bool) (n int) {
+		for _, r := range s {
+			if pred(r) {
+				n++
+			}
+		}
+		return n
+	}
+	mark := func(r rune) bool { return r == 0x0301 }
+	joiner := func(r rune) bool { return r == 0x200D }
+	stacked := "a" + strings.Repeat("\u0301\u0301\u0301\u0301\u200d", 50)
+	for _, f := range []Field{Multiline, SingleLine, Name} {
+		got, err := Sanitize([]byte(stacked), f)
+		if err != nil || count(got, mark) > maxCombiningRun {
+			t.Errorf("field %d: %d marks on one base", f, count(got, mark))
+		}
+	}
+	got, _ := Sanitize([]byte("a\u0301\u0301\u0301\u0301"+strings.Repeat("\u200d\u200d\u0301", 50)), Multiline)
+	if count(got, joiner) > maxJoinerRun {
+		t.Errorf("%d joiners in a row", count(got, joiner))
+	}
+}
+
 func TestNormalize(t *testing.T) {
 	cases := [][2]string{
 		{"Alice", "alice"},
@@ -106,7 +132,6 @@ func checkClean(t *testing.T, s string, f Field) {
 				t.Fatal("joiner in name")
 			}
 			joiners++
-			marks = 0
 			if joiners > maxJoinerRun {
 				t.Fatal("joiner run")
 			}
@@ -127,6 +152,7 @@ func checkClean(t *testing.T, s string, f Field) {
 func FuzzSanitize(f *testing.F) {
 	for _, s := range []string{"hello", "a\r\nb", "\u202E", "👩\u200D👩", "é́́́́", "\xff", ""} {
 		f.Add([]byte(s), uint8(0))
+		f.Add([]byte("a\u0301\u0301\u0301\u0301\u200d\u0301\u200d\u200d\u0301"+s), uint8(1))
 		f.Add([]byte(s), uint8(2))
 	}
 	f.Fuzz(func(t *testing.T, b []byte, fld uint8) {

@@ -27,22 +27,48 @@ const maxPendingAcks = 1024
 // peer is the engine's record of one live session. It is owned by the engine
 // goroutine; there is no goroutine per peer in core.
 type peer struct {
-	e        *Engine
 	s        *session.Session
 	kind     transport.Kind
 	since    time.Time
-	replaced bool
+	replaced bool // a newer session has taken this one's place
 
 	queue     []*queued
-	acks      []uint64 // ACKs not yet queued on the session
-	seen      map[MsgID]struct{}
-	order     []MsgID              // ring of the last MsgIDDedupSet received ids
+	acks      []uint64             // ACKs not yet queued on the session
 	transfers map[uint16]*transfer // by stream id
 }
 
 func newPeer(e *Engine, s *session.Session, kind transport.Kind) *peer {
-	return &peer{e: e, s: s, kind: kind, since: e.now(), seen: map[MsgID]struct{}{}, transfers: map[uint16]*transfer{}}
+	return &peer{s: s, kind: kind, since: e.now(), transfers: map[uint16]*transfer{}}
 }
+
+// dedup remembers the last MsgIDDedupSet TEXT ids received from one contact,
+// so a message that is sent again after a reconnect is shown once (§4.4).
+type dedup struct {
+	seen  map[MsgID]struct{}
+	order []MsgID // oldest first
+}
+
+// seenL records id for the contact and reports whether it was there already.
+func (e *Engine) seenL(contact PeerID, id MsgID) bool {
+	d := e.dedup[contact]
+	if d == nil {
+		d = &dedup{seen: map[MsgID]struct{}{}}
+		e.dedup[contact] = d
+	}
+	if _, dup := d.seen[id]; dup {
+		return true
+	}
+	d.seen[id] = struct{}{}
+	d.order = append(d.order, id)
+	if len(d.order) > wire.MsgIDDedupSet {
+		delete(d.seen, d.order[0])
+		d.order = d.order[1:]
+	}
+	return false
+}
+
+// reconnect is one running reconnect loop.
+type reconnect struct{ cancel context.CancelFunc }
 
 // onInboundL handles one frame from a registered session.
 func (e *Engine) onInboundL(in session.Inbound) {
@@ -62,15 +88,7 @@ func (e *Engine) onInboundL(in session.Inbound) {
 			return
 		}
 		mid := MsgID(tx.MsgID)
-		_, dup := p.seen[mid]
-		if !dup {
-			p.seen[mid] = struct{}{}
-			p.order = append(p.order, mid)
-			if len(p.order) > wire.MsgIDDedupSet {
-				delete(p.seen, p.order[0])
-				p.order = p.order[1:]
-			}
-		}
+		dup := e.seenL(id, mid)
 		// ACK always (re-sent for duplicates); deliver once.
 		if len(p.acks) < maxPendingAcks {
 			p.acks = append(p.acks, tx.MsgID)
@@ -83,7 +101,7 @@ func (e *Engine) onInboundL(in session.Inbound) {
 		if tx.SentAt != 0 {
 			at = time.Unix(tx.SentAt, 0)
 		}
-		e.recordHistory(id, mid, false, body, e.now())
+		e.recordHistoryL(id, mid, false, body, e.now())
 		e.queueL(MessageReceived{Peer: id, ID: mid, Text: body, SentAt: at})
 	case wire.TypeAck:
 		a, err := wire.DecodeAck(in.Payload)
@@ -154,46 +172,48 @@ func (e *Engine) onSessionClosedL(s *session.Session) {
 	id := s.Peer()
 	err := s.Err()
 	e.failPeerTransfersL(p)
-	current := e.peers[id] == p
-	if current {
-		delete(e.peers, id)
-		if c, ok := e.contacts[id]; ok {
-			c.Online = false
-		}
+	if e.peers[id] != p {
+		return // replaced by a newer session, which has the queue: not a disconnect
 	}
-	// Every sent-but-undelivered message reverts to pending; the next session resends it.
-	for _, q := range p.queue {
-		if q.status == StatusSent {
-			q.status = StatusPending
-			e.queueL(MessageStatus{Peer: id, ID: q.id, Status: StatusPending})
-		}
+	delete(e.peers, id)
+	c, known := e.contacts[id]
+	if !known {
+		return // the contact was removed; its queue went with it
 	}
-	// Hand the queue to the contact's holding slot so it survives the session.
-	if current {
-		e.orphanQueues[id] = append(e.orphanQueues[id], p.queue...)
-	}
+	c.Online = false
+	// Every sent-but-undelivered message reverts to pending and waits for the
+	// next session.
+	e.revertSentL(p)
+	e.orphanQueues[id] = append(e.orphanQueues[id], p.queue...)
 	p.queue = nil
-	// A BYE "replaced" from the peer means a newer session exists (ours or theirs): not a disconnect.
-	var be *session.ByeError
-	if p.replaced || (errors.As(err, &be) && be.Reason == wire.ByeReplaced) {
-		return
-	}
 	e.queueL(PeerDisconnected{Peer: id, Reason: disconnectReason(err)})
-	if c, known := e.contacts[id]; current && known && e.cfg.AutoReconnect && len(c.Addrs) > 0 && e.ctx.Err() == nil && shouldReconnect(err) {
+	if e.cfg.AutoReconnect && len(c.Addrs) > 0 && !c.Blocked && !e.stopping && shouldReconnect(err) {
 		e.scheduleReconnectL(id)
 	}
 }
 
-// shouldReconnect: only after a lost connection or a BYE the peer did not
-// choose (local error, resource limit). A deliberate BYE, our own close, or a
-// protocol violation never triggers reconnect beacons.
+// revertSentL marks p's sent but unacknowledged messages pending again.
+func (e *Engine) revertSentL(p *peer) {
+	for _, q := range p.queue {
+		if q.status == StatusSent {
+			q.status = StatusPending
+			e.queueL(MessageStatus{Peer: p.s.Peer(), ID: q.id, Status: StatusPending})
+		}
+	}
+}
+
+// shouldReconnect: after a lost connection, or a BYE the peer did not choose:
+// a local error, a resource limit, or "replaced" while this was the only
+// session we had (the two sides disagreed about a simultaneous dial, §12). A
+// deliberate BYE, our own close, or a protocol violation never triggers
+// reconnect beacons.
 func shouldReconnect(err error) bool {
 	var be *session.ByeError
 	switch {
 	case err == nil, errors.Is(err, session.ErrClosed), errors.Is(err, session.ErrProtocol):
 		return false
 	case errors.As(err, &be):
-		return be.Reason == wire.ByeLocalError || be.Reason == wire.ByeResourceLimit
+		return be.Reason == wire.ByeLocalError || be.Reason == wire.ByeResourceLimit || be.Reason == wire.ByeReplaced
 	}
 	return true
 }
@@ -212,20 +232,34 @@ func disconnectReason(err error) string {
 
 // scheduleReconnectL starts (or keeps) one reconnect loop per contact.
 func (e *Engine) scheduleReconnectL(id PeerID) {
-	if _, running := e.reconnects[id]; running {
+	if e.reconnects[id] != nil {
 		return
 	}
 	ctx, cancel := context.WithCancel(e.ctx)
-	e.reconnects[id] = cancel
-	e.wg.Add(1)
-	go e.reconnectLoop(ctx, id)
+	r := &reconnect{cancel: cancel}
+	if !e.spawnL(func() { e.reconnectLoop(ctx, id, r) }) {
+		cancel()
+		return
+	}
+	e.reconnects[id] = r
+}
+
+// stopReconnectL ends the contact's reconnect loop, if one is running.
+func (e *Engine) stopReconnectL(id PeerID) {
+	if r := e.reconnects[id]; r != nil {
+		r.cancel()
+		delete(e.reconnects, id)
+	}
 }
 
 // reconnectLoop dials a contact with exponential backoff and full jitter
 // until it connects, the contact goes away, or the loop is cancelled.
-func (e *Engine) reconnectLoop(ctx context.Context, id PeerID) {
-	defer e.wg.Done()
-	defer e.do(func() { delete(e.reconnects, id) })
+func (e *Engine) reconnectLoop(ctx context.Context, id PeerID, self *reconnect) {
+	defer e.do(func() {
+		if e.reconnects[id] == self { // a newer loop may have taken the place
+			delete(e.reconnects, id)
+		}
+	})
 	backoff := wire.ReconnectMinBackoff
 	for attempt := 1; ; attempt++ {
 		// Full jitter: uniform in [0, backoff].

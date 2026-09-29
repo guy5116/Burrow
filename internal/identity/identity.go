@@ -126,12 +126,14 @@ func (id *Identity) Public() PeerID { return id.pub }
 func (id *Identity) Scalar() []byte { return id.scalar }
 
 // Clear wipes the private scalar and frees its storage. Safe to call twice.
+// Afterwards Scalar returns nil, which X25519 refuses: use after Clear fails
+// instead of computing with a known key.
 func (id *Identity) Clear() {
 	if id.release != nil {
 		id.release()
 		id.release = nil
 	}
-	id.scalar = make([]byte, curve25519.ScalarSize)
+	id.scalar = nil
 }
 
 // SafetyNumber is twelve 5-digit groups derived from both public keys.

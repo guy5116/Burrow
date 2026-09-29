@@ -3,9 +3,11 @@ package session
 import (
 	"context"
 	"errors"
+	"slices"
 	"sync"
 	"time"
 
+	"github.com/guy5116/burrow/internal/buf"
 	"github.com/guy5116/burrow/internal/wire"
 )
 
@@ -27,16 +29,46 @@ const (
 
 // stream is one transfer (image or file) from this side's point of view.
 type stream struct {
-	id       uint16
-	outgoing bool // we are the sender
-	state    streamState
-	size     uint64
-	chunks   uint32
-	next     uint32        // receiver: next expected chunk index
-	queue    chan outFrame // sender/receiver frames for the writer (cap TransferQueueCap)
-	done     chan struct{} // closed when the stream closes; late senders get ErrStreamState
-	sink     chan<- []byte // receiver: where chunk data goes (set by the owner)
+	id        uint16
+	outgoing  bool // we are the sender
+	offerSent bool // sender: the peer has been told about this id
+	state     streamState
+	size      uint64
+	chunks    uint32
+	next      uint32        // receiver: next expected chunk index
+	queue     chan outFrame // frames for the writer (cap TransferQueueCap)
+	done      chan struct{} // closed when the stream closes; late senders get ErrStreamState
+	halt      chan struct{} // closed when chunks are no longer wanted (draining or closed)
+	halted    bool
+	sink      chan<- Chunk // receiver: where chunk data goes (set by the owner)
 }
+
+func newStream(id uint16, outgoing bool, size uint64) *stream {
+	return &stream{id: id, outgoing: outgoing, state: stOffered, size: size, chunks: chunksFor(size),
+		queue: make(chan outFrame, wire.TransferQueueCap), done: make(chan struct{}), halt: make(chan struct{})}
+}
+
+// stopReceiving releases a reader that is waiting to hand a chunk to the
+// owner. Caller holds the table mutex.
+func (s *stream) stopReceiving() {
+	if !s.halted {
+		s.halted = true
+		close(s.halt)
+	}
+}
+
+// Chunk is the data of one IMG_CHUNK in a pooled buffer. The receiver calls
+// Release when it has written the data.
+type Chunk struct {
+	buf *[]byte
+	n   int
+}
+
+// Data returns the chunk's bytes; they are valid until Release.
+func (c Chunk) Data() []byte { return (*c.buf)[:c.n] }
+
+// Release wipes the buffer and returns it to the pool.
+func (c Chunk) Release() { buf.Put(c.buf) }
 
 // streamTable is the mutex-guarded per-stream state shared by reader, writer
 // and core. It holds no key material.
@@ -84,6 +116,7 @@ func (t *streamTable) close(s *stream) {
 	if _, open := t.open[s.id]; open {
 		close(s.done)
 	}
+	s.stopReceiving()
 	delete(t.open, s.id)
 	t.closed[t.closedPos] = s.id
 	t.closedPos = (t.closedPos + 1) % len(t.closed)
@@ -115,9 +148,7 @@ func (s *Session) OpenStream(size uint64) (uint16, error) {
 	}
 	id := uint16(t.nextID) // #nosec G115 -- checked above
 	t.nextID += 2
-	st := &stream{id: id, outgoing: true, state: stOffered, size: size, chunks: chunksFor(size),
-		queue: make(chan outFrame, wire.TransferQueueCap), done: make(chan struct{})}
-	t.open[id] = st
+	t.open[id] = newStream(id, true, size)
 	return id, nil
 }
 
@@ -147,7 +178,22 @@ func offerSize(in wire.Inner, ours uint64) (uint64, error) {
 // stream state: REJECT/RESULT close, CANCEL starts draining (or closes when it
 // answers a received CANCEL).
 func (s *Session) SendStream(ctx context.Context, id uint16, typ wire.FrameType, payload []byte) error {
-	if typ.Class() != wire.ClassTransfer {
+	return s.sendStream(ctx, outFrame{typ: typ, stream: id, payload: append([]byte(nil), payload...)})
+}
+
+// SendChunk queues one IMG_CHUNK whose encoded payload is (*b)[:n], with b
+// from the buffer pool. The session owns b from here on and returns it to
+// the pool, so sending a chunk allocates nothing of its size.
+func (s *Session) SendChunk(ctx context.Context, id uint16, b *[]byte, n int) error {
+	err := s.sendStream(ctx, outFrame{typ: wire.TypeImgChunk, stream: id, payload: (*b)[:n], pooled: b})
+	if err != nil {
+		buf.Put(b)
+	}
+	return err
+}
+
+func (s *Session) sendStream(ctx context.Context, f outFrame) error {
+	if f.typ.Class() != wire.ClassTransfer {
 		return wire.ErrStream
 	}
 	if !s.ready.Load() {
@@ -155,17 +201,19 @@ func (s *Session) SendStream(ctx context.Context, id uint16, typ wire.FrameType,
 	}
 	t := s.streams
 	t.mu.Lock()
-	st, ok := t.open[id]
+	st, ok := t.open[f.stream]
 	if !ok {
 		t.mu.Unlock()
 		return ErrStreamState
 	}
-	switch typ {
+	q := st.queue
+	switch f.typ {
 	case wire.TypeImgOffer, wire.TypeFileOffer:
-		if !st.outgoing || st.state != stOffered {
+		if !st.outgoing || st.state != stOffered || st.offerSent {
 			t.mu.Unlock()
 			return ErrStreamState
 		}
+		st.offerSent = true
 	case wire.TypeImgAccept:
 		if st.outgoing || st.state != stOffered {
 			t.mu.Unlock()
@@ -175,19 +223,18 @@ func (s *Session) SendStream(ctx context.Context, id uint16, typ wire.FrameType,
 			t.mu.Unlock()
 			return ErrStreamLimit
 		}
-		st.state = stActive
-		startChunk, err := wire.DecodeImgAccept(payload)
+		startChunk, err := wire.DecodeImgAccept(f.payload)
 		if err != nil {
 			t.mu.Unlock()
 			return err
 		}
-		st.next = startChunk
+		st.state, st.next = stActive, startChunk
 	case wire.TypeImgChunk, wire.TypeImgDone:
 		if !st.outgoing || st.state != stActive {
 			t.mu.Unlock()
 			return ErrStreamState
 		}
-		if typ == wire.TypeImgDone {
+		if f.typ == wire.TypeImgDone {
 			st.state = stDone
 		}
 	case wire.TypeImgReject, wire.TypeImgResult:
@@ -195,79 +242,99 @@ func (s *Session) SendStream(ctx context.Context, id uint16, typ wire.FrameType,
 			t.mu.Unlock()
 			return ErrStreamState
 		}
+		// Our own terminal frame goes out on a fresh queue, so that nothing
+		// queued behind it on the closed stream can follow.
 		t.close(st)
+		s.queueClosedLocked(f)
+		t.mu.Unlock()
+		return nil
 	case wire.TypeImgCancel:
-		if st.state == stDraining {
+		switch {
+		case st.state == stDraining:
 			t.mu.Unlock()
 			return ErrStreamState
-		}
-		st.state = stDraining
-		if t.count(true, stDraining)+t.count(false, stDraining) > wire.MaxDrainingStreams {
+		case st.outgoing && !st.offerSent:
+			// The peer has never heard of this stream: forget it without a frame.
+			close(st.done)
+			st.stopReceiving()
+			delete(t.open, st.id)
 			t.mu.Unlock()
+			return nil
+		case t.count(true, stDraining)+t.count(false, stDraining) >= wire.MaxDrainingStreams:
+			t.mu.Unlock()
+			s.fail(ErrProtocol) // the peer leaves our cancels unanswered (§4.3)
 			return ErrStreamLimit
 		}
-	}
-	f := outFrame{typ: typ, stream: id, payload: append([]byte(nil), payload...)}
-	if _, stillOpen := t.open[id]; !stillOpen {
-		// Our own terminal frame (REJECT/RESULT): it goes out on a fresh queue
-		// so that nothing queued behind it on the closed stream can follow.
-		q := make(chan outFrame, 1)
-		q <- f
-		s.closedQueues[id] = q
+		// Draining starts and the CANCEL is queued in one step under the lock:
+		// the reader can never find the stream draining without its CANCEL.
+		// Frames still queued on the old queue are dropped with it.
+		st.state = stDraining
+		st.stopReceiving()
+		st.queue = make(chan outFrame, 1)
+		st.queue <- f
 		t.mu.Unlock()
-	} else {
-		q := st.queue
-		t.mu.Unlock()
-		select {
-		case q <- f:
-		case <-st.done:
-			return ErrStreamState // closed while we waited (peer cancelled/rejected)
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-s.closed:
-			return ErrClosed
-		}
+		s.wakeWriter()
+		return nil
 	}
+	t.mu.Unlock()
+	select {
+	case q <- f:
+	case <-st.done:
+		return ErrStreamState // closed while we waited (peer cancelled/rejected)
+	case <-st.halt:
+		return ErrStreamState // cancelled by us meanwhile
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-s.closed:
+		return ErrClosed
+	}
+	s.wakeWriter()
+	return nil
+}
+
+func (s *Session) wakeWriter() {
 	select {
 	case s.transferWake <- struct{}{}:
 	default:
 	}
-	return nil
 }
 
-// nextTransferFrame picks the next queued transfer frame round-robin, or
-// returns false when none is ready. Called by the writer only.
+// queueClosedLocked queues a frame for a stream that is already closed (our
+// terminal frame, a CANCEL echo, a busy reject). Caller holds the table mutex.
+func (s *Session) queueClosedLocked(f outFrame) {
+	q := make(chan outFrame, 1)
+	q <- f
+	s.closedQueues[f.stream] = q
+	s.wakeWriter()
+}
+
+// rrEntry is one queue the writer may take a transfer frame from.
+type rrEntry struct {
+	id uint16
+	q  chan outFrame
+}
+
+// nextTransferFrame picks the next queued transfer frame, going round the
+// streams in id order starting after the one served last, or returns false
+// when none is ready. Called by the writer only.
 func (s *Session) nextTransferFrame() (outFrame, bool) {
 	t := s.streams
 	t.mu.Lock()
-	ids := make([]uint16, 0, len(t.open))
-	for id := range t.open {
-		ids = append(ids, id)
+	s.rr = s.rr[:0]
+	for id, st := range t.open {
+		s.rr = append(s.rr, rrEntry{id, st.queue})
 	}
-	// Also drain queues of streams closed while frames were still queued (REJECT/RESULT/CANCEL echoes).
-	for id := range s.closedQueues {
-		ids = append(ids, id)
+	for id, q := range s.closedQueues { // frames still owed on streams already closed
+		s.rr = append(s.rr, rrEntry{id, q})
 	}
 	t.mu.Unlock()
-	if len(ids) == 0 {
-		return outFrame{}, false
-	}
-	for i := 0; i < len(ids); i++ {
-		id := ids[(s.rrPos+i)%len(ids)]
-		t.mu.Lock()
-		var q chan outFrame
-		if st, ok := t.open[id]; ok {
-			q = st.queue
-		} else {
-			q = s.closedQueues[id]
-		}
-		t.mu.Unlock()
-		if q == nil {
-			continue
-		}
+	slices.SortFunc(s.rr, func(a, b rrEntry) int { return int(a.id) - int(b.id) })
+	start, _ := slices.BinarySearchFunc(s.rr, s.rrLast+1, func(e rrEntry, id uint32) int { return int(e.id) - int(id) })
+	for i := range s.rr {
+		e := s.rr[(start+i)%len(s.rr)]
 		select {
-		case f := <-q:
-			s.rrPos = (s.rrPos + i + 1) % len(ids)
+		case f := <-e.q:
+			s.rrLast = uint32(e.id)
 			return f, true
 		default:
 		}
@@ -285,7 +352,7 @@ func (s *Session) onStreamFrame(in wire.Inner) error {
 	st, open := t.open[in.Stream]
 	if !open {
 		if in.Type == wire.TypeImgCancel && t.wasClosed(in.Stream) {
-			return nil // late cancel on a recently closed stream: ignored
+			return decodeTerminal(in) // a late cancel on a recently closed stream is ignored
 		}
 		if in.Type != wire.TypeImgOffer && in.Type != wire.TypeFileOffer {
 			return ErrProtocol
@@ -293,23 +360,21 @@ func (s *Session) onStreamFrame(in wire.Inner) error {
 		return s.onOffer(in, now)
 	}
 	if st.state == stDraining {
-		if in.Type == wire.TypeImgReject || in.Type == wire.TypeImgResult || in.Type == wire.TypeImgCancel {
-			t.close(st)
-			// Our own CANCEL may still be queued (both sides cancelled at once): it must
-			// still go out so the peer leaves draining. Anything else queued is dropped.
-			for len(st.queue) > 0 {
-				if f := <-st.queue; f.typ == wire.TypeImgCancel {
-					q := make(chan outFrame, 1)
-					q <- f
-					s.closedQueues[st.id] = q
-					select {
-					case s.transferWake <- struct{}{}:
-					default:
-					}
-				}
-			}
+		if in.Type != wire.TypeImgReject && in.Type != wire.TypeImgResult && in.Type != wire.TypeImgCancel {
+			return nil // discarded, whatever it is
 		}
-		return nil // discard everything else
+		if err := decodeTerminal(in); err != nil {
+			return err
+		}
+		t.close(st)
+		// Both sides cancelled at once: our CANCEL may still be queued and must
+		// go out, or the peer stays draining.
+		select {
+		case f := <-st.queue:
+			s.queueClosedLocked(f)
+		default:
+		}
+		return nil
 	}
 	switch in.Type {
 	case wire.TypeImgOffer, wire.TypeFileOffer:
@@ -367,13 +432,7 @@ func (s *Session) onStreamFrame(in wire.Inner) error {
 		// Reply with exactly one IMG_CANCEL and close. The echo goes out on a
 		// fresh queue; anything still queued on the stream is never sent.
 		t.close(st)
-		q := make(chan outFrame, 1)
-		q <- outFrame{typ: wire.TypeImgCancel, stream: st.id, payload: wire.AppendImgCancel(nil, wire.CancelUser)}
-		s.closedQueues[st.id] = q
-		select {
-		case s.transferWake <- struct{}{}:
-		default:
-		}
+		s.queueClosedLocked(outFrame{typ: wire.TypeImgCancel, stream: st.id, payload: wire.AppendImgCancel(nil, wire.CancelUser)})
 	default:
 		return ErrProtocol
 	}
@@ -396,7 +455,7 @@ func (s *Session) onOffer(in wire.Inner, now time.Time) error {
 		return ErrProtocol
 	}
 	t.peerSeen(in.Stream)
-	if t.count(false, stOffered) >= wire.MaxPendingOffers || t.count(false, stActive)+t.count(false, stOffered) >= wire.MaxPendingOffers+wire.MaxActiveTransfers {
+	if t.count(false, stOffered) >= wire.MaxPendingOffers {
 		// Busy: reject without an event; too many busy rejects → close.
 		t.busyTimes = trimWindow(t.busyTimes, now, wire.BusyRejectWindow)
 		t.busyTimes = append(t.busyTimes, now)
@@ -404,18 +463,10 @@ func (s *Session) onOffer(in wire.Inner, now time.Time) error {
 			return ErrProtocol
 		}
 		t.markClosed(in.Stream)
-		q := make(chan outFrame, 1)
-		q <- outFrame{typ: wire.TypeImgReject, stream: in.Stream, payload: wire.AppendImgReject(nil, wire.RejectBusy)}
-		s.closedQueues[in.Stream] = q
-		select {
-		case s.transferWake <- struct{}{}:
-		default:
-		}
+		s.queueClosedLocked(outFrame{typ: wire.TypeImgReject, stream: in.Stream, payload: wire.AppendImgReject(nil, wire.RejectBusy)})
 		return nil
 	}
-	st := &stream{id: in.Stream, outgoing: false, state: stOffered, size: size, chunks: chunksFor(size),
-		queue: make(chan outFrame, wire.TransferQueueCap), done: make(chan struct{})}
-	t.open[in.Stream] = st
+	t.open[in.Stream] = newStream(in.Stream, false, size)
 	return s.deliverLocked(in)
 }
 
@@ -436,35 +487,55 @@ func (t *streamTable) markClosed(id uint16) {
 	}
 }
 
-// deliverLocked hands the frame to the owner (releasing the table lock while blocked).
-func (s *Session) deliverLocked(in wire.Inner) error {
-	msg := Inbound{Type: in.Type, Stream: in.Stream, Payload: append([]byte(nil), in.Payload...)}
-	var sink chan<- []byte
-	if st := s.streams.open[in.Stream]; st != nil && in.Type == wire.TypeImgChunk {
-		sink = st.sink
+// decodeTerminal checks the payload of a REJECT, RESULT or CANCEL that
+// changes nothing else: a malformed one is still a violation.
+func decodeTerminal(in wire.Inner) (err error) {
+	switch in.Type {
+	case wire.TypeImgReject:
+		_, err = wire.DecodeImgReject(in.Payload)
+	case wire.TypeImgResult:
+		_, err = wire.DecodeImgResult(in.Payload)
+	case wire.TypeImgCancel:
+		_, err = wire.DecodeImgCancel(in.Payload)
 	}
+	if err != nil {
+		return ErrProtocol
+	}
+	return nil
+}
+
+// deliverLocked hands the frame to the owner (releasing the table lock while
+// blocked). Chunk data on a stream with a sink goes straight to the
+// transfer's file-writer in a pooled buffer, never through the engine: the
+// channel is bounded, so a slow disk becomes TCP backpressure.
+func (s *Session) deliverLocked(in wire.Inner) error {
+	st := s.streams.open[in.Stream]
 	s.streams.mu.Unlock()
 	defer s.streams.mu.Lock()
-	if sink != nil {
-		// Chunk data goes straight from the reader to the transfer's file-writer
-		// (bounded; a slow disk becomes TCP backpressure), never through the engine.
-		c, err := wire.DecodeImgChunk(msg.Payload)
-		if err != nil {
-			return ErrProtocol
-		}
-		select {
-		case sink <- c.Data:
-			return nil
-		case <-s.ctx.Done():
-			return ErrClosed
-		}
+	if st == nil || st.sink == nil || in.Type != wire.TypeImgChunk {
+		return s.deliver(Inbound{Type: in.Type, Stream: in.Stream, Payload: append([]byte(nil), in.Payload...)})
 	}
-	return s.deliver(msg)
+	c, err := wire.DecodeImgChunk(in.Payload)
+	if err != nil {
+		return ErrProtocol
+	}
+	chunk := Chunk{buf: buf.Get()}
+	chunk.n = copy(*chunk.buf, c.Data)
+	select {
+	case st.sink <- chunk:
+		return nil
+	case <-st.halt: // the owner stopped this transfer: the chunk is not wanted
+		chunk.Release()
+		return nil
+	case <-s.ctx.Done():
+		chunk.Release()
+		return ErrClosed
+	}
 }
 
 // SetChunkSink routes the data of IMG_CHUNK frames on an accepted incoming
 // stream to sink instead of the inbound channel. Call it before IMG_ACCEPT.
-func (s *Session) SetChunkSink(id uint16, sink chan<- []byte) error {
+func (s *Session) SetChunkSink(id uint16, sink chan<- Chunk) error {
 	s.streams.mu.Lock()
 	defer s.streams.mu.Unlock()
 	st, ok := s.streams.open[id]
@@ -473,12 +544,4 @@ func (s *Session) SetChunkSink(id uint16, sink chan<- []byte) error {
 	}
 	st.sink = sink
 	return nil
-}
-
-// StreamOpen reports whether id is still open (tests and core bookkeeping).
-func (s *Session) StreamOpen(id uint16) bool {
-	s.streams.mu.Lock()
-	defer s.streams.mu.Unlock()
-	_, ok := s.streams.open[id]
-	return ok
 }

@@ -18,14 +18,21 @@ const (
 // ErrRelPath is returned for a blob path outside the allowed shape.
 var ErrRelPath = errors.New("store: invalid blob path")
 
-// validRelPath allows "name" or "dir/name" with [A-Za-z0-9._-] segments,
-// no "..", no leading slash, forward slashes only.
+// tempPrefix starts the name of a file that writeFileAtomic is still writing.
+const tempPrefix = ".tmp-"
+
+// validRelPath allows "name" or "dir/name" with segments of [A-Za-z0-9._-]
+// that do not start with a dot. The store's own files (lock, master.hdr,
+// master.key) are no blob names, in any letter case: on the default file
+// systems of macOS and Windows "LOCK" is the same file as "lock".
 func validRelPath(p string) bool {
-	if p == "" || len(p) > 128 || strings.HasPrefix(p, "/") || strings.HasSuffix(p, "/") {
+	segs := strings.Split(p, "/")
+	if len(p) > 128 || len(segs) > 2 {
 		return false
 	}
-	for _, seg := range strings.Split(p, "/") {
-		if seg == "" || seg == "." || seg == ".." || seg == "lock" || strings.HasPrefix(seg, "master.") {
+	for _, seg := range segs {
+		lower := strings.ToLower(seg)
+		if seg == "" || seg[0] == '.' || lower == lockFile || strings.HasPrefix(lower, "master.") {
 			return false
 		}
 		for i := 0; i < len(seg); i++ {
@@ -47,7 +54,7 @@ func writeFileAtomic(path string, data []byte) error {
 	if _, err := rand.Read(r[:]); err != nil {
 		return err
 	}
-	tmp := filepath.Join(dir, ".tmp-"+hex.EncodeToString(r[:]))
+	tmp := filepath.Join(dir, tempPrefix+hex.EncodeToString(r[:]))
 	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_EXCL, filePerm)
 	if err != nil {
 		return err

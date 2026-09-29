@@ -22,7 +22,7 @@ func exifOrientation(tiff []byte) int {
 		return 0
 	}
 	off := int(bo.Uint32(tiff[4:]))
-	if off < 8 || off+2 > len(tiff) {
+	if off < 8 || off > len(tiff)-2 {
 		return 0
 	}
 	n := int(bo.Uint16(tiff[off:]))

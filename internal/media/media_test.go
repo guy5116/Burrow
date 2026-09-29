@@ -2,6 +2,7 @@ package media
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"image"
 	"image/color"
@@ -49,13 +50,13 @@ func samePixels(t *testing.T, a, b image.Image) {
 // prepareAndStream runs both passes and returns the streamed bytes.
 func prepareAndStream(t *testing.T, path string, mode Mode) (Prepared, []byte) {
 	t.Helper()
-	p, err := Prepare(path, mode, 0)
+	p, err := Prepare(context.Background(), path, mode, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
 	var out []byte
 	var next uint32
-	if err := Stream(p, func(i uint32, chunk []byte) error {
+	if err := Stream(context.Background(), p, func(i uint32, chunk []byte) error {
 		if i != next {
 			t.Fatalf("chunk index %d want %d", i, next)
 		}
@@ -105,17 +106,17 @@ func TestJPEGStrip(t *testing.T) {
 	if !bytes.Equal(out[2:2+len(minimalJFIF)], minimalJFIF) || bytes.Contains(out, []byte("TTTT")) {
 		t.Fatal("APP0 not rewritten to the minimal JFIF")
 	}
-	orig, _, err := Decode(dirtyJPEG(t, img, 1))
+	orig, _, err := Decode(context.Background(), dirtyJPEG(t, img, 1))
 	if err != nil {
 		t.Fatal(err)
 	}
-	got, info, err := Decode(out)
+	got, info, err := Decode(context.Background(), out)
 	if err != nil || info.Format != wire.FormatJPEG {
 		t.Fatal(err)
 	}
 	samePixels(t, orig, got) // scan data untouched → identical pixels
 	// Deterministic: a second Prepare gives the same hash.
-	p2, _ := Prepare(path, ModeStrip, 0)
+	p2, _ := Prepare(context.Background(), path, ModeStrip, 0)
 	if p2.Hash != p.Hash || p2.Size != p.Size {
 		t.Fatal("not deterministic")
 	}
@@ -135,7 +136,7 @@ func TestJPEGOrientationReencodes(t *testing.T) {
 			t.Fatal("format")
 		}
 		assertNoSecrets(t, out)
-		got, _, err := Decode(out)
+		got, _, err := Decode(context.Background(), out)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -172,7 +173,7 @@ func TestPNGStrip(t *testing.T) {
 			t.Fatalf("%s survived", ch)
 		}
 	}
-	got, _, err := Decode(out)
+	got, _, err := Decode(context.Background(), out)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -180,12 +181,12 @@ func TestPNGStrip(t *testing.T) {
 	// Bad CRC → corrupt.
 	bad := dirtyPNG(t, img, 1)
 	bad[len(bad)-len(trailing)-5] ^= 1 // inside IEND's CRC
-	if _, err := Prepare(writeTemp(t, "bad.png", bad), ModeStrip, 0); !errors.Is(err, ErrCorrupt) {
+	if _, err := Prepare(context.Background(), writeTemp(t, "bad.png", bad), ModeStrip, 0); !errors.Is(err, ErrCorrupt) {
 		t.Fatal(err)
 	}
 	// Orientation via eXIf → re-encoded PNG, still PNG, rotated.
 	p6, out6 := prepareAndStream(t, writeTemp(t, "r.png", dirtyPNG(t, img, 6)), ModeStrip)
-	got6, _, _ := Decode(out6)
+	got6, _, _ := Decode(context.Background(), out6)
 	if p6.Format != wire.FormatPNG || got6.Bounds().Dx() != 21 || got6.Bounds().Dy() != 33 {
 		t.Fatalf("%+v %v", p6, got6.Bounds())
 	}
@@ -203,11 +204,11 @@ func TestGIFStrip(t *testing.T) {
 	if !bytes.Contains(out, []byte("NETSCAPE2.0")) {
 		t.Fatal("loop extension dropped")
 	}
-	g, err := DecodeGIF(out)
+	g, err := gif.DecodeAll(bytes.NewReader(out))
 	if err != nil || len(g.Image) != 3 {
 		t.Fatal(err)
 	}
-	orig, _ := DecodeGIF(dirtyGIF(t, frames))
+	orig, _ := gif.DecodeAll(bytes.NewReader(dirtyGIF(t, frames)))
 	for i := range g.Image {
 		samePixels(t, orig.Image[i], g.Image[i])
 	}
@@ -248,7 +249,7 @@ func TestGIFFrameLimits(t *testing.T) {
 func TestWebPStrip(t *testing.T) {
 	c := color.NRGBA{10, 200, 30, 255}
 	plain := webpFile(5, 3, c, false, 1, false)
-	img, info, err := Decode(plain)
+	img, info, err := Decode(context.Background(), plain)
 	if err != nil || info.Format != wire.FormatWebP || img.Bounds().Dx() != 5 {
 		t.Fatalf("hand-built VP8L does not decode: %v %+v", err, info)
 	}
@@ -256,7 +257,7 @@ func TestWebPStrip(t *testing.T) {
 		t.Fatalf("color %v", got)
 	}
 	dirty := webpFile(5, 3, c, true, 1, false)
-	if _, _, err := Decode(dirty); err != nil {
+	if _, _, err := Decode(context.Background(), dirty); err != nil {
 		t.Fatal(err)
 	}
 	p, out := prepareAndStream(t, writeTemp(t, "a.webp", dirty), ModeStrip)
@@ -270,7 +271,7 @@ func TestWebPStrip(t *testing.T) {
 	if out[20]&(vp8xICC|vp8xEXIF|vp8xXMP) != 0 {
 		t.Fatalf("VP8X flags not cleared: %02x", out[20])
 	}
-	got, _, err := Decode(out)
+	got, _, err := Decode(context.Background(), out)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -280,7 +281,7 @@ func TestWebPStrip(t *testing.T) {
 	if p6.Format != wire.FormatPNG {
 		t.Fatalf("rotated webp format %d", p6.Format)
 	}
-	got6, info6, _ := Decode(out6)
+	got6, info6, _ := Decode(context.Background(), out6)
 	if info6.Format != wire.FormatPNG || got6.Bounds().Dx() != 3 || got6.Bounds().Dy() != 5 {
 		t.Fatal("rotation")
 	}
@@ -289,7 +290,7 @@ func TestWebPStrip(t *testing.T) {
 	if _, err := Probe(anim); !errors.Is(err, ErrAnimated) {
 		t.Fatal(err)
 	}
-	if _, err := Prepare(writeTemp(t, "an.webp", anim), ModeStrip, 0); !errors.Is(err, ErrAnimated) {
+	if _, err := Prepare(context.Background(), writeTemp(t, "an.webp", anim), ModeStrip, 0); !errors.Is(err, ErrAnimated) {
 		t.Fatal(err)
 	}
 }
@@ -302,7 +303,7 @@ func TestParanoid(t *testing.T) {
 			t.Fatalf("%s: paranoid format %d", name, p.Format)
 		}
 		assertNoSecrets(t, out)
-		if _, info, err := Decode(out); err != nil || info.Format != wire.FormatPNG {
+		if _, info, err := Decode(context.Background(), out); err != nil || info.Format != wire.FormatPNG {
 			t.Fatal(name, err)
 		}
 	}
@@ -361,15 +362,15 @@ func TestGatesAndLies(t *testing.T) {
 	}
 	// Truncated files are corrupt, not panics.
 	for _, data := range [][]byte{dirtyJPEG(t, testImage(8, 8), 1)[:40], dirtyPNG(t, testImage(8, 8), 1)[:40], dirtyGIF(t, []*image.Paletted{palettedFrame(3, 3, color.Black)})[:20]} {
-		if _, err := Prepare(writeTemp(t, "t.bin", data), ModeStrip, 0); err == nil {
+		if _, err := Prepare(context.Background(), writeTemp(t, "t.bin", data), ModeStrip, 0); err == nil {
 			t.Fatal("truncated accepted")
 		}
 	}
-	if _, err := Prepare(writeTemp(t, "x.txt", []byte("not an image")), ModeStrip, 0); !errors.Is(err, ErrUnsupported) {
+	if _, err := Prepare(context.Background(), writeTemp(t, "x.txt", []byte("not an image")), ModeStrip, 0); !errors.Is(err, ErrUnsupported) {
 		t.Fatal(err)
 	}
 	// maxSize enforced on the stripped output.
-	if _, err := Prepare(writeTemp(t, "m.png", dirtyPNG(t, testImage(64, 64), 1)), ModeStrip, 100); !errors.Is(err, ErrTooLarge) {
+	if _, err := Prepare(context.Background(), writeTemp(t, "m.png", dirtyPNG(t, testImage(64, 64), 1)), ModeStrip, 100); !errors.Is(err, ErrTooLarge) {
 		t.Fatal(err)
 	}
 }
@@ -377,14 +378,14 @@ func TestGatesAndLies(t *testing.T) {
 func TestStreamDetectsChange(t *testing.T) {
 	img := testImage(30, 30)
 	path := writeTemp(t, "c.png", dirtyPNG(t, img, 1))
-	p, err := Prepare(path, ModeStrip, 0)
+	p, err := Prepare(context.Background(), path, ModeStrip, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(path, dirtyPNG(t, testImage(30, 31), 1), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	err = Stream(p, func(uint32, []byte) error { return nil })
+	err = Stream(context.Background(), p, func(uint32, []byte) error { return nil })
 	if !errors.Is(err, ErrDiverged) {
 		t.Fatal(err)
 	}
@@ -399,7 +400,7 @@ func TestChunking(t *testing.T) {
 	var buf bytes.Buffer
 	_ = png.Encode(&buf, img)
 	path := writeTemp(t, "big.png", buf.Bytes())
-	p, err := Prepare(path, ModeStrip, 0)
+	p, err := Prepare(context.Background(), path, ModeStrip, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -407,7 +408,7 @@ func TestChunking(t *testing.T) {
 		t.Skip("fixture too small")
 	}
 	var sizes []int
-	if err := Stream(p, func(i uint32, c []byte) error { sizes = append(sizes, len(c)); return nil }); err != nil {
+	if err := Stream(context.Background(), p, func(i uint32, c []byte) error { sizes = append(sizes, len(c)); return nil }); err != nil {
 		t.Fatal(err)
 	}
 	for _, s := range sizes[:len(sizes)-1] {
@@ -512,7 +513,7 @@ func FuzzGIFPrescan(f *testing.F) {
 	f.Add(dirtyGIF(f, frames))
 	f.Add([]byte("GIF89a"))
 	f.Fuzz(func(t *testing.T, data []byte) {
-		frames, area, err := gifPrescan(data)
+		frames, area, err := gifPrescan(bytes.NewReader(data))
 		if err == nil && (frames < 0 || area < 0) {
 			t.Fatal("negative")
 		}

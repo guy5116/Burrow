@@ -9,11 +9,14 @@ import (
 	"fmt"
 	"image"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"time"
 
+	"github.com/guy5116/burrow/internal/buf"
 	"github.com/guy5116/burrow/internal/media"
 	"github.com/guy5116/burrow/internal/session"
 	"github.com/guy5116/burrow/internal/text"
@@ -28,6 +31,8 @@ var (
 	ErrPeerNoFiles     = errors.New("core: peer does not accept files")
 	ErrNoSpace         = errors.New("core: not enough free disk space")
 	ErrOffline         = errors.New("core: contact is not connected")
+	ErrBusy            = errors.New("core: two downloads from this contact are already running; accept again when one has finished")
+	ErrStopping        = errors.New("core: the engine is shutting down")
 )
 
 const (
@@ -39,11 +44,12 @@ const (
 	metaBlobVersion = 1
 )
 
-// transfer is one transfer of an image or another file, in either direction. Fields written after
-// creation belong to the engine goroutine, except lastProg, which belongs to
-// the transfer's own file-reader or file-writer goroutine.
+// transfer is one transfer of an image or another file, in either direction.
+// Fields written after creation belong to the engine goroutine, except
+// lastProg, which belongs to the transfer's own file-reader or file-writer
+// goroutine, and discard.
 type transfer struct {
-	id       TransferID
+	id       TransferID // what the API and the events call this transfer; never changes
 	peer     PeerID
 	owner    *peer // the session record the stream lives on
 	stream   uint16
@@ -62,15 +68,27 @@ type transfer struct {
 	acceptCh chan uint32 // start chunk from IMG_ACCEPT, engine → file-reader
 
 	// incoming
+	partID   TransferID // names the .part and .meta on disk: the id of the download that created them
 	partPath string
 	destDir  string
-	chunkCh  chan []byte
+	chunkCh  chan session.Chunk
 	doneCh   chan struct{}
 	timer    *time.Timer
+	discard  atomic.Bool // a user cancel: the partial is deleted, not kept for resume
 
 	accepted bool
 	lastProg time.Time
-	stop     chan struct{} // closed when the transfer fails
+	ctx      context.Context // ends when the transfer fails or finishes, or the sessions stop
+	cancel   context.CancelFunc
+}
+
+// newTransfer gives t its id and a context that ends with the sessions.
+func (e *Engine) newTransfer(t *transfer) (*transfer, error) {
+	if _, err := randomFill(t.id[:]); err != nil {
+		return nil, err
+	}
+	t.ctx, t.cancel = context.WithCancel(e.sessCtx)
+	return t, nil
 }
 
 // metaRec is the encrypted sidecar for a partial download (§6.3).
@@ -137,33 +155,57 @@ func (e *Engine) readMeta(rel string) (metaRec, error) {
 	return m, nil
 }
 
+// metaRel names the sidecar of the partial with the given part id.
 func (e *Engine) metaRel(id TransferID) string {
 	return metaBlobPrefix + hex.EncodeToString(id[:]) + ".meta"
 }
 
 func (e *Engine) writeMeta(t *transfer, complete uint32) error {
-	m := metaRec{Version: metaBlobVersion, ID: hex.EncodeToString(t.id[:]), Peer: hex.EncodeToString(t.peer[:]),
+	m := metaRec{Version: metaBlobVersion, ID: hex.EncodeToString(t.partID[:]), Peer: hex.EncodeToString(t.peer[:]),
 		Size: t.size, Hash: hex.EncodeToString(t.hash[:]), Format: t.format, Ext: t.ext, Dest: t.destDir, Complete: complete}
 	b, err := json.Marshal(m)
 	if err != nil {
 		return err
 	}
-	return e.st.WriteBlob(e.metaRel(t.id), b)
+	return e.st.WriteBlob(e.metaRel(t.partID), b)
 }
 
-// findResumable looks for a partial download of the same (peer, hash).
-func (e *Engine) findResumable(peer PeerID, hash [wire.HashSize]byte) (metaRec, bool) {
+// findResumable looks for a partial download of the same peer, hash and size
+// that no running transfer is writing to.
+func (e *Engine) findResumable(t *transfer) (m metaRec, partID TransferID, found bool) {
 	metas, _ := e.st.ListBlobs(partialsDir)
 	for _, rel := range metas {
 		m, err := e.readMeta(rel)
-		if err != nil {
+		if err != nil || m.Peer != hex.EncodeToString(t.peer[:]) || m.Hash != hex.EncodeToString(t.hash[:]) || m.Size != t.size {
 			continue
 		}
-		if m.Peer == hex.EncodeToString(peer[:]) && m.Hash == hex.EncodeToString(hash[:]) {
-			return m, true
+		raw, err := hex.DecodeString(m.ID)
+		if err != nil || len(raw) != len(partID) {
+			continue
+		}
+		copy(partID[:], raw)
+		if e.claimPart(t, partID) {
+			return m, partID, true
 		}
 	}
-	return metaRec{}, false
+	return metaRec{}, TransferID{}, false
+}
+
+// claimPart makes t the writer of the partial named partID unless another
+// running transfer already is. The engine goroutine decides, so two accepts
+// of the same image can never share a partial.
+func (e *Engine) claimPart(t *transfer, partID TransferID) (ok bool) {
+	e.do(func() {
+		for _, other := range e.transfers {
+			if other != t && other.partID == partID {
+				return
+			}
+		}
+		if e.transfers[t.id] == t {
+			t.partID, ok = partID, true
+		}
+	})
+	return ok
 }
 
 func (e *Engine) livePeer(id PeerID) (p *peer, err error) {
@@ -239,79 +281,92 @@ func (e *Engine) send(id PeerID, path, caption string, raw bool) (TransferID, er
 	if e.cfg.Paranoid {
 		mode = media.ModeParanoid
 	}
-	t := &transfer{peer: id, outgoing: true, caption: cap, acceptCh: make(chan uint32, 1), stop: make(chan struct{})}
-	if _, err := randomFill(t.id[:]); err != nil {
+	t, err := e.newTransfer(&transfer{peer: id, outgoing: true, caption: cap, acceptCh: make(chan uint32, 1)})
+	if err != nil {
 		return TransferID{}, err
 	}
-	e.do(func() { e.transfers[t.id] = t })
-	e.wg.Add(1)
-	go func() { // file-reader
-		defer e.wg.Done()
-		var prep media.Prepared
-		var err error
-		if raw {
-			prep, err = media.PrepareFile(path, limit)
-		} else {
-			prep, err = media.Prepare(path, mode, limit)
-		}
-		if err == nil && prep.Animated && ph.Features&wire.FeatureAnimatedGIF == 0 {
-			err = errAnimatedUnsupported
-		}
-		if err != nil {
-			e.failTransfer(t, redactMediaErr(err))
-			return
-		}
-		stream, err := p.s.OpenStream(prep.Size)
-		if errors.Is(err, session.ErrStreamsExhaust) {
-			e.failTransfer(t, "session ran out of stream ids; reconnecting")
-			e.onStreamsExhausted(p)
-			return
-		}
-		if err != nil {
-			e.failTransfer(t, "too many transfers in progress")
-			return
-		}
-		live := false
-		e.do(func() {
-			if e.transfers[t.id] != t {
-				return // cancelled during pass 1
-			}
-			if e.bySession[p.s] != p {
-				e.failTransferL(t, "connection lost")
+	started := e.spawn(func() { e.transfers[t.id] = t }, func() { e.fileReader(p, t, path, raw, mode, limit) })
+	if !started {
+		t.cancel()
+		return TransferID{}, ErrStopping
+	}
+	return t.id, nil
+}
+
+// fileReader is the per-outgoing-transfer goroutine: pass 1, the offer, and
+// once the peer accepts, pass 2.
+func (e *Engine) fileReader(p *peer, t *transfer, path string, raw bool, mode media.Mode, limit uint64) {
+	ph := p.s.PeerHello()
+	var prep media.Prepared
+	var err error
+	if raw {
+		prep, err = media.PrepareFile(t.ctx, path, limit)
+	} else {
+		prep, err = media.Prepare(t.ctx, path, mode, limit)
+	}
+	if err == nil && prep.Animated && ph.Features&wire.FeatureAnimatedGIF == 0 {
+		err = errAnimatedUnsupported
+	}
+	if err != nil {
+		e.failTransfer(t, redactMediaErr(err))
+		return
+	}
+	typ := wire.TypeImgOffer
+	offer, err := wire.AppendImgOffer(nil, wire.ImgOffer{Size: prep.Size, Format: prep.Format, Width: uint32(prep.Width), // #nosec G115 -- gated ≤ 16384
+		Height: uint32(prep.Height), Hash: prep.Hash, Caption: []byte(t.caption)}) // #nosec G115 -- gated ≤ 16384
+	if raw {
+		typ = wire.TypeFileOffer
+		offer, err = wire.AppendFileOffer(nil, wire.FileOffer{Size: prep.Size, Hash: prep.Hash, Ext: []byte(prep.Ext), Caption: []byte(t.caption)})
+	}
+	if err != nil {
+		e.failTransfer(t, "bad offer")
+		return
+	}
+	// The stream id is taken only once nothing can stop the offer from being
+	// sent except the session itself: an id that is taken and never offered
+	// would count against the pending offers for the rest of the session.
+	var openErr error
+	e.do(func() {
+		switch {
+		case e.transfers[t.id] != t:
+			openErr = context.Canceled // cancelled during pass 1
+		case e.bySession[p.s] != p:
+			openErr = session.ErrClosed
+		default:
+			if t.stream, openErr = p.s.OpenStream(prep.Size); openErr != nil {
 				return
 			}
 			t.prep, t.size, t.hash, t.format, t.ext = prep, prep.Size, prep.Hash, prep.Format, prep.Ext
 			t.width, t.height = uint32(prep.Width), uint32(prep.Height)          // #nosec G115 -- gated ≤ 16384
 			t.chunks = uint32((prep.Size + wire.ChunkData - 1) / wire.ChunkData) // #nosec G115 -- Size ≤ limit from Prepare
-			t.stream, t.owner = stream, p
-			p.transfers[stream] = t
-			live = true
-		})
-		if !live {
-			return
+			t.owner = p
+			p.transfers[t.stream] = t
 		}
-		typ := wire.TypeImgOffer
-		offer, err := wire.AppendImgOffer(nil, wire.ImgOffer{Size: prep.Size, Format: prep.Format, Width: t.width, Height: t.height, Hash: prep.Hash, Caption: []byte(cap)})
-		if raw {
-			typ = wire.TypeFileOffer
-			offer, err = wire.AppendFileOffer(nil, wire.FileOffer{Size: prep.Size, Hash: prep.Hash, Ext: []byte(prep.Ext), Caption: []byte(cap)})
-		}
-		if err != nil {
-			e.failTransfer(t, "bad offer")
-			return
-		}
-		if err := p.s.SendStream(e.sessCtx, stream, typ, offer); err != nil {
-			e.failTransfer(t, "connection lost")
-			return
-		}
-		select {
-		case start := <-t.acceptCh:
-			e.streamOut(p, t, start)
-		case <-t.stop:
-		case <-e.sessCtx.Done():
-		}
-	}()
-	return t.id, nil
+	})
+	switch {
+	case openErr == nil:
+	case errors.Is(openErr, context.Canceled):
+		return
+	case errors.Is(openErr, session.ErrStreamsExhaust):
+		e.failTransfer(t, "session ran out of stream ids; reconnecting")
+		e.onStreamsExhausted(p)
+		return
+	case errors.Is(openErr, session.ErrStreamLimit):
+		e.failTransfer(t, "too many transfers in progress")
+		return
+	default:
+		e.failTransfer(t, "connection lost")
+		return
+	}
+	if err := p.s.SendStream(t.ctx, t.stream, typ, offer); err != nil {
+		e.failTransfer(t, "connection lost")
+		return
+	}
+	select {
+	case start := <-t.acceptCh:
+		e.streamOut(p, t, start)
+	case <-t.ctx.Done():
+	}
 }
 
 var errAnimatedUnsupported = errors.New("peer does not accept animated GIFs")
@@ -350,7 +405,7 @@ func (e *Engine) failTransferL(t *transfer, reason string) {
 	if t.timer != nil {
 		t.timer.Stop()
 	}
-	close(t.stop)
+	t.cancel()
 	e.queueL(TransferFailed{Peer: TransferPeer{Peer: t.peer, Outgoing: t.outgoing}, ID: t.id, Reason: reason})
 }
 
@@ -368,6 +423,7 @@ func (e *Engine) forgetL(t *transfer) bool {
 
 func (e *Engine) finishTransferL(t *transfer, path string) {
 	if e.forgetL(t) {
+		t.cancel()
 		e.queueL(TransferDone{Peer: TransferPeer{Peer: t.peer, Outgoing: t.outgoing}, ID: t.id, Path: path, Image: t.format != FormatFile})
 	}
 }
@@ -386,36 +442,42 @@ func (e *Engine) progress(t *transfer, done uint64) {
 
 // --- sender side ---
 
-// streamOut is pass 2, on the transfer's file-reader goroutine.
+// streamOut is pass 2, on the transfer's file-reader goroutine. Chunks
+// travel in pooled buffers that the session returns once they are written.
 func (e *Engine) streamOut(p *peer, t *transfer, start uint32) {
-	err := media.Stream(t.prep, func(index uint32, chunk []byte) error {
+	err := media.Stream(t.ctx, t.prep, func(index uint32, chunk []byte) error {
 		if index < start {
 			return nil
 		}
-		c, err := wire.AppendImgChunk(nil, wire.ImgChunk{Index: index, Data: chunk})
+		b := buf.Get()
+		payload, err := wire.AppendImgChunk((*b)[:0], wire.ImgChunk{Index: index, Data: chunk})
 		if err != nil {
+			buf.Put(b)
 			return err
 		}
-		if err := p.s.SendStream(e.sessCtx, t.stream, wire.TypeImgChunk, c); err != nil {
+		if err := p.s.SendChunk(t.ctx, t.stream, b, len(payload)); err != nil {
 			return err
 		}
 		e.progress(t, min(uint64(index+1)*wire.ChunkData, t.size))
 		return nil
 	})
+	cancel := func(reason uint8) {
+		_ = p.s.SendStream(e.sessCtx, t.stream, wire.TypeImgCancel, wire.AppendImgCancel(nil, reason))
+	}
 	switch {
-	case errors.Is(err, session.ErrStreamState), errors.Is(err, session.ErrClosed):
-		// The peer ended the stream (cancel/reject) or the session closed: the
-		// inbound terminal frame or the session teardown reports the failure.
-	case errors.Is(err, media.ErrDiverged):
-		_ = p.s.SendStream(e.sessCtx, t.stream, wire.TypeImgCancel, wire.AppendImgCancel(nil, wire.CancelHashDiverged))
-		e.failTransfer(t, "file changed while sending")
-	case err != nil:
-		_ = p.s.SendStream(e.sessCtx, t.stream, wire.TypeImgCancel, wire.AppendImgCancel(nil, wire.CancelLocalIO))
-		e.failTransfer(t, "could not read image")
-	default:
-		if err := p.s.SendStream(e.sessCtx, t.stream, wire.TypeImgDone, nil); err != nil {
+	case err == nil:
+		if err := p.s.SendStream(t.ctx, t.stream, wire.TypeImgDone, nil); err != nil {
 			e.failTransfer(t, "connection lost")
 		}
+	case errors.Is(err, session.ErrStreamState), errors.Is(err, session.ErrClosed), t.ctx.Err() != nil:
+		// The peer ended the stream, the session closed, or the transfer was
+		// cancelled here: whoever ended it has reported it.
+	case errors.Is(err, media.ErrDiverged):
+		cancel(wire.CancelHashDiverged)
+		e.failTransfer(t, "file changed while sending")
+	default:
+		cancel(wire.CancelLocalIO)
+		e.failTransfer(t, "could not read image")
 	}
 }
 
@@ -444,33 +506,42 @@ func (e *Engine) onOfferL(p *peer, stream uint16, o wire.ImgOffer, ext string) {
 		reject(wire.RejectUnsupported)
 		return
 	}
-	t := &transfer{peer: p.s.Peer(), owner: p, stream: stream, size: o.Size, hash: o.Hash, format: o.Format, width: o.Width,
-		height: o.Height, caption: caption, ext: ext, chunkCh: make(chan []byte, fileChunkQueue), doneCh: make(chan struct{}, 1), stop: make(chan struct{})}
-	if _, err := randomFill(t.id[:]); err != nil {
+	t, err := e.newTransfer(&transfer{peer: p.s.Peer(), owner: p, stream: stream, size: o.Size, hash: o.Hash, format: o.Format,
+		width: o.Width, height: o.Height, caption: caption, ext: ext,
+		chunks:  uint32((o.Size + wire.ChunkData - 1) / wire.ChunkData), // #nosec G115 -- Size ≤ the limit checked above
+		chunkCh: make(chan session.Chunk, fileChunkQueue), doneCh: make(chan struct{}, 1)})
+	if err != nil {
 		reject(wire.RejectUnsupported)
 		return
 	}
-	t.chunks = uint32((o.Size + wire.ChunkData - 1) / wire.ChunkData) // #nosec G115 -- Size ≤ maxImage checked above
 	e.transfers[t.id] = t
 	p.transfers[stream] = t
 	e.queueL(ImageOffered{Peer: t.peer, ID: t.id, Size: o.Size, Format: o.Format, Ext: ext, Width: o.Width, Height: o.Height, Caption: caption})
 	// Auto-accept covers images only: a file is always the user's decision.
-	if c := e.contacts[t.peer]; e.cfg.AutoAcceptFromVerified && c != nil && c.Verified && o.Format != FormatFile {
+	// When two downloads are running the offer waits for the user instead.
+	if c := e.contacts[t.peer]; e.cfg.AutoAcceptFromVerified && c != nil && c.Verified && o.Format != FormatFile && e.downloadsL(p) < wire.MaxActiveTransfers {
 		t.accepted = true
-		e.wg.Add(1)
-		go func() { // this transfer's file-writer
-			defer e.wg.Done()
-			if start, err := e.prepareAccept(p, t, ""); err == nil {
-				e.fileWriter(p, t, start)
-			}
-		}()
-		return
+		if e.spawnL(func() { e.download(p, t, "") }) {
+			return
+		}
+		t.accepted = false
 	}
 	tid := t.id
 	t.timer = time.AfterFunc(wire.AcceptPromptTimeout, func() { _ = e.RejectImage(tid) })
 }
 
-// claimOffer finds an offer that is still awaiting a decision.
+// downloadsL counts the accepted incoming transfers on p's session.
+func (e *Engine) downloadsL(p *peer) (n int) {
+	for _, t := range p.transfers {
+		if !t.outgoing && t.accepted {
+			n++
+		}
+	}
+	return n
+}
+
+// claimOffer finds an offer that is still awaiting a decision and, when
+// accept is set, marks it accepted.
 func (e *Engine) claimOffer(id TransferID, accept bool) (t *transfer, err error) {
 	e.do(func() {
 		t = e.transfers[id]
@@ -479,6 +550,8 @@ func (e *Engine) claimOffer(id TransferID, accept bool) (t *transfer, err error)
 			err = ErrUnknownTransfer
 		case t.outgoing || t.accepted:
 			err = ErrNotOffered
+		case accept && e.downloadsL(t.owner) >= wire.MaxActiveTransfers:
+			err = ErrBusy // the offer stays; the user can accept it later
 		default:
 			t.accepted = accept
 			if t.timer != nil {
@@ -489,8 +562,8 @@ func (e *Engine) claimOffer(id TransferID, accept bool) (t *transfer, err error)
 	return t, err
 }
 
-// AcceptImage accepts an offered image into destDir ("" → the image dir),
-// resuming a matching partial download when one exists.
+// AcceptImage accepts an offered image or file into destDir ("" → the image
+// dir), resuming a matching partial download when one exists.
 func (e *Engine) AcceptImage(id TransferID, destDir string) error {
 	t, err := e.claimOffer(id, true)
 	if err != nil {
@@ -500,63 +573,71 @@ func (e *Engine) AcceptImage(id TransferID, destDir string) error {
 	if err != nil {
 		return err
 	}
-	e.wg.Add(1)
-	go func() {
-		defer e.wg.Done()
-		e.fileWriter(t.owner, t, start)
-	}()
+	if !e.spawn(nil, func() { e.fileWriter(t.owner, t, start) }) {
+		e.failTransfer(t, "shutting down")
+		return ErrStopping
+	}
 	return nil
 }
 
+// download accepts and receives on one goroutine (auto-accept).
+func (e *Engine) download(p *peer, t *transfer, destDir string) {
+	if start, err := e.prepareAccept(p, t, destDir); err == nil {
+		e.fileWriter(p, t, start)
+	}
+}
+
 // prepareAccept does the disk work for an accepted offer and sends
-// IMG_ACCEPT. It never runs on the engine goroutine.
-func (e *Engine) prepareAccept(p *peer, t *transfer, destDir string) (uint32, error) {
+// IMG_ACCEPT. It never runs on the engine goroutine. On failure the transfer
+// has failed and the peer has been told.
+func (e *Engine) prepareAccept(p *peer, t *transfer, destDir string) (start uint32, err error) {
+	reject := func(wireReason uint8, reason string) {
+		_ = p.s.SendStream(e.sessCtx, t.stream, wire.TypeImgReject, wire.AppendImgReject(nil, wireReason))
+		e.failTransfer(t, reason)
+	}
 	if destDir == "" {
 		destDir = e.imageDir()
 	}
 	for _, d := range []string{destDir, e.partialsPath()} {
 		if err := os.MkdirAll(d, 0o700); err != nil {
-			e.failTransfer(t, "cannot create directory")
+			reject(wire.RejectDeclined, "cannot create directory")
 			return 0, err
 		}
 	}
 	if free, err := freeSpace(e.partialsPath()); err == nil && free < t.size+wire.FreeSpaceMargin {
-		_ = p.s.SendStream(e.sessCtx, t.stream, wire.TypeImgReject, wire.AppendImgReject(nil, wire.RejectTooLarge))
-		e.failTransfer(t, "not enough free disk space")
+		reject(wire.RejectTooLarge, "not enough free disk space")
 		return 0, ErrNoSpace
 	}
-	// Resume a matching partial (same peer and hash): truncate to whole chunks,
-	// re-hash from the start, continue from there.
-	start, partPath, newID, resumed := uint32(0), "", t.id, false
-	if m, ok := e.findResumable(t.peer, t.hash); ok && m.Size == t.size {
+	// Resume a matching partial: truncate to whole chunks; the file-writer
+	// hashes them again from the start.
+	partPath, resumed := "", false
+	if m, partID, ok := e.findResumable(t); ok {
 		old := filepath.Join(e.partialsPath(), m.ID+".part")
-		oldID, _ := hex.DecodeString(m.ID)
-		if err := truncatePartial(old, m.Complete); err == nil && m.Complete < t.chunks && len(oldID) == len(newID) {
-			copy(newID[:], oldID) // keep the on-disk names valid
+		if err := truncatePartial(old, m.Complete); err == nil && m.Complete < t.chunks {
 			start, partPath, resumed = m.Complete, old, true
 		} else {
 			_ = os.Remove(old)
-			_ = e.st.DeleteBlob(metaBlobPrefix + m.ID + ".meta")
+			_ = e.st.DeleteBlob(e.metaRel(partID))
 		}
 	}
-	if partPath == "" {
+	if !resumed {
+		if !e.claimPart(t, t.id) {
+			return 0, ErrOffline // failed meanwhile (session lost)
+		}
 		partPath = filepath.Join(e.partialsPath(), hex.EncodeToString(t.id[:])+".part")
 		f, err := os.OpenFile(partPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600) // #nosec G304 -- our partials dir
 		if err != nil {
-			e.failTransfer(t, "cannot create partial file")
+			reject(wire.RejectDeclined, "cannot create partial file")
 			return 0, err
 		}
 		_ = f.Close()
 	}
 	gone := false
 	e.do(func() {
-		if e.transfers[t.id] != t {
-			gone = true // failed meanwhile (session lost)
+		if gone = e.transfers[t.id] != t; gone {
 			return
 		}
-		delete(e.transfers, t.id)
-		t.id, t.destDir, t.partPath = newID, destDir, partPath
-		e.transfers[t.id] = t
+		t.destDir, t.partPath = destDir, partPath
 		if resumed {
 			e.queueL(TransferResumed{ID: t.id})
 		}
@@ -565,14 +646,18 @@ func (e *Engine) prepareAccept(p *peer, t *transfer, destDir string) (uint32, er
 		return 0, ErrOffline
 	}
 	if err := e.writeMeta(t, start); err != nil {
-		e.failTransfer(t, "cannot write transfer metadata")
+		reject(wire.RejectDeclined, "cannot write transfer metadata")
 		return 0, err
 	}
-	if err := p.s.SetChunkSink(t.stream, t.chunkCh); err != nil {
-		e.failTransfer(t, "connection lost")
-		return 0, err
+	err = p.s.SetChunkSink(t.stream, t.chunkCh)
+	if err == nil {
+		err = p.s.SendStream(e.sessCtx, t.stream, wire.TypeImgAccept, wire.AppendImgAccept(nil, start))
 	}
-	if err := p.s.SendStream(e.sessCtx, t.stream, wire.TypeImgAccept, wire.AppendImgAccept(nil, start)); err != nil {
+	if errors.Is(err, session.ErrStreamLimit) { // claimOffer counts the same way; kept as a backstop
+		reject(wire.RejectBusy, "too many downloads at once")
+		return 0, ErrBusy
+	}
+	if err != nil {
 		e.failTransfer(t, "connection lost")
 		return 0, err
 	}
@@ -595,40 +680,34 @@ func truncatePartial(path string, complete uint32) error {
 // fileWriter is the per-incoming-transfer goroutine: it writes chunks, hashes,
 // rewrites the .meta every 16 chunks, and finishes the transfer on IMG_DONE.
 func (e *Engine) fileWriter(p *peer, t *transfer, start uint32) {
+	// abort ends a transfer that failed on our side and tells the peer to stop.
+	abort := func(reason string) {
+		_ = p.s.SendStream(e.sessCtx, t.stream, wire.TypeImgCancel, wire.AppendImgCancel(nil, wire.CancelLocalIO))
+		e.failTransfer(t, reason)
+	}
 	f, err := os.OpenFile(t.partPath, os.O_RDWR, 0o600) // #nosec G304 -- our partials dir
 	if err != nil {
-		e.failTransfer(t, "cannot open partial file")
+		abort("cannot open partial file")
 		return
 	}
 	defer func() { _ = f.Close() }()
 	h := media.NewHasher()
-	if start > 0 { // re-hash the kept prefix
-		buf := make([]byte, 1<<20)
-		left := int64(start) * wire.ChunkData
-		for left > 0 {
-			n, err := f.Read(buf[:min(int64(len(buf)), left)])
-			if n > 0 {
-				h.Write(buf[:n])
-				left -= int64(n)
-			}
-			if err != nil {
-				e.failTransfer(t, "cannot read partial file")
-				return
-			}
-		}
-	}
-	if _, err := f.Seek(int64(start)*wire.ChunkData, 0); err != nil {
-		e.failTransfer(t, "cannot seek partial file")
+	kept := int64(start) * wire.ChunkData
+	if n, err := io.Copy(h, io.LimitReader(f, kept)); err != nil || n != kept { // hash the kept prefix again
+		abort("cannot read partial file")
 		return
 	}
 	next := start
-	write := func(chunk []byte) bool {
-		if _, err := f.Write(chunk); err != nil {
-			_ = p.s.SendStream(e.sessCtx, t.stream, wire.TypeImgCancel, wire.AppendImgCancel(nil, wire.CancelLocalIO))
-			e.failTransfer(t, "disk write failed")
+	write := func(c session.Chunk) bool {
+		_, err := f.Write(c.Data())
+		if err == nil {
+			h.Write(c.Data())
+		}
+		c.Release()
+		if err != nil {
+			abort("disk write failed")
 			return false
 		}
-		h.Write(chunk)
 		next++
 		if e.cfg.ChunkDelay > 0 {
 			time.Sleep(e.cfg.ChunkDelay)
@@ -656,36 +735,55 @@ func (e *Engine) fileWriter(p *peer, t *transfer, start uint32) {
 					return
 				}
 			}
-			_ = f.Sync()
-			_ = f.Close()
-			if next != t.chunks || subtle.ConstantTimeCompare(h.Sum(nil), t.hash[:]) != 1 {
-				_ = os.Remove(t.partPath)
-				_ = e.st.DeleteBlob(e.metaRel(t.id))
-				_ = p.s.SendStream(e.sessCtx, t.stream, wire.TypeImgResult, wire.AppendImgResult(nil, wire.ResultHashMismatch))
-				e.failTransfer(t, "hash mismatch")
-				return
-			}
-			dest, err := e.placeImage(t)
-			if err != nil {
-				_ = p.s.SendStream(e.sessCtx, t.stream, wire.TypeImgResult, wire.AppendImgResult(nil, wire.ResultAborted))
-				e.failTransfer(t, "cannot save image")
-				return
-			}
-			_ = e.st.DeleteBlob(e.metaRel(t.id))
-			_ = p.s.SendStream(e.sessCtx, t.stream, wire.TypeImgResult, wire.AppendImgResult(nil, wire.ResultOK))
-			e.do(func() { e.finishTransferL(t, dest) })
+			e.finishDownload(p, t, f, h.Sum(nil), next)
 			return
-		case <-t.stop: // transfer failed (connection lost, cancel): keep an accurate .meta for resume
+		case <-t.ctx.Done(): // failed, cancelled, or shutting down
 			_ = f.Sync()
-			if _, err := os.Stat(t.partPath); err == nil { // a user cancel has deleted the partial
-				_ = e.writeMeta(t, next)
+			if t.discard.Load() {
+				e.dropPartial(t)
+			} else {
+				_ = e.writeMeta(t, next) // an accurate .meta, so a later offer can resume
 			}
-			return
-		case <-e.sessCtx.Done():
-			_ = e.writeMeta(t, next)
 			return
 		}
 	}
+}
+
+// finishDownload verifies a complete download, moves it into place and
+// answers the sender.
+func (e *Engine) finishDownload(p *peer, t *transfer, f *os.File, sum []byte, got uint32) {
+	result := func(status uint8) {
+		_ = p.s.SendStream(e.sessCtx, t.stream, wire.TypeImgResult, wire.AppendImgResult(nil, status))
+	}
+	_ = f.Sync()
+	_ = f.Close()
+	if got != t.chunks || subtle.ConstantTimeCompare(sum, t.hash[:]) != 1 {
+		e.dropPartial(t)
+		result(wire.ResultHashMismatch)
+		e.failTransfer(t, "hash mismatch")
+		return
+	}
+	dest, err := e.placeImage(t)
+	switch {
+	case errors.Is(err, media.ErrUnsupported):
+		e.dropPartial(t) // offered as an image, and it is none
+		result(wire.ResultAborted)
+		e.failTransfer(t, "the received data is not an image")
+		return
+	case err != nil:
+		result(wire.ResultAborted) // the verified partial stays for a later attempt
+		e.failTransfer(t, "cannot save the file in "+t.destDir)
+		return
+	}
+	_ = e.st.DeleteBlob(e.metaRel(t.partID))
+	result(wire.ResultOK)
+	e.do(func() { e.finishTransferL(t, dest) })
+}
+
+// dropPartial deletes a download's partial and its sidecar.
+func (e *Engine) dropPartial(t *transfer) {
+	_ = os.Remove(t.partPath)
+	_ = e.st.DeleteBlob(e.metaRel(t.partID))
 }
 
 // placeImage renames the verified .part to <dest>/img-<hash8>.<ext>, with the
@@ -714,6 +812,9 @@ func (e *Engine) placeImage(t *transfer) (string, error) {
 	return placeAs(t, "img-"+hex.EncodeToString(t.hash[:4]), media.Ext(format))
 }
 
+// placeAs moves the partial to <destDir>/<base>.<ext>, or <base>-2.<ext> and
+// so on when that name is taken. The name is reserved before the move, so two
+// downloads that finish together cannot overwrite each other.
 func placeAs(t *transfer, base, ext string) (string, error) {
 	for i := 1; i < 1000; i++ {
 		name := base
@@ -721,15 +822,48 @@ func placeAs(t *transfer, base, ext string) (string, error) {
 			name = fmt.Sprintf("%s-%d", base, i)
 		}
 		dest := filepath.Join(t.destDir, name+"."+ext)
-		if _, err := os.Stat(dest); err == nil {
+		f, err := os.OpenFile(dest, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600) // #nosec G304 -- name built from the hash
+		if errors.Is(err, fs.ErrExist) {
 			continue
 		}
-		if err := os.Rename(t.partPath, dest); err != nil {
+		if err != nil {
+			return "", err
+		}
+		_ = f.Close()
+		if err := moveFile(t.partPath, dest); err != nil {
+			_ = os.Remove(dest)
 			return "", err
 		}
 		return dest, nil
 	}
 	return "", errors.New("too many collisions")
+}
+
+// moveFile renames src over dst, or copies it when they are on different
+// file systems (rename cannot cross them).
+func moveFile(src, dst string) error {
+	if os.Rename(src, dst) == nil {
+		return nil
+	}
+	in, err := os.Open(src) // #nosec G304 -- our partials dir
+	if err != nil {
+		return err
+	}
+	defer func() { _ = in.Close() }()
+	out, err := os.OpenFile(dst, os.O_WRONLY|os.O_TRUNC, 0o600) // #nosec G304 -- reserved by placeAs
+	if err != nil {
+		return err
+	}
+	if _, err = io.Copy(out, in); err == nil {
+		err = out.Sync()
+	}
+	if cerr := out.Close(); err == nil {
+		err = cerr
+	}
+	if err != nil {
+		return err
+	}
+	return os.Remove(src)
 }
 
 // RejectImage declines an offer.
@@ -748,11 +882,10 @@ func (e *Engine) RejectImage(id TransferID) error {
 func (e *Engine) CancelTransfer(id TransferID) error {
 	var t *transfer
 	var p *peer
-	var part string
-	offer := false
+	offer, receiving := false, false
 	e.do(func() {
 		if t = e.transfers[id]; t != nil {
-			p, part, offer = t.owner, t.partPath, !t.accepted && !t.outgoing
+			p, offer, receiving = t.owner, !t.accepted && !t.outgoing, t.partPath != ""
 		}
 	})
 	if t == nil {
@@ -761,14 +894,14 @@ func (e *Engine) CancelTransfer(id TransferID) error {
 	if offer {
 		return e.RejectImage(id)
 	}
+	t.discard.Store(true)
 	if p != nil {
 		_ = p.s.SendStream(e.sessCtx, t.stream, wire.TypeImgCancel, wire.AppendImgCancel(nil, wire.CancelUser))
 	}
 	e.failTransfer(t, "cancelled")
-	if part != "" {
-		_ = os.Remove(part)
+	if receiving {
+		e.dropPartial(t) // the file-writer does the same when it stops; whoever is last wins
 	}
-	_ = e.st.DeleteBlob(e.metaRel(id))
 	return nil
 }
 
@@ -848,7 +981,7 @@ func (e *Engine) failPeerTransfersL(p *peer) {
 
 // DecodeImage safely loads a saved image for display, downscaled to fit
 // maxSide (0 = full size). Call it off the UI thread.
-func DecodeImage(path string, maxSide int) (image.Image, error) {
+func DecodeImage(ctx context.Context, path string, maxSide int) (image.Image, error) {
 	if st, err := os.Stat(path); err != nil {
 		return nil, err
 	} else if uint64(st.Size()) > wire.MaxImageDecodeBytes { // #nosec G115 -- a size is not negative
@@ -861,7 +994,7 @@ func DecodeImage(path string, maxSide int) (image.Image, error) {
 	if err != nil {
 		return nil, err
 	}
-	img, _, err := media.Decode(data)
+	img, _, err := media.Decode(ctx, data)
 	if err != nil {
 		return nil, err
 	}

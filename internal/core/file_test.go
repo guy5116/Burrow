@@ -64,7 +64,7 @@ func TestFileTransfer(t *testing.T) {
 	}
 	a.wait(t, "sender done", func(ev Event) bool { d, ok := ev.(TransferDone); return ok && d.ID == id && !d.Image })
 	// A received file of another kind is never decoded or read into memory for display.
-	if _, err := DecodeImage(done.Path, 0); !errors.Is(err, media.ErrUnsupported) {
+	if _, err := DecodeImage(context.Background(), done.Path, 0); !errors.Is(err, media.ErrUnsupported) {
 		t.Fatal(err)
 	}
 	// No extension: saved as .bin.

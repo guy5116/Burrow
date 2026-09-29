@@ -106,6 +106,7 @@ type outFrame struct {
 	typ     wire.FrameType
 	stream  uint16
 	payload []byte
+	pooled  *[]byte // when set, payload lives in this pool buffer; the writer returns it
 }
 
 // Session is one live connection to one peer.
@@ -157,7 +158,8 @@ type Session struct {
 	streams      *streamTable
 	transferWake chan struct{}
 	closedQueues map[uint16]chan outFrame // frames still to send on streams already closed
-	rrPos        int                      // writer round-robin position
+	rr           []rrEntry                // writer: scratch list for nextTransferFrame
+	rrLast       uint32                   // writer: stream id served last
 
 	peerHello wire.Hello
 	helloRecv chan struct{} // closed when the peer's HELLO validated
@@ -370,6 +372,12 @@ func (s *Session) Close(reason uint8) {
 	<-s.closed
 }
 
+// Drop closes the session without a BYE: the peer learns nothing about why.
+func (s *Session) Drop() {
+	s.fail(ErrClosed)
+	<-s.closed
+}
+
 // Done closes when the session has fully torn down.
 func (s *Session) Done() <-chan struct{} { return s.closed }
 
@@ -396,31 +404,6 @@ func (s *Session) Peer() identity.PeerID { return s.cfg.Peer }
 // Initiator reports which side we are.
 func (s *Session) Initiator() bool { return s.cfg.Initiator }
 
-// Send queues a chat frame (TEXT, ACK, TYPING). It blocks under backpressure
-// until ctx or the session ends. payload is copied.
-func (s *Session) Send(ctx context.Context, typ wire.FrameType, payload []byte) error {
-	if typ.Class() != wire.ClassChat {
-		return wire.ErrStream
-	}
-	if !s.ready.Load() {
-		return ErrNotReady
-	}
-	select {
-	case <-s.closed:
-		return ErrClosed
-	default:
-	}
-	f := outFrame{typ: typ, stream: wire.StreamChat, payload: append([]byte(nil), payload...)}
-	select {
-	case s.chat <- f:
-		return nil
-	case <-ctx.Done():
-		return ctx.Err()
-	case <-s.closed:
-		return ErrClosed
-	}
-}
-
 // TrySend queues a chat frame without blocking. It reports false when the
 // chat queue is full; the caller keeps the frame and tries again later.
 func (s *Session) TrySend(typ wire.FrameType, payload []byte) (bool, error) {
@@ -443,16 +426,6 @@ func (s *Session) TrySend(typ wire.FrameType, payload []byte) (bool, error) {
 	}
 }
 
-// Rekey asks the writer to start a rekey now (initiator) or to send
-// REKEY_REQUEST (responder). Tests and the controller use it.
-func (s *Session) Rekey() error {
-	kind := ctrlStartRekey
-	if !s.cfg.Initiator {
-		kind = ctrlSendRekeyRequest
-	}
-	return s.pushControl(ctrl{kind: kind})
-}
-
 func (s *Session) pushControl(c ctrl) error {
 	select {
 	case s.control <- c:
@@ -460,9 +433,4 @@ func (s *Session) pushControl(c ctrl) error {
 	default:
 		return ErrQueueFull
 	}
-}
-
-// Epochs reports the current send and receive epochs (tests).
-func (s *Session) Epochs() (send, recv uint32) {
-	return uint32(s.sendEpoch.Load()), uint32(s.recvEpoch.Load())
 }

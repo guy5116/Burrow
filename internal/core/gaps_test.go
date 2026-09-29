@@ -292,7 +292,7 @@ func TestReceiverIgnoresDeclaredFormat(t *testing.T) {
 	if !strings.HasSuffix(done.Path, ".png") {
 		t.Fatalf("saved as %s: the declared format was trusted", done.Path)
 	}
-	got, err := DecodeImage(done.Path, 0)
+	got, err := DecodeImage(context.Background(), done.Path, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -306,7 +306,13 @@ func TestReceiverIgnoresDeclaredFormat(t *testing.T) {
 	chunk2, _ := wire.AppendImgChunk(nil, wire.ImgChunk{Index: 0, Data: junk})
 	_ = p.SendFrame(wire.TypeImgChunk, 4, chunk2)
 	_ = p.SendFrame(wire.TypeImgDone, 4, nil)
-	a.wait(t, "cannot save", func(ev Event) bool { f, ok := ev.(TransferFailed); return ok && f.Reason == "cannot save image" })
+	a.wait(t, "not an image", func(ev Event) bool {
+		f, ok := ev.(TransferFailed)
+		return ok && f.Reason == "the received data is not an image"
+	})
+	if parts, _ := filepath.Glob(filepath.Join(a.e.partialsPath(), "*")); len(parts) != 0 {
+		t.Fatal("junk kept on disk")
+	}
 }
 
 // The 1,024-contact cap applies to the side that dials as well.

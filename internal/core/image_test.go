@@ -131,12 +131,12 @@ func TestImageTransfer(t *testing.T) {
 	if bytes.Contains(saved, []byte("SECRET-METADATA")) {
 		t.Fatal("metadata leaked")
 	}
-	got, err := DecodeImage(done.Path, 0)
+	got, err := DecodeImage(context.Background(), done.Path, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
 	samePix(t, want, got)
-	if th, _ := DecodeImage(done.Path, 50); th.Bounds().Dx() != 50 {
+	if th, _ := DecodeImage(context.Background(), done.Path, 50); th.Bounds().Dx() != 50 {
 		t.Fatal("thumbnail")
 	}
 	// No partials left behind; no stray transfers.
@@ -281,12 +281,16 @@ func TestImageResume(t *testing.T) {
 		t.Fatal(err)
 	}
 	res := b.wait(t, "TransferResumed", isType[TransferResumed]).(TransferResumed)
-	if hex.EncodeToString(res.ID[:]) != m.ID {
-		t.Fatal("resumed transfer did not adopt the partial's id")
+	// The transfer keeps the id it was offered under; only the file on disk is the old one.
+	if res.ID != off2.ID || hex.EncodeToString(off2.ID[:]) == m.ID {
+		t.Fatal("a resumed transfer changed its id")
+	}
+	if err := b.e.CancelTransfer(TransferID{1}); !errors.Is(err, ErrUnknownTransfer) {
+		t.Fatal(err)
 	}
 	// The sender skipped the completed chunks: its first progress is past the checkpoint.
 	done := b.wait(t, "TransferDone", isType[TransferDone]).(TransferDone)
-	got, err := DecodeImage(done.Path, 0)
+	got, err := DecodeImage(context.Background(), done.Path, 0)
 	if err != nil {
 		t.Fatal(err)
 	}

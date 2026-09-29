@@ -5,6 +5,9 @@ import (
 	"context"
 	"crypto/rand"
 	"errors"
+	"github.com/guy5116/burrow/internal/buf"
+	"runtime"
+	"slices"
 	"testing"
 	"time"
 
@@ -228,7 +231,7 @@ func TestCancelRaces(t *testing.T) {
 	if p.i.Err() != nil || p.r.Err() != nil {
 		t.Fatal(p.i.Err(), p.r.Err())
 	}
-	// Cancel after DONE: a late CANCEL on a closed stream is ignored.
+	// A late CANCEL on a stream that has already closed is ignored.
 	id2, _ := p.i.OpenStream(5)
 	op2, _ := wire.AppendImgOffer(nil, wire.ImgOffer{Size: 5, Format: 1})
 	_ = p.i.SendStream(ctx, id2, wire.TypeImgOffer, op2)
@@ -409,6 +412,7 @@ func TestBusyRejectAndDrainingLimits(t *testing.T) {
 			if !errors.Is(err, ErrStreamLimit) {
 				t.Fatalf("17th draining stream accepted: %v", err)
 			}
+			b.expectViolation(t) // §4.3: more than 16 draining streams close the session
 			return
 		}
 		if err != nil {
@@ -441,51 +445,74 @@ func TestSenderRejectPath(t *testing.T) {
 	}
 }
 
+// transferChunks moves chunks full chunks over one stream the way the engine
+// does: pooled buffers on the way out, a sink and Release on the way in.
+func transferChunks(p *pairT, chunks int) {
+	ctx := context.Background()
+	size := uint64(chunks) * wire.ChunkData
+	// A real peer may offer at most 16 transfers per minute; a loop of these is
+	// not the churn that rule is about.
+	p.r.streams.mu.Lock()
+	p.r.streams.offerTimes = nil
+	p.r.streams.mu.Unlock()
+	id, _ := p.i.OpenStream(size)
+	sink := make(chan Chunk, 4)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		<-p.r.Inbound()
+		_ = p.r.SetChunkSink(id, sink)
+		_ = p.r.SendStream(ctx, id, wire.TypeImgAccept, wire.AppendImgAccept(nil, 0))
+		for n := 0; n < chunks; n++ {
+			(<-sink).Release()
+		}
+		<-p.r.Inbound() // DONE
+		_ = p.r.SendStream(ctx, id, wire.TypeImgResult, wire.AppendImgResult(nil, 0))
+	}()
+	_ = p.i.SendStream(ctx, id, wire.TypeImgOffer, offerPayload(size))
+	<-p.i.Inbound()
+	for i := 0; i < chunks; i++ {
+		b := buf.Get()
+		payload, _ := wire.AppendImgChunk((*b)[:0], wire.ImgChunk{Index: uint32(i), Data: (*b)[wire.MaxCiphertext-wire.ChunkData : wire.MaxCiphertext]})
+		_ = p.i.SendChunk(ctx, id, b, len(payload))
+	}
+	_ = p.i.SendStream(ctx, id, wire.TypeImgDone, nil)
+	<-p.i.Inbound()
+	<-done
+}
+
+// End-to-end throughput of the session layer over net.Pipe (no disk, no TCP).
 func BenchmarkTransfer(b *testing.B) {
-	// End-to-end throughput of the session layer over net.Pipe (no disk, no TCP).
-	t := &testing.T{}
-	p := newPair(t, time.Hour)
-	const size = 256 * wire.ChunkData // exactly 256 full chunks
-	data := make([]byte, wire.ChunkData)
-	b.SetBytes(size)
+	p := newPair(&testing.T{}, time.Hour)
+	const chunks = 256
+	b.SetBytes(chunks * wire.ChunkData)
+	b.ReportAllocs()
 	b.ResetTimer()
 	for n := 0; n < b.N; n++ {
-		ctx := context.Background()
-		// A real peer may offer at most 16 images per minute; the benchmark
-		// resets the receiver's churn window so b.N iterations are not a violation.
-		p.r.streams.mu.Lock()
-		p.r.streams.offerTimes = nil
-		p.r.streams.mu.Unlock()
-		id, _ := p.i.OpenStream(size)
-		op, _ := wire.AppendImgOffer(nil, wire.ImgOffer{Size: size, Format: 1})
-		done := make(chan struct{})
-		go func() {
-			defer close(done)
-			<-p.r.Inbound()
-			_ = p.r.SendStream(ctx, id, wire.TypeImgAccept, wire.AppendImgAccept(nil, 0))
-			for {
-				in := <-p.r.Inbound()
-				if in.Type == wire.TypeImgDone {
-					break
-				}
-			}
-			_ = p.r.SendStream(ctx, id, wire.TypeImgResult, wire.AppendImgResult(nil, 0))
-		}()
-		_ = p.i.SendStream(ctx, id, wire.TypeImgOffer, op)
-		<-p.i.Inbound()
-		for i := 0; i < size/wire.ChunkData; i++ {
-			cp, _ := wire.AppendImgChunk(nil, wire.ImgChunk{Index: uint32(i), Data: data})
-			_ = p.i.SendStream(ctx, id, wire.TypeImgChunk, cp)
-		}
-		_ = p.i.SendStream(ctx, id, wire.TypeImgDone, nil)
-		<-p.i.Inbound()
-		<-done
+		transferChunks(p, chunks)
 	}
 	p.cancel()
 }
 
+// Sending and receiving a chunk allocates nothing of a chunk's size (§11).
+func TestTransferAllocs(t *testing.T) {
+	if raceEnabled {
+		t.Skip("the race runtime changes allocation counts")
+	}
+	p := newPair(t, time.Hour)
+	transferChunks(p, 8) // warm the buffer pool
+	const chunks = 128
+	var before, after runtime.MemStats
+	runtime.ReadMemStats(&before)
+	transferChunks(p, chunks)
+	runtime.ReadMemStats(&after)
+	if per := (after.TotalAlloc - before.TotalAlloc) / chunks; per > wire.ChunkData/4 {
+		t.Fatalf("%d bytes allocated per %d-byte chunk", per, wire.ChunkData)
+	}
+}
+
 // acceptOfferWithSink is acceptOffer with chunk data routed to sink.
-func (a *adv) acceptOfferWithSink(t *testing.T, id uint16, size uint64, sink chan<- []byte) {
+func (a *adv) acceptOfferWithSink(t *testing.T, id uint16, size uint64, sink chan<- Chunk) {
 	t.Helper()
 	if err := a.p.SendFrame(wire.TypeImgOffer, id, offerPayload(size)); err != nil {
 		t.Fatal(err)
@@ -572,4 +599,201 @@ func TestBadFileOfferClosesSession(t *testing.T) {
 		t.Fatal(err)
 	}
 	a.expectViolation(t)
+}
+
+// openActive offers a stream from the initiator and has the responder accept it.
+func openActive(t *testing.T, p *pairT, size uint64) uint16 {
+	t.Helper()
+	ctx := context.Background()
+	id, err := p.i.OpenStream(size)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := p.i.SendStream(ctx, id, wire.TypeImgOffer, offerPayload(size)); err != nil {
+		t.Fatal(err)
+	}
+	if in := <-p.r.Inbound(); in.Type != wire.TypeImgOffer {
+		t.Fatal(in.Type)
+	}
+	if err := p.r.SendStream(ctx, id, wire.TypeImgAccept, wire.AppendImgAccept(nil, 0)); err != nil {
+		t.Fatal(err)
+	}
+	if in := <-p.i.Inbound(); in.Type != wire.TypeImgAccept {
+		t.Fatal(in.Type)
+	}
+	return id
+}
+
+func waitClosed(t *testing.T, p *pairT, id uint16) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for p.i.StreamOpen(id) || p.r.StreamOpen(id) {
+		if time.Now().After(deadline) {
+			t.Fatalf("stream %d still open: initiator=%v responder=%v", id, p.i.StreamOpen(id), p.r.StreamOpen(id))
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+// Both sides cancel the same transfer at the same instant, many times over:
+// neither CANCEL may be lost, or one side would stay draining for ever.
+func TestSimultaneousCancel(t *testing.T) {
+	p := newPair(t, time.Hour)
+	cancel := wire.AppendImgCancel(nil, wire.CancelUser)
+	for n := 0; n < 150; n++ {
+		p.r.streams.mu.Lock()
+		p.r.streams.offerTimes = nil // this loop is not the offer churn of §4.3
+		p.r.streams.mu.Unlock()
+		id := openActive(t, p, 2*wire.ChunkData)
+		start := make(chan struct{})
+		done := make(chan struct{}, 2)
+		for _, s := range []*Session{p.i, p.r} {
+			go func() {
+				<-start
+				_ = s.SendStream(context.Background(), id, wire.TypeImgCancel, cancel)
+				done <- struct{}{}
+			}()
+		}
+		close(start)
+		<-done
+		<-done
+		waitClosed(t, p, id)
+	}
+	if p.i.Err() != nil || p.r.Err() != nil {
+		t.Fatal(p.i.Err(), p.r.Err())
+	}
+}
+
+// Cancel after DONE: the sender has sent everything and cancels before the
+// RESULT arrives.
+func TestCancelAfterDone(t *testing.T) {
+	p := newPair(t, time.Hour)
+	ctx := context.Background()
+	id := openActive(t, p, 3)
+	chunk, _ := wire.AppendImgChunk(nil, wire.ImgChunk{Index: 0, Data: []byte{1, 2, 3}})
+	if err := p.i.SendStream(ctx, id, wire.TypeImgChunk, chunk); err != nil {
+		t.Fatal(err)
+	}
+	if err := p.i.SendStream(ctx, id, wire.TypeImgDone, nil); err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []wire.FrameType{wire.TypeImgChunk, wire.TypeImgDone} {
+		if in := <-p.r.Inbound(); in.Type != want {
+			t.Fatalf("got %#x want %#x", in.Type, want)
+		}
+	}
+	if err := p.i.SendStream(ctx, id, wire.TypeImgCancel, wire.AppendImgCancel(nil, wire.CancelUser)); err != nil {
+		t.Fatal(err)
+	}
+	if in := <-p.r.Inbound(); in.Type != wire.TypeImgCancel {
+		t.Fatalf("got %#x", in.Type)
+	}
+	waitClosed(t, p, id)
+	if p.i.Err() != nil || p.r.Err() != nil {
+		t.Fatal(p.i.Err(), p.r.Err())
+	}
+}
+
+// A receiver that stops a transfer while its disk is behind releases the
+// reader: frames on other streams keep arriving.
+func TestReaderNotStuckOnStoppedTransfer(t *testing.T) {
+	a := newAdv(t, false, true)
+	sink := make(chan Chunk) // nobody reads: the file-writer has gone
+	a.acceptOfferWithSink(t, 2, 2*wire.ChunkData, sink)
+	chunk, _ := wire.AppendImgChunk(nil, wire.ImgChunk{Index: 0, Data: make([]byte, wire.ChunkData)})
+	if err := a.p.SendFrame(wire.TypeImgChunk, 2, chunk); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(50 * time.Millisecond) // the reader is now waiting on the sink
+	if err := a.s.SendStream(context.Background(), 2, wire.TypeImgCancel, wire.AppendImgCancel(nil, wire.CancelUser)); err != nil {
+		t.Fatal(err)
+	}
+	a.recv(t, wire.TypeImgCancel)
+	text, _ := wire.AppendText(nil, wire.Text{MsgID: 9, Text: []byte("still here")})
+	if err := a.p.SendFrame(wire.TypeText, wire.StreamChat, text); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case in := <-a.s.Inbound():
+		if in.Type != wire.TypeText {
+			t.Fatalf("%#x", in.Type)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("the reader is stuck behind the stopped transfer")
+	}
+}
+
+// Cancelling a stream whose offer was never sent forgets it without a frame.
+func TestCancelBeforeOffer(t *testing.T) {
+	a := newAdv(t, true, true)
+	for n := 0; n < wire.MaxPendingOffers+2; n++ { // more than the limit: nothing leaks
+		id, err := a.s.OpenStream(10)
+		if err != nil {
+			t.Fatal(n, err)
+		}
+		if err := a.s.SendStream(context.Background(), id, wire.TypeImgCancel, wire.AppendImgCancel(nil, wire.CancelUser)); err != nil {
+			t.Fatal(err)
+		}
+		if a.s.StreamOpen(id) {
+			t.Fatal("stream still open")
+		}
+		if err := a.s.SendStream(context.Background(), id, wire.TypeImgOffer, offerPayload(10)); !errors.Is(err, ErrStreamState) {
+			t.Fatal(err)
+		}
+	}
+	// The peer has seen nothing but our next real frame.
+	ping, _ := randomNonce()
+	_ = a.s.pushControl(ctrl{kind: ctrlPong, payload: wire.AppendPong(nil, ping)})
+	a.recv(t, wire.TypePong)
+}
+
+// A terminal frame with a bad payload is a violation even where its content
+// changes nothing: on a draining stream and on a recently closed one.
+func TestMalformedTerminalFrames(t *testing.T) {
+	t.Run("draining", func(t *testing.T) {
+		a := newAdv(t, true, true)
+		id, _ := a.s.OpenStream(1)
+		_ = a.s.SendStream(context.Background(), id, wire.TypeImgOffer, offerPayload(1))
+		a.recv(t, wire.TypeImgOffer)
+		_ = a.s.SendStream(context.Background(), id, wire.TypeImgCancel, wire.AppendImgCancel(nil, 0))
+		a.recv(t, wire.TypeImgCancel)
+		_ = a.p.SendFrame(wire.TypeImgCancel, id, []byte{7}) // unknown reason
+		a.expectViolation(t)
+	})
+	t.Run("closed", func(t *testing.T) {
+		a := newAdv(t, true, true)
+		id, _ := a.s.OpenStream(1)
+		_ = a.s.SendStream(context.Background(), id, wire.TypeImgOffer, offerPayload(1))
+		a.recv(t, wire.TypeImgOffer)
+		_ = a.p.SendFrame(wire.TypeImgReject, id, wire.AppendImgReject(nil, wire.RejectDeclined))
+		if in := <-a.s.Inbound(); in.Type != wire.TypeImgReject {
+			t.Fatal(in.Type)
+		}
+		_ = a.p.SendFrame(wire.TypeImgCancel, id, []byte{7})
+		a.expectViolation(t)
+	})
+}
+
+// Concurrent transfers are served in turn, not at random.
+func TestTransfersTakeTurns(t *testing.T) {
+	s := &Session{streams: newStreamTable(true), closedQueues: map[uint16]chan outFrame{}}
+	for _, id := range []uint16{2, 4, 6} {
+		st := newStream(id, true, 1)
+		st.queue = make(chan outFrame, 3)
+		for n := 0; n < 3; n++ {
+			st.queue <- outFrame{stream: id}
+		}
+		s.streams.open[id] = st
+	}
+	var got []uint16
+	for {
+		f, ok := s.nextTransferFrame()
+		if !ok {
+			break
+		}
+		got = append(got, f.stream)
+	}
+	if want := []uint16{2, 4, 6, 2, 4, 6, 2, 4, 6}; !slices.Equal(got, want) {
+		t.Fatalf("served %v", got)
+	}
 }

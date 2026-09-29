@@ -3,6 +3,7 @@ package identity
 import (
 	"bytes"
 	"encoding/hex"
+	"golang.org/x/crypto/curve25519"
 	"regexp"
 	"strings"
 	"testing"
@@ -36,8 +37,11 @@ func TestX25519KAT(t *testing.T) {
 		t.Fatal("scalar lost")
 	}
 	id.Clear()
-	if !bytes.Equal(id.Scalar(), make([]byte, 32)) {
+	if id.Scalar() != nil {
 		t.Fatal("Clear")
+	}
+	if _, err := curve25519.X25519(id.Scalar(), curve25519.Basepoint); err == nil {
+		t.Fatal("a cleared identity still computes")
 	}
 	if _, err := FromScalar([]byte{1, 2}); err == nil {
 		t.Fatal("short scalar accepted")
@@ -154,7 +158,7 @@ func TestStorageLifecycle(t *testing.T) {
 	}
 	id.Clear()
 	id.Clear() // idempotent; with memguard the storage is unmapped, Scalar must not touch it
-	if !bytes.Equal(id.Scalar(), make([]byte, 32)) {
+	if id.Scalar() != nil {
 		t.Fatal("scalar readable after Clear")
 	}
 	t.Logf("identity keys in locked memory: %v", Locked())

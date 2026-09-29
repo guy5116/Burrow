@@ -77,7 +77,14 @@ func TestEncodeRejects(t *testing.T) {
 			i.Kind = KindTor
 			i.Addr = strings.Repeat("a", 16) + ".onion"
 		},
-		"expiry0": func(i *Invite) { i.Expiry = time.Unix(0, 0) },
+		"tor-not-base32": func(i *Invite) {
+			i.Kind = KindTor
+			i.Addr = strings.Repeat("1", 56) + ".onion" // 0, 1, 8 and 9 are not base32
+		},
+		"onion-over-tcp": func(i *Invite) { i.Addr = strings.Repeat("a", 56) + ".onion" }, // would go to the DNS resolver
+		"mistyped-ip":    func(i *Invite) { i.Addr = "192.168.1.256" },                    // would become a DNS query
+		"numeric-host":   func(i *Invite) { i.Addr = "12345" },
+		"expiry0":        func(i *Invite) { i.Expiry = time.Unix(0, 0) },
 	}
 	for name, mod := range mods {
 		i := sample()

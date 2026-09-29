@@ -2,6 +2,7 @@ package media
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"image"
 	"image/color"
@@ -42,7 +43,7 @@ func TestTruncationAtEveryOffset(t *testing.T) {
 			}
 			_, _ = Probe(data[:n])
 			if name == "gif" {
-				_, _, _ = gifPrescan(data[:n])
+				_, _, _ = gifPrescan(bytes.NewReader(data[:n]))
 			}
 		}
 		if failures < full/2 {
@@ -119,8 +120,10 @@ func TestJPEGStructuralCases(t *testing.T) {
 		}
 	}
 	// Fill bytes before markers, RSTn and stuffing inside a scan, a second scan
-	// (progressive layout), APP14 kept, and a second JFIF dropped.
-	ok := []byte("\xff\xd8" + "\xff\xff\xff\xe0\x00\x07JFIF\x00" + "\xff\xe0\x00\x07JFIF\x00" + "\xff\xee\x00\x04Ad" +
+	// (progressive layout), the Adobe APP14 kept, anything else under APP14
+	// dropped, and a second JFIF dropped.
+	adobe := "\xff\xee\x00\x0eAdobe\x00\x64\x00\x00\x00\x00\x01"
+	ok := []byte("\xff\xd8" + "\xff\xff\xff\xe0\x00\x07JFIF\x00" + "\xff\xe0\x00\x07JFIF\x00" + adobe + "\xff\xee\x00\x08SECRET" +
 		"\xff\xdb\x00\x03q" + "\xff\xda\x00\x02" + "\x01\xff\x00\x02\xff\xd1\x03\xff\xff" +
 		"\xff\xc4\x00\x03h" + "\xff\xda\x00\x02" + "\x09\x08" + "\xff\xd9" + "junk")
 	var out bytes.Buffer
@@ -128,7 +131,7 @@ func TestJPEGStructuralCases(t *testing.T) {
 		t.Fatal(err)
 	}
 	got := out.Bytes()
-	if bytes.Count(got, []byte("JFIF")) != 1 || !bytes.Contains(got, []byte("\xff\xee\x00\x04Ad")) ||
+	if bytes.Count(got, []byte("JFIF")) != 1 || !bytes.Contains(got, []byte(adobe)) || bytes.Contains(got, []byte("SECRET")) ||
 		!bytes.Contains(got, []byte("\x01\xff\x00\x02\xff\xd1\x03")) || bytes.Count(got, []byte("\xff\xda")) != 2 ||
 		!bytes.HasSuffix(got, []byte("\xff\xd9")) {
 		t.Fatalf("%q", got)
@@ -169,8 +172,17 @@ func TestPNGAndWebPStructuralCases(t *testing.T) {
 	if err != nil || o != 3 {
 		t.Fatal(o, err)
 	}
-	if webpAnimated([]byte("short")) || !webpAnimated(append([]byte("RIFF\x00\x00\x00\x00WEBPVP8L"), []byte("....ANIM")...)) {
-		t.Fatal("webpAnimated")
+	if _, err := webpAnimated(bytes.NewReader([]byte("short"))); !errors.Is(err, ErrCorrupt) {
+		t.Fatal(err)
+	}
+	// Only the VP8X flag decides. The letters ANIM inside pixel data mean nothing.
+	still := append([]byte("RIFF\x00\x00\x00\x00WEBP"), riffChunk("VP8L", []byte("..ANIM.."))...)
+	still[4] = byte(len(still) - 8)
+	if animated, err := webpAnimated(bytes.NewReader(still)); err != nil || animated {
+		t.Fatal(animated, err)
+	}
+	if animated, err := webpAnimated(bytes.NewReader(webpFile(4, 4, color.NRGBA{1, 2, 3, 255}, true, 1, true))); err != nil || !animated {
+		t.Fatal(animated, err)
 	}
 }
 
@@ -190,7 +202,7 @@ func TestGIFStructuralCases(t *testing.T) {
 	if err := stripGIF(&out, bytes.NewReader(lct)); err != nil || !bytes.Contains(out.Bytes(), []byte{1, 2, 3, 4, 5, 6}) {
 		t.Fatal(err)
 	}
-	if f, a, err := gifPrescan(lct); err != nil || f != 1 || a != 4 {
+	if f, a, err := gifPrescan(bytes.NewReader(lct)); err != nil || f != 1 || a != 4 {
 		t.Fatal(f, a, err)
 	}
 	g87 := append([]byte("GIF87a"), lct[6:]...)
@@ -201,17 +213,11 @@ func TestGIFStructuralCases(t *testing.T) {
 	if err := stripGIF(&bytes.Buffer{}, bytes.NewReader(bad)); !errors.Is(err, ErrCorrupt) {
 		t.Fatal(err)
 	}
-	if _, _, err := gifPrescan(bad); !errors.Is(err, ErrCorrupt) {
+	if _, _, err := gifPrescan(bytes.NewReader(bad)); !errors.Is(err, ErrCorrupt) {
 		t.Fatal(err)
 	}
-	if _, _, err := gifPrescan([]byte("GIF89b.......")); !errors.Is(err, ErrCorrupt) {
+	if _, _, err := gifPrescan(bytes.NewReader([]byte("GIF89b......."))); !errors.Is(err, ErrCorrupt) {
 		t.Fatal(err)
-	}
-	if _, err := DecodeGIF(dirtyPNG(t, testImage(2, 2), 1)); !errors.Is(err, ErrUnsupported) {
-		t.Fatal(err)
-	}
-	if _, err := DecodeGIF([]byte("GIF89a")); err == nil {
-		t.Fatal("truncated gif decoded")
 	}
 }
 
@@ -253,15 +259,15 @@ func TestSmallHelpers(t *testing.T) {
 	// Decode of corrupt pixel data after a valid header.
 	bad := dirtyPNG(t, testImage(8, 8), 1)
 	bad = bad[:len(bad)-len(trailing)-30]
-	if _, _, err := Decode(bad); !errors.Is(err, ErrCorrupt) {
+	if _, _, err := Decode(context.Background(), bad); !errors.Is(err, ErrCorrupt) {
 		t.Fatal(err)
 	}
-	if _, _, err := Decode([]byte("nope")); !errors.Is(err, ErrUnsupported) {
+	if _, _, err := Decode(context.Background(), []byte("nope")); !errors.Is(err, ErrUnsupported) {
 		t.Fatal(err)
 	}
 	// Static GIF decodes through Decode; static GIF in paranoid mode becomes PNG.
 	sg := dirtyGIF(t, []*image.Paletted{palettedFrame(5, 5, color.RGBA{7, 7, 7, 255})})
-	if _, info, err := Decode(sg); err != nil || info.Format != wire.FormatGIF || info.Animated {
+	if _, info, err := Decode(context.Background(), sg); err != nil || info.Format != wire.FormatGIF || info.Animated {
 		t.Fatal(err)
 	}
 	p, _ := prepareAndStream(t, writeTemp(t, "s.gif", sg), ModeParanoid)
@@ -271,39 +277,39 @@ func TestSmallHelpers(t *testing.T) {
 }
 
 func TestPrepareAndStreamErrors(t *testing.T) {
-	if _, err := Prepare("/definitely/missing.png", ModeStrip, 0); !errors.Is(err, os.ErrNotExist) {
+	if _, err := Prepare(context.Background(), "/definitely/missing.png", ModeStrip, 0); !errors.Is(err, os.ErrNotExist) {
 		t.Fatal(err)
 	}
 	if _, err := ProbeFile(t.TempDir()); err == nil {
 		t.Fatal("directory probed")
 	}
 	path := writeTemp(t, "a.png", dirtyPNG(t, testImage(300, 300), 1))
-	p, err := Prepare(path, ModeStrip, 0)
+	p, err := Prepare(context.Background(), path, ModeStrip, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
 	boom := errors.New("sink failed")
-	if err := Stream(p, func(uint32, []byte) error { return boom }); !errors.Is(err, boom) {
+	if err := Stream(context.Background(), p, func(uint32, []byte) error { return boom }); !errors.Is(err, boom) {
 		t.Fatal(err)
 	}
 	if err := os.Remove(path); err != nil {
 		t.Fatal(err)
 	}
-	if err := Stream(p, func(uint32, []byte) error { return nil }); err == nil {
+	if err := Stream(context.Background(), p, func(uint32, []byte) error { return nil }); err == nil {
 		t.Fatal("stream of a missing file succeeded")
 	}
 	// Replacing the file with another format is caught by the extension check.
 	if err := os.WriteFile(path, dirtyJPEG(t, testImage(300, 300), 1), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := Stream(p, func(uint32, []byte) error { return nil }); !errors.Is(err, ErrMismatch) {
+	if err := Stream(context.Background(), p, func(uint32, []byte) error { return nil }); !errors.Is(err, ErrMismatch) {
 		t.Fatal(err)
 	}
 	// Re-encode paths surface decode failures.
 	bad := dirtyJPEG(t, testImage(16, 16), 6)
 	bad = bad[:len(bad)-len(trailing)-40]
 	bad = append(bad, 0xff, 0xd9)
-	if _, err := Prepare(writeTemp(t, "bad.jpg", bad), ModeStrip, 0); err == nil {
+	if _, err := Prepare(context.Background(), writeTemp(t, "bad.jpg", bad), ModeStrip, 0); err == nil {
 		t.Fatal("corrupt rotated jpeg accepted")
 	}
 }

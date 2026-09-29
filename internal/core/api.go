@@ -91,8 +91,8 @@ func (e *Engine) VerifyContact(id PeerID) error {
 func (e *Engine) BlockContact(id PeerID, blocked bool) error {
 	p, err := e.editContact(id, func(c *Contact) {
 		c.Blocked = blocked
-		if cancel := e.reconnects[id]; blocked && cancel != nil {
-			cancel()
+		if blocked {
+			e.stopReconnectL(id)
 		}
 	})
 	if blocked && p != nil {
@@ -106,9 +106,11 @@ func (e *Engine) RemoveContact(id PeerID) error {
 	p, err := e.editContact(id, func(*Contact) {
 		delete(e.contacts, id)
 		delete(e.orphanQueues, id)
-		if cancel := e.reconnects[id]; cancel != nil {
-			cancel()
+		delete(e.dedup, id)
+		if p := e.peers[id]; p != nil {
+			p.queue = nil
 		}
+		e.stopReconnectL(id)
 	})
 	if p != nil {
 		p.s.Close(wire.ByeUserQuit)
@@ -207,9 +209,7 @@ func (e *Engine) Disconnect(id PeerID) error {
 	var p *peer
 	e.do(func() {
 		p = e.peers[id]
-		if cancel := e.reconnects[id]; cancel != nil {
-			cancel()
-		}
+		e.stopReconnectL(id)
 	})
 	if p != nil {
 		p.s.Close(wire.ByeUserQuit)
@@ -253,7 +253,7 @@ func (e *Engine) SendText(id PeerID, msg string) (MsgID, error) {
 	if err != nil {
 		return 0, err
 	}
-	e.recordHistory(id, q.id, true, clean, e.now())
+	e.do(func() { e.recordHistoryL(id, q.id, true, clean, e.now()) })
 	return q.id, nil
 }
 

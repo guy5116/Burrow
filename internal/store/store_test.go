@@ -4,8 +4,11 @@ import (
 	"bytes"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
+	"strconv"
 	"testing"
 
 	"golang.org/x/crypto/argon2"
@@ -105,6 +108,9 @@ func TestInitOpenRoundTrip(t *testing.T) {
 	}
 	if _, err := s.ListBlobs("../x"); !errors.Is(err, ErrRelPath) {
 		t.Fatal(err)
+	}
+	if runtime.GOOS == "windows" {
+		return // no permission bits: the per-user profile ACL protects the store (SECURITY.md)
 	}
 	if fi, _ := os.Stat(filepath.Join(dir, StoreDir, "contacts")); fi.Mode().Perm() != filePerm {
 		t.Fatalf("perm %v", fi.Mode())
@@ -543,8 +549,8 @@ func FuzzMasterHeader(f *testing.F) {
 }
 
 func TestErrorPaths(t *testing.T) {
-	if os.Getuid() == 0 {
-		t.Skip("permission tests need a non-root user")
+	if os.Getuid() == 0 || runtime.GOOS == "windows" {
+		t.Skip("needs directory permissions that bind the current user")
 	}
 	dir := t.TempDir()
 	s := mustInit(t, dir, pass("pw"))
@@ -568,12 +574,22 @@ func TestErrorPaths(t *testing.T) {
 		t.Fatal("store.old should remain")
 	}
 	_ = os.Chmod(filepath.Join(dir, oldDir), dirPerm)
-	if err := Recover(dir); err != nil || exists(filepath.Join(dir, oldDir)) {
-		t.Fatal("Recover did not remove store.old", err)
-	}
 	if b, err := s.ReadBlob(IdentityKey); err != nil || len(b) != 65 {
 		t.Fatal("store unusable after swap", err)
 	}
+	// Recovery never touches the directories of a store that is in use.
+	if err := Recover(dir); !errors.Is(err, ErrInUse) || !exists(filepath.Join(dir, oldDir)) {
+		t.Fatal("Recover ran underneath an open store", err)
+	}
+	s.Close()
+	if err := Recover(dir); err != nil || exists(filepath.Join(dir, oldDir)) {
+		t.Fatal("Recover did not remove store.old", err)
+	}
+	s, err := Open(dir, pass("q"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
 	ents, _ := os.ReadDir(s.Dir())
 	for _, e := range ents {
 		if len(e.Name()) > 4 && e.Name()[:5] == ".tmp-" {
@@ -678,5 +694,207 @@ func TestOnionKeyAndV1Upgrade(t *testing.T) {
 	}
 	if k4, _ := s.LoadOnionKey(); string(k4) != string(k3) {
 		t.Fatal("upgraded key not persisted")
+	}
+}
+
+// Blob operations and a passphrase change from different goroutines: every
+// blob written before, during or after the change opens with the new key.
+func TestPassphraseChangeUnderLoad(t *testing.T) {
+	dir := t.TempDir()
+	s := mustInit(t, dir, pass("old"))
+	stop, done := make(chan struct{}), make(chan error, 1)
+	go func() {
+		for n := 0; ; n++ {
+			select {
+			case <-stop:
+				done <- nil
+				return
+			default:
+			}
+			name := "partials/" + strconv.Itoa(n%8) + ".meta"
+			if err := s.WriteBlob(name, []byte(name)); err != nil {
+				done <- err
+				return
+			}
+			if b, err := s.ReadBlob(name); err != nil || string(b) != name {
+				done <- fmt.Errorf("%s: %q %v", name, b, err)
+				return
+			}
+		}
+	}()
+	for n := 0; n < 3; n++ {
+		if err := s.ChangePassphrase(pass("new"), fast); err != nil {
+			t.Fatal(err)
+		}
+	}
+	close(stop)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	s.Close()
+	s, err := Open(dir, pass("new"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	blobs, _ := s.ListBlobs("partials")
+	for _, rel := range blobs {
+		if b, err := s.ReadBlob(rel); err != nil || string(b) != rel {
+			t.Fatalf("%s: %q %v", rel, b, err)
+		}
+	}
+	if len(blobs) == 0 {
+		t.Fatal("nothing was written")
+	}
+}
+
+// A swap that fails while the process lives on: either the old store is back
+// and works, or the store has closed itself. Never a fresh, empty store/.
+func TestSwapFailureInLivingProcess(t *testing.T) {
+	defer func() { rename = os.Rename }()
+	for _, rollbackWorks := range []bool{true, false} {
+		dir := t.TempDir()
+		s := mustInit(t, dir, pass("old"))
+		if err := s.WriteBlob("contacts", []byte("c")); err != nil {
+			t.Fatal(err)
+		}
+		calls := 0
+		rename = func(from, to string) error {
+			calls++
+			if calls == 2 || (calls > 2 && !rollbackWorks && filepath.Base(to) == StoreDir) {
+				return errors.New("injected")
+			}
+			return os.Rename(from, to)
+		}
+		if err := s.ChangePassphrase(pass("new"), fast); err == nil {
+			t.Fatal("the change reported success")
+		}
+		rename = os.Rename
+		err := s.WriteBlob("invites", []byte("i"))
+		if rollbackWorks {
+			if b, rerr := s.ReadBlob("contacts"); err != nil || rerr != nil || string(b) != "c" {
+				t.Fatal("the old store is not back", err, rerr)
+			}
+		} else if !errors.Is(err, ErrClosed) {
+			t.Fatalf("a write after a failed swap: %v", err)
+		}
+		s.Close()
+		// Whatever happened, the next start finds the identity, under exactly one passphrase.
+		sOld, errOld := Open(dir, pass("old"))
+		sOld.Close()
+		sNew, errNew := Open(dir, pass("new"))
+		sNew.Close()
+		if (errOld == nil) == (errNew == nil) {
+			t.Fatalf("rollback=%v: old passphrase %v, new passphrase %v", rollbackWorks, errOld, errNew)
+		}
+	}
+}
+
+// Nothing is touched by a second process while the first holds the store,
+// whatever state the directories are in.
+func TestSecondProcessLeavesSwapAlone(t *testing.T) {
+	dir := t.TempDir()
+	s := mustInit(t, dir, pass("pw"))
+	defer s.Close()
+	for _, d := range []string{newDir, oldDir, initDir} {
+		if err := os.Mkdir(filepath.Join(dir, d), dirPerm); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := Mode(dir); !errors.Is(err, ErrInUse) {
+		t.Fatal(err)
+	}
+	if _, err := Open(dir, pass("pw")); !errors.Is(err, ErrInUse) {
+		t.Fatal(err)
+	}
+	if err := Recover(dir); !errors.Is(err, ErrInUse) {
+		t.Fatal(err)
+	}
+	for _, d := range []string{newDir, oldDir, initDir} {
+		if !exists(filepath.Join(dir, d)) {
+			t.Fatalf("%s was removed underneath the running process", d)
+		}
+	}
+}
+
+// A process of a version that locked store/lock is still noticed.
+func TestLegacyLockIsHonoured(t *testing.T) {
+	dir := t.TempDir()
+	mustInit(t, dir, pass("pw")).Close()
+	old, err := acquireLock(filepath.Join(dir, StoreDir, lockFile))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Open(dir, pass("pw")); !errors.Is(err, ErrInUse) {
+		t.Fatal(err)
+	}
+	_ = releaseLock(old)
+	s, err := Open(dir, pass("pw"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.Close()
+}
+
+// What an interrupted write left behind is no blob, and is cleaned up.
+func TestLeftoverTempFiles(t *testing.T) {
+	dir := t.TempDir()
+	s := mustInit(t, dir, pass("pw"))
+	tmp := filepath.Join(s.Dir(), tempPrefix+"0011223344556677")
+	if err := os.WriteFile(tmp, []byte("half a blob"), filePerm); err != nil {
+		t.Fatal(err)
+	}
+	if blobs, _ := s.ListBlobs(""); len(blobs) != 1 || blobs[0] != IdentityKey {
+		t.Fatal(blobs)
+	}
+	if err := s.ChangePassphrase(pass("new"), fast); err != nil {
+		t.Fatal(err)
+	}
+	s.Close()
+	_ = os.WriteFile(tmp, []byte("half a blob"), filePerm)
+	s, err := Open(dir, pass("new"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	if exists(tmp) {
+		t.Fatal("temporary file survived Open")
+	}
+}
+
+func TestClosedStore(t *testing.T) {
+	s := mustInit(t, t.TempDir(), pass("pw"))
+	s.Close()
+	if err := s.WriteBlob("contacts", []byte("x")); !errors.Is(err, ErrClosed) {
+		t.Fatal(err)
+	}
+	if _, err := s.ReadBlob(IdentityKey); !errors.Is(err, ErrClosed) {
+		t.Fatal(err)
+	}
+	if err := s.DeleteBlob("contacts"); !errors.Is(err, ErrClosed) {
+		t.Fatal(err)
+	}
+	if _, err := s.ListBlobs(""); !errors.Is(err, ErrClosed) {
+		t.Fatal(err)
+	}
+	if err := s.ChangePassphrase(pass("n"), fast); !errors.Is(err, ErrClosed) {
+		t.Fatal(err)
+	}
+	if exists(filepath.Join(s.Dir(), "contacts")) {
+		t.Fatal("a closed store wrote a blob")
+	}
+}
+
+func TestBlobNames(t *testing.T) {
+	for _, ok := range []string{"identity", "contacts", "partials/ab12.meta", "history/seg-3", "a.b_c-d"} {
+		if !validRelPath(ok) {
+			t.Errorf("%q refused", ok)
+		}
+	}
+	for _, bad := range []string{"", ".", "..", "a/..", "/a", "a/", "a//b", "a/b/c", ".hidden", "partials/.tmp-00",
+		"lock", "LOCK", "Lock", "partials/lock", "master.hdr", "MASTER.KEY", "Master.anything", "a b", "a\\b", "é"} {
+		if validRelPath(bad) {
+			t.Errorf("%q accepted", bad)
+		}
 	}
 }
