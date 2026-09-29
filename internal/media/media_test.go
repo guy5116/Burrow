@@ -344,11 +344,20 @@ func TestGatesAndLies(t *testing.T) {
 	if err := CheckDimensions(6000, 6000); err != nil {
 		t.Fatal(err)
 	}
-	// Format lying about magic bytes: a PNG file named .jpg is sniffed as PNG regardless.
-	p := writeTemp(t, "lie.jpg", dirtyPNG(t, testImage(4, 4), 1))
-	info, err := ProbeFile(p)
-	if err != nil || info.Format != wire.FormatPNG {
-		t.Fatal(info, err)
+	// A file whose extension disagrees with its magic bytes is rejected; no extension cannot disagree.
+	for _, name := range []string{"lie.jpg", "lie.gif", "lie.txt", "lie.PNG.exe"} {
+		if _, err := ProbeFile(writeTemp(t, name, dirtyPNG(t, testImage(4, 4), 1))); !errors.Is(err, ErrMismatch) {
+			t.Fatalf("%s: %v", name, err)
+		}
+	}
+	for _, name := range []string{"ok.png", "OK.PNG", "noext"} {
+		info, err := ProbeFile(writeTemp(t, name, dirtyPNG(t, testImage(4, 4), 1)))
+		if err != nil || info.Format != wire.FormatPNG {
+			t.Fatal(name, info, err)
+		}
+	}
+	if _, err := ProbeFile(writeTemp(t, "photo.jpeg", dirtyJPEG(t, testImage(4, 4), 1))); err != nil {
+		t.Fatal(err)
 	}
 	// Truncated files are corrupt, not panics.
 	for _, data := range [][]byte{dirtyJPEG(t, testImage(8, 8), 1)[:40], dirtyPNG(t, testImage(8, 8), 1)[:40], dirtyGIF(t, []*image.Paletted{palettedFrame(3, 3, color.Black)})[:20]} {

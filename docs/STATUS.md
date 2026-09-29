@@ -7,6 +7,7 @@ See docs/phases/PHASE-5.md and docs/RELEASE_CHECKLIST.md.
 ## Done
 - Phases 0–4 in full; Phase 5 hardening, coverage floors, log audit, reproducible-build
   check on one machine, disclosure process, protocol document, release checklist.
+- Spec gap closure (table in docs/phases/PHASE-5.md) and a README for first-time users.
 
 ## Mid-flight
 - (nothing)

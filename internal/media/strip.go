@@ -12,6 +12,8 @@ import (
 	"image/png"
 	"io"
 	"os"
+	"path/filepath"
+	"strings"
 
 	"golang.org/x/crypto/blake2b"
 
@@ -50,8 +52,12 @@ func ProbeFile(path string) (Info, error) {
 	defer func() { _ = f.Close() }()
 	head := make([]byte, SniffLen)
 	n, _ := io.ReadFull(f, head)
-	if _, err := Sniff(head[:n]); err != nil {
+	format, err := Sniff(head[:n])
+	if err != nil {
 		return Info{}, err
+	}
+	if !extensionAgrees(path, format) {
+		return Info{}, ErrMismatch
 	}
 	st, err := f.Stat()
 	if err != nil {
@@ -115,6 +121,27 @@ func Stream(p Prepared, sink func(index uint32, chunk []byte) error) error {
 		return ErrDiverged
 	}
 	return nil
+}
+
+// ErrMismatch means the file's extension claims a different format than its bytes.
+var ErrMismatch = errBase("media: file extension does not match the image data")
+
+// extensionAgrees reports whether path's extension (if any) names the sniffed
+// format. A file without an extension cannot disagree.
+func extensionAgrees(path string, f Format) bool {
+	switch strings.ToLower(filepath.Ext(path)) {
+	case "":
+		return true
+	case ".png":
+		return f == wire.FormatPNG
+	case ".jpg", ".jpeg":
+		return f == wire.FormatJPEG
+	case ".webp":
+		return f == wire.FormatWebP
+	case ".gif":
+		return f == wire.FormatGIF
+	}
+	return false
 }
 
 // NewHasher returns the BLAKE2b-256 hasher used for transfer integrity, so

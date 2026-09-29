@@ -12,7 +12,7 @@ func TestConfig(t *testing.T) {
 		t.Fatal(c, err)
 	}
 	// Defaults audit (§17).
-	if c.Typing || !c.Timestamps || c.AutoAcceptFromVerified || c.MDNS || c.ParanoidImages || c.OpenLinks || c.DisplayName != "" || c.ListenPort != 47337 || c.History || c.Transport != "tcp" {
+	if c.Typing || !c.Timestamps || c.AutoAcceptFromVerified || c.MDNS || c.ParanoidImages || c.OpenLinks || c.DisplayName != "" || c.ListenPort != 47337 || c.History || c.Transport != "tcp" || c.MaxPeers != 32 {
 		t.Fatalf("defaults %+v", c)
 	}
 	for _, k := range ConfigKeys() {
@@ -26,12 +26,12 @@ func TestConfig(t *testing.T) {
 	if err := c.Set("nope", "1"); !errors.Is(err, ErrConfigKey) {
 		t.Fatal(err)
 	}
-	for _, kv := range [][2]string{{"listen_port", "0"}, {"listen_port", "x"}, {"typing", "maybe"}, {"max_image_mib", "0"}, {"display_name", string(make([]byte, 33))}, {"transport", "udp"}, {"history", "sometimes"}} {
+	for _, kv := range [][2]string{{"listen_port", "0"}, {"listen_port", "x"}, {"typing", "maybe"}, {"max_image_mib", "0"}, {"display_name", string(make([]byte, 33))}, {"transport", "udp"}, {"history", "sometimes"}, {"max_peers", "0"}, {"max_peers", "33"}} {
 		if err := c.Set(kv[0], kv[1]); err == nil {
 			t.Fatalf("Set(%s,%q) accepted", kv[0], kv[1])
 		}
 	}
-	for _, kv := range [][2]string{{"listen_port", "1234"}, {"display_name", "Zoë"}, {"typing", "true"}, {"image_dir", "/tmp/x"}, {"max_image_mib", "5"}, {"invite_host", "203.0.113.5"}} {
+	for _, kv := range [][2]string{{"listen_port", "1234"}, {"display_name", "Zoë"}, {"typing", "true"}, {"image_dir", "/tmp/x"}, {"max_image_mib", "5"}, {"invite_host", "203.0.113.5"}, {"max_peers", "8"}} {
 		if err := c.Set(kv[0], kv[1]); err != nil {
 			t.Fatal(kv, err)
 		}

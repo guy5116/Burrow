@@ -38,9 +38,9 @@
   hold animation.
 - The stripping pass also serves as the orientation probe (a second cheap file read)
   so pass 1 never buffers a file that does not need rotation.
-- Inline rendering in the TUI is on demand (`/view n`) with the terminal released, not
-  in the Bubble Tea viewport (its renderer cannot carry graphics escapes); the path is
-  always shown.
+- Inline rendering: on Kitty, thumbnails appear inside the conversation through Unicode
+  placeholders (added in Phase 5); on iTerm2 it is on demand (`/view n`) with the
+  terminal released. The saved path is always shown.
 - Progress events carry the peer and direction (`TransferPeer`) so UIs can route them.
 - `CancelTransfer` on an accepted incoming transfer deletes the partial (a user cancel
   is not a resume candidate); a lost connection keeps it.

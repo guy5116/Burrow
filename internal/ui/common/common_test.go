@@ -344,3 +344,119 @@ func TestTerminalImages(t *testing.T) {
 		t.Fatal("no protocol must fail")
 	}
 }
+
+func TestNewControllerFeatures(t *testing.T) {
+	a := newNode(t, core.Config{DisplayName: "Alice"})
+	b := newNode(t, core.Config{DisplayName: "Bob"})
+	port := uint16(a.e.ListenAddrs()[0].(*net.TCPAddr).Port)
+
+	// QR only when asked for, and only when the UI supplied a renderer.
+	if out := exec(t, a.ctl, "/invite qr 127.0.0.1"); !strings.Contains(out, "QR codes are not available") {
+		t.Fatal(out)
+	}
+	a.ctl.QR = func(s string) string { return "QR<" + s[:8] + ">\nrow2\n" }
+	out := exec(t, a.ctl, "/invite qr 127.0.0.1")
+	if lines := strings.Split(out, "\n"); len(lines) != 4 || lines[2] != "QR<burrow1:>" || lines[3] != "row2" {
+		t.Fatalf("%q", out)
+	}
+	if out := exec(t, a.ctl, "/invite 127.0.0.1"); strings.Contains(out, "QR<") {
+		t.Fatal("QR printed without being asked")
+	}
+
+	// A hostname invite prints the DNS note before connecting; an IP invite does not.
+	inv, err := a.e.CreateInvite(core.InviteOptions{Host: "localhost", Port: port})
+	if err != nil {
+		t.Fatal(err)
+	}
+	out = exec(t, b.ctl, "/connect "+inv.String)
+	if !strings.Contains(out, "note: this invite uses the hostname localhost") || !strings.Contains(out, "DNS resolver") {
+		t.Fatal(out)
+	}
+	if !strings.Contains(out, "connected to") {
+		t.Skipf("localhost did not resolve to the listener here: %q", out)
+	}
+	a.wait(t, func(ev core.Event) bool { _, ok := ev.(core.PeerConnected); return ok })
+	ipInv, _ := a.e.CreateInvite(core.InviteOptions{Host: "127.0.0.1", Port: port})
+	if info, err := core.DescribeInvite(ipInv.String); err != nil || info.Hostname {
+		t.Fatal(info, err)
+	}
+
+	// The status line names the transport while online.
+	if st := b.ctl.Status(); !strings.Contains(st, "online via tcp") || !strings.Contains(st, "UNVERIFIED") || !strings.Contains(st, "Alice") {
+		t.Fatal(st)
+	}
+	_ = exec(t, b.ctl, "/verify Alice")
+	_ = exec(t, b.ctl, "/disconnect Alice")
+	b.wait(t, func(ev core.Event) bool { _, ok := ev.(core.PeerDisconnected); return ok })
+	if st := b.ctl.Status(); !strings.Contains(st, "offline") || !strings.Contains(st, "verified") || strings.Contains(st, "via") {
+		t.Fatal(st)
+	}
+	b.ctl.Current = nil
+	if st := b.ctl.Status(); st != "me "+b.e.Identity().ID.Short() {
+		t.Fatal(st)
+	}
+	var gone core.PeerID
+	b.ctl.Current = &gone
+	if st := b.ctl.Status(); strings.Contains(st, "talking") {
+		t.Fatal(st)
+	}
+
+	// Partials: quiet at startup when there are none, explicit on request.
+	if notes := b.ctl.StartupNotes(false); notes != nil {
+		t.Fatal(notes)
+	}
+	if out := exec(t, b.ctl, "/partials"); out != "(no partial downloads)" {
+		t.Fatal(out)
+	}
+}
+
+func TestKittyInline(t *testing.T) {
+	img := image.NewNRGBA(image.Rect(0, 0, 320, 160))
+	in, err := KittyInline(img, 7, 32)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(in.Transmit, "\x1b_Ga=T,U=1,f=100,q=2,i=7,c=32,r=8,m=0;") || !strings.HasSuffix(in.Transmit, "\x1b\\") {
+		t.Fatalf("%q", in.Transmit[:60])
+	}
+	if len(in.Lines) != 8 {
+		t.Fatal(len(in.Lines))
+	}
+	for r, line := range in.Lines {
+		if !strings.HasPrefix(line, "\x1b[38;5;7m") || !strings.HasSuffix(line, "\x1b[39m") {
+			t.Fatalf("row %d colour framing: %q", r, line)
+		}
+		body := strings.TrimSuffix(strings.TrimPrefix(line, "\x1b[38;5;7m"), "\x1b[39m")
+		runes := []rune(body)
+		if len(runes) != 33 || runes[0] != kittyPlaceholder || runes[1] != rowDiacritics[r] || runes[2] != kittyPlaceholder {
+			t.Fatalf("row %d cells: %U", r, runes[:3])
+		}
+	}
+	// Tall images are clamped to MaxInlineRows and narrowed to keep the aspect ratio.
+	tall, err := KittyInline(image.NewNRGBA(image.Rect(0, 0, 100, 2000)), 1, 32)
+	if err != nil || len(tall.Lines) != MaxInlineRows || len([]rune(tall.Lines[0])) > 20 {
+		t.Fatal(len(tall.Lines), err)
+	}
+	// Large images are uploaded in several chunks.
+	noisy := image.NewNRGBA(image.Rect(0, 0, 200, 200))
+	x := uint32(2463534242)
+	for i := range noisy.Pix {
+		x ^= x << 13
+		x ^= x >> 17
+		x ^= x << 5
+		noisy.Pix[i] = byte(x)
+	}
+	big, _ := KittyInline(noisy, 2, 20)
+	if !strings.Contains(big.Transmit, ",m=1;") || !strings.Contains(big.Transmit, "\x1b_Gm=0;") {
+		t.Fatal("chunking")
+	}
+	for _, bad := range []func() (InlineImage, error){
+		func() (InlineImage, error) { return KittyInline(img, 0, 10) },
+		func() (InlineImage, error) { return KittyInline(img, 1, 0) },
+		func() (InlineImage, error) { return KittyInline(image.NewNRGBA(image.Rect(0, 0, 0, 0)), 1, 10) },
+	} {
+		if _, err := bad(); err == nil {
+			t.Fatal("bad parameters accepted")
+		}
+	}
+}

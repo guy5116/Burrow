@@ -219,6 +219,11 @@ func (e *Engine) SendImage(ctx context.Context, id PeerID, path string, caption 
 			return
 		}
 		stream, err := p.s.OpenStream(prep.Size)
+		if errors.Is(err, session.ErrStreamsExhaust) {
+			e.failTransfer(t, "session ran out of stream ids; reconnecting")
+			e.onStreamsExhausted(p)
+			return
+		}
 		if err != nil {
 			e.failTransfer(t, "too many transfers in progress")
 			return
@@ -254,6 +259,8 @@ func redactMediaErr(err error) string {
 		return "animated WebP is not supported"
 	case errors.Is(err, media.ErrCorrupt):
 		return "image file is malformed"
+	case errors.Is(err, media.ErrMismatch):
+		return "file extension does not match the image data"
 	case errors.Is(err, errAnimatedUnsupported):
 		return err.Error()
 	case errors.Is(err, os.ErrNotExist):
@@ -770,4 +777,47 @@ func DecodeImage(path string, maxSide int) (image.Image, error) {
 		img = media.Thumbnail(img, maxSide)
 	}
 	return img, nil
+}
+
+// onStreamsExhausted ends a session whose stream ids ran out with BYE reason 4
+// and reconnects (§4.3); a fresh session starts again at id 2 or 3.
+func (e *Engine) onStreamsExhausted(p *peer) {
+	id := p.s.Peer()
+	p.close(wire.ByeResourceLimit)
+	e.mu.Lock()
+	c, ok := e.contacts[id]
+	canDial := ok && !c.Blocked && len(c.Addrs) > 0
+	e.mu.Unlock()
+	if canDial && e.ctx.Err() == nil {
+		e.scheduleReconnect(id)
+	}
+}
+
+// ResumableTransfer describes a partial download kept on disk.
+type ResumableTransfer struct {
+	Peer   PeerID
+	Size   uint64
+	Done   uint64
+	Format uint8
+}
+
+// Resumable lists partial downloads with valid metadata; they continue when
+// the sender offers the same image again.
+func (e *Engine) Resumable() []ResumableTransfer {
+	metas, _ := e.st.ListBlobs(partialsDir)
+	var out []ResumableTransfer
+	for _, rel := range metas {
+		m, err := e.readMeta(rel)
+		if err != nil {
+			continue
+		}
+		raw, err := hex.DecodeString(m.Peer)
+		if err != nil || len(raw) != 32 {
+			continue
+		}
+		var peer PeerID
+		copy(peer[:], raw)
+		out = append(out, ResumableTransfer{Peer: peer, Size: m.Size, Done: min(uint64(m.Complete)*wire.ChunkData, m.Size), Format: m.Format})
+	}
+	return out
 }

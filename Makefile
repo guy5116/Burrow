@@ -50,7 +50,7 @@ fuzz:
 	done
 
 bench:
-	$(GO) run ./bench/cmp -baseline bench/baseline.json -- $(GO) test -run '^$$' -bench . -benchmem ./internal/session ./internal/handshake  # Phase 2 adds ./internal/media
+	$(GO) run ./bench/cmp -baseline bench/baseline.json -- $(GO) test -run '^$$' -bench . -benchmem ./internal/session ./internal/media ./internal/handshake
 
 release:
 	mkdir -p dist

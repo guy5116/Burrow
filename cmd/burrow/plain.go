@@ -33,6 +33,9 @@ func runPlain(ctx context.Context, ctl *common.Controller, target core.Target, a
 	emit(map[string]any{"event": "Ready", "fingerprint": ctl.E.Identity().Fingerprint, "listen": addrs},
 		"* ready on "+strings.Join(addrs, " ")+"; fingerprint "+ctl.E.Identity().Display+" (type /help)")
 
+	for _, l := range ctl.StartupNotes(false) {
+		emit(map[string]any{"event": "Output", "text": l}, l)
+	}
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	// Events on a dedicated goroutine (never the input thread).

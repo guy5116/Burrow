@@ -1,5 +1,11 @@
 {
-  "BenchmarkHandshake": 917082,
-  "BenchmarkSealOpen": 54575,
-  "BenchmarkTransfer": 20261735
+  "BenchmarkHandshake": 914998,
+  "BenchmarkPrepare": 15414506,
+  "BenchmarkRekey": 1190117,
+  "BenchmarkSealOpen": 54142,
+  "BenchmarkStripJPEG": 6604733,
+  "BenchmarkStripPNG": 988675,
+  "BenchmarkTextOverRawTCP": 3178,
+  "BenchmarkTextOverSession": 17108,
+  "BenchmarkTransfer": 20307760
 }

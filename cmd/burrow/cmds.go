@@ -177,7 +177,7 @@ func (a *app) engineConfig() core.Config {
 		NoTimestamp: !a.cfg.Timestamps, AutoReconnect: a.cfg.AutoReconnect,
 		DataDir: a.paths.Data, ImageDir: a.cfg.ImageDir, MaxImage: uint64(a.cfg.MaxImageMiB) << 20,
 		Paranoid: a.cfg.ParanoidImages, AutoAcceptFromVerified: a.cfg.AutoAcceptFromVerified,
-		MDNS: a.cfg.MDNS, History: a.cfg.History}
+		MDNS: a.cfg.MDNS, History: a.cfg.History, MaxPeers: a.cfg.MaxPeers}
 }
 
 func (a *app) cmdContacts(args []string, stdin io.Reader, stdout, stderr io.Writer) int {

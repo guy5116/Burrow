@@ -344,3 +344,88 @@ func TestRedactStack(t *testing.T) {
 		}
 	}
 }
+
+// A sender blocked on a full stream queue is released by its context and by
+// the peer ending the stream; nothing it queued follows the close.
+func TestBlockedStreamSenderIsReleased(t *testing.T) {
+	a := newAdv(t, true, true)
+	ctx := context.Background()
+	id, err := a.s.OpenStream(10 * wire.ChunkData)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := a.s.SendStream(ctx, id, wire.TypeImgOffer, offerPayload(10*wire.ChunkData)); err != nil {
+		t.Fatal(err)
+	}
+	a.recv(t, wire.TypeImgOffer)
+	if err := a.p.SendFrame(wire.TypeImgAccept, id, wire.AppendImgAccept(nil, 0)); err != nil {
+		t.Fatal(err)
+	}
+	a.recvType(t, wire.TypeImgAccept)
+	// The raw peer stops reading: the writer blocks on the first chunk and the queue fills.
+	chunk := func(i uint32) []byte {
+		c, _ := wire.AppendImgChunk(nil, wire.ImgChunk{Index: i, Data: make([]byte, wire.ChunkData)})
+		return c
+	}
+	// The writer buffers up to 256 KiB before the pipe blocks it; after that the
+	// stream queue (cap 2) fills and the next sender blocks until its context ends.
+	blocked := false
+	for i := uint32(0); i < 32 && !blocked; i++ {
+		tctx, cancel := context.WithTimeout(ctx, 150*time.Millisecond)
+		err := a.s.SendStream(tctx, id, wire.TypeImgChunk, chunk(i))
+		cancel()
+		switch {
+		case errors.Is(err, context.DeadlineExceeded):
+			blocked = true
+		case err != nil:
+			t.Fatal(i, err)
+		}
+	}
+	if !blocked {
+		t.Fatal("sender never blocked: no backpressure")
+	}
+	errc := make(chan error, 1)
+	go func() { errc <- a.s.SendStream(ctx, id, wire.TypeImgChunk, chunk(9)) }()
+	time.Sleep(30 * time.Millisecond)
+	// The peer cancels the transfer: the stream closes under the blocked sender.
+	go func() { _ = a.p.SendFrame(wire.TypeImgCancel, id, wire.AppendImgCancel(nil, wire.CancelUser)) }()
+	select {
+	case err := <-errc:
+		if !errors.Is(err, ErrStreamState) {
+			t.Fatalf("blocked sender after peer cancel: %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("sender stayed blocked after the stream closed")
+	}
+	if a.s.StreamOpen(id) {
+		t.Fatal("stream still open")
+	}
+	if err := a.s.SendStream(ctx, id, wire.TypeImgChunk, chunk(9)); !errors.Is(err, ErrStreamState) {
+		t.Fatal(err)
+	}
+	// The session is closing a blocked writer from the test cleanup; Send reports it.
+	a.s.fail(ErrClosed)
+	<-a.s.Done()
+	if err := a.s.SendStream(ctx, id, wire.TypeImgChunk, nil); err == nil {
+		t.Fatal("SendStream after close")
+	}
+	if err := a.s.Send(ctx, wire.TypeTyping, []byte{0}); !errors.Is(err, ErrClosed) {
+		t.Fatal(err)
+	}
+	if _, err := a.s.OpenStream(1); err != nil {
+		t.Log("OpenStream after close:", err) // allowed either way; nothing can be sent
+	}
+}
+
+func TestStreamIDsExhaust(t *testing.T) {
+	p := newPair(t, time.Hour)
+	p.i.streams.mu.Lock()
+	p.i.streams.nextID = 0xFFFE
+	p.i.streams.mu.Unlock()
+	if id, err := p.i.OpenStream(1); err != nil || id != 0xFFFE {
+		t.Fatal(id, err)
+	}
+	if _, err := p.i.OpenStream(1); !errors.Is(err, ErrStreamsExhaust) {
+		t.Fatal(err)
+	}
+}

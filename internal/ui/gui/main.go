@@ -80,6 +80,9 @@ func (a *App) buildMain() {
 		}
 	})
 	a.win.Canvas().Focus(a.composer)
+	if notes := a.ctl.StartupNotes(false); len(notes) > 0 {
+		dialog.ShowInformation("Partial downloads", strings.Join(notes, "\n"), a.win)
+	}
 }
 
 func (a *App) refreshContacts() {
@@ -94,20 +97,7 @@ func (a *App) updateStatus() {
 	if a.status == nil {
 		return
 	}
-	s := "me " + a.e.Identity().ID.Short()
-	if id, ok := a.selected(); ok {
-		if c, err := a.e.Contact(id); err == nil {
-			ver := "UNVERIFIED"
-			if c.Verified {
-				ver = "verified"
-			}
-			on := "offline"
-			if c.Online {
-				on = "online"
-			}
-			s += fmt.Sprintf(" · %s (%s, %s, %s)", c.Nickname, c.ID.Short(), ver, on)
-		}
-	}
+	s := a.ctl.Status()
 	a.status.SetText(s)
 }
 

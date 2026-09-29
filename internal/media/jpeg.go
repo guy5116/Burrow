@@ -133,8 +133,12 @@ func copyScan(bw *bufio.Writer, br *bufio.Reader) error {
 			return ErrCorrupt
 		}
 		if next[0] == 0x00 || (next[0] >= 0xD0 && next[0] <= 0xD7) {
+			b := next[0]
 			_, _ = br.ReadByte()
-			if _, err := bw.Write([]byte{0xFF, next[0]}); err != nil {
+			if err := bw.WriteByte(0xFF); err != nil {
+				return err
+			}
+			if err := bw.WriteByte(b); err != nil {
 				return err
 			}
 			continue

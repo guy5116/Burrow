@@ -66,6 +66,8 @@ func entry(tag, typ uint16, count, val uint32) []byte {
 	return e
 }
 
+var testColor = color.NRGBA{R: 10, G: 200, B: 30, A: 255}
+
 // Secrets that must not survive stripping.
 var (
 	secretComment = []byte("secret comment about the sender")

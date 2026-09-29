@@ -86,7 +86,22 @@ func (a *App) showConnectDialog() {
 		if !ok || s == "" {
 			return
 		}
-		a.connectTarget(core.Target{Invite: s})
+		info, err := core.DescribeInvite(s)
+		if err != nil {
+			a.errDialog(err)
+			return
+		}
+		if !info.Hostname {
+			a.connectTarget(core.Target{Invite: s})
+			return
+		}
+		dialog.ShowConfirm("This invite uses a hostname",
+			"Looking up "+info.Host+" tells your DNS resolver which host you are contacting. IP addresses and onion addresses avoid that.\n\nConnect anyway?",
+			func(yes bool) {
+				if yes {
+					a.connectTarget(core.Target{Invite: s})
+				}
+			}, a.win)
 	}, a.win)
 }
 

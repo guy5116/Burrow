@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bufio"
 	"errors"
 	"fmt"
 	"io"
@@ -24,21 +23,38 @@ func readSecret(prompt string, stdin io.Reader, stderr io.Writer, allowStdin boo
 		fmt.Fprintln(stderr)
 		return b, err
 	}
-	if tty, err := os.OpenFile(ttyPath, os.O_RDWR, 0); err == nil {
+	if !allowStdin {
+		tty, err := os.OpenFile(ttyPath, os.O_RDWR, 0)
+		if err != nil {
+			return nil, errors.New("no terminal available to prompt securely")
+		}
 		defer func() { _ = tty.Close() }()
 		fmt.Fprint(tty, prompt)
 		b, err := term.ReadPassword(int(tty.Fd()))
 		fmt.Fprintln(tty)
 		return b, err
 	}
-	if !allowStdin {
-		return nil, errors.New("no terminal available to prompt securely")
+	// `connect -`: the caller asked for stdin explicitly, even when a terminal exists.
+	// Read one line byte by byte: a buffered reader would swallow the chat
+	// commands that follow the invite on the same stream.
+	var line []byte
+	var b [1]byte
+	for {
+		n, err := stdin.Read(b[:])
+		if n == 1 {
+			if b[0] == '\n' {
+				break
+			}
+			line = append(line, b[0])
+		}
+		if err != nil {
+			if len(line) == 0 {
+				return nil, err
+			}
+			break
+		}
 	}
-	line, err := bufio.NewReader(stdin).ReadString('\n')
-	if err != nil && line == "" {
-		return nil, err
-	}
-	return []byte(strings.TrimRight(line, "\r\n")), nil
+	return []byte(strings.TrimRight(string(line), "\r")), nil
 }
 
 // unlock opens the store, prompting for the passphrase when the store needs one.

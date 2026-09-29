@@ -12,6 +12,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"net"
+	"sync"
 	"time"
 
 	"golang.org/x/net/dns/dnsmessage"
@@ -20,9 +21,14 @@ import (
 const (
 	service  = "_burrow._tcp.local."
 	group    = "224.0.0.251:5353"
+	group6   = "[ff02::fb]:5353"
 	interval = 30 * time.Second
 	ttl      = 60
 )
+
+// families are the multicast groups used, IPv4 first. IPv6 is best effort:
+// a host without IPv6 multicast still works over IPv4.
+var families = []struct{ network, group string }{{"udp4", group}, {"udp6", group6}}
 
 // Announcement is what a browser learns from one packet.
 type Announcement struct {
@@ -83,25 +89,46 @@ func (a *Announcer) Packet() ([]byte, error) {
 	return b.Finish()
 }
 
-// Run announces until ctx ends.
+// Run announces on every available family until ctx ends. It fails only when
+// no family can be used.
 func (a *Announcer) Run(ctx context.Context) error {
 	pkt, err := a.Packet()
 	if err != nil {
 		return err
 	}
-	dst, err := net.ResolveUDPAddr("udp4", group)
-	if err != nil {
-		return err
+	type out struct {
+		conn *net.UDPConn
+		dst  *net.UDPAddr
 	}
-	conn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4zero, Port: 0})
-	if err != nil {
-		return err
+	var outs []out
+	var firstErr error
+	for _, f := range families {
+		dst, err := net.ResolveUDPAddr(f.network, f.group)
+		if err == nil {
+			var conn *net.UDPConn
+			if conn, err = net.ListenUDP(f.network, nil); err == nil {
+				outs = append(outs, out{conn, dst})
+				continue
+			}
+		}
+		if firstErr == nil {
+			firstErr = err
+		}
 	}
-	defer func() { _ = conn.Close() }()
+	if len(outs) == 0 {
+		return firstErr
+	}
+	defer func() {
+		for _, o := range outs {
+			_ = o.conn.Close()
+		}
+	}()
 	t := time.NewTicker(interval)
 	defer t.Stop()
 	for {
-		_, _ = conn.WriteToUDP(pkt, dst)
+		for _, o := range outs {
+			_, _ = o.conn.WriteToUDP(pkt, o.dst)
+		}
 		select {
 		case <-ctx.Done():
 			return nil
@@ -182,32 +209,53 @@ func decode16(s string, dst *[16]byte) bool {
 	return true
 }
 
-// Browse delivers announcements from other instances until ctx ends.
+// Browse delivers announcements from other instances on every available
+// family until ctx ends. It fails only when no family can be joined.
 func Browse(ctx context.Context, fn func(Announcement)) error {
-	addr, err := net.ResolveUDPAddr("udp4", group)
-	if err != nil {
-		return err
+	var conns []*net.UDPConn
+	var firstErr error
+	for _, f := range families {
+		addr, err := net.ResolveUDPAddr(f.network, f.group)
+		if err == nil {
+			var conn *net.UDPConn
+			if conn, err = net.ListenMulticastUDP(f.network, nil, addr); err == nil {
+				conns = append(conns, conn)
+				continue
+			}
+		}
+		if firstErr == nil {
+			firstErr = err
+		}
 	}
-	conn, err := net.ListenMulticastUDP("udp4", nil, addr)
-	if err != nil {
-		return err
+	if len(conns) == 0 {
+		return firstErr
 	}
-	defer func() { _ = conn.Close() }()
 	go func() {
 		<-ctx.Done()
-		_ = conn.Close()
+		for _, c := range conns {
+			_ = c.Close()
+		}
 	}()
-	buf := make([]byte, 9000)
-	for {
-		n, src, err := conn.ReadFromUDP(buf)
-		if err != nil {
-			if ctx.Err() != nil {
-				return nil
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+	for _, conn := range conns {
+		wg.Add(1)
+		go func(conn *net.UDPConn) {
+			defer wg.Done()
+			buf := make([]byte, 9000)
+			for {
+				n, src, err := conn.ReadFromUDP(buf)
+				if err != nil {
+					return
+				}
+				if an, ok := Parse(buf[:n], src.IP); ok {
+					mu.Lock()
+					fn(an)
+					mu.Unlock()
+				}
 			}
-			return err
-		}
-		if an, ok := Parse(buf[:n], src.IP); ok {
-			fn(an)
-		}
+		}(conn)
 	}
+	wg.Wait()
+	return nil
 }

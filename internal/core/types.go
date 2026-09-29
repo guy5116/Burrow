@@ -57,7 +57,8 @@ type Contact struct {
 	Addrs     []transport.Address
 	FirstSeen time.Time
 	InviteID  string
-	Online    bool // live session (not persisted)
+	Online    bool           // live session (not persisted)
+	Transport transport.Kind // transport of the live session ("" when offline; not persisted)
 }
 
 // Identity describes our own key for display.

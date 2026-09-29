@@ -13,6 +13,7 @@ import (
 )
 
 func main() {
+	store.HardenProcess() // no core dumps, not dumpable (CLAUDE.md §3.6)
 	cfgDir := flag.String("config", "", "config directory")
 	dataDir := flag.String("data", "", "data directory")
 	level := flag.String("log-level", "warn", "debug|info|warn|error (stderr)")

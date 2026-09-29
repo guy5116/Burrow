@@ -23,6 +23,9 @@ func (e *Engine) Contacts() []Contact {
 	for _, c := range e.contacts {
 		cc := *c
 		cc.Addrs = append([]transport.Address(nil), c.Addrs...)
+		if p := e.peers[c.ID]; p != nil {
+			cc.Transport = p.kind
+		}
 		out = append(out, cc)
 	}
 	return out
@@ -36,7 +39,11 @@ func (e *Engine) Contact(id PeerID) (Contact, error) {
 	if !ok {
 		return Contact{}, ErrUnknownContact
 	}
-	return *c, nil
+	cc := *c
+	if p := e.peers[id]; p != nil {
+		cc.Transport = p.kind
+	}
+	return cc, nil
 }
 
 // RenameContact sets a user-chosen nickname (sanitized, single line, ≤ 64 chars).
@@ -305,4 +312,28 @@ func (e *Engine) Queue(id PeerID) []MessageStatus {
 		out = append(out, MessageStatus{Peer: id, ID: q.id, Status: q.status})
 	}
 	return out
+}
+
+// InviteInfo is what a UI may show about an invite before connecting.
+type InviteInfo struct {
+	Host     string
+	Port     uint16
+	Kind     transport.Kind
+	Peer     PeerID
+	Expiry   time.Time
+	MultiUse bool
+	// Hostname is true when Host is a DNS name: resolving it tells the local
+	// resolver which host the user is contacting.
+	Hostname bool
+}
+
+// DescribeInvite parses an invite without any network action.
+func DescribeInvite(s string) (InviteInfo, error) {
+	inv, err := invite.Parse(s)
+	if err != nil {
+		return InviteInfo{}, err
+	}
+	info := InviteInfo{Host: inv.Addr, Port: inv.Port, Kind: kindOf(inv.Kind), Peer: inv.PubKey, Expiry: inv.Expiry, MultiUse: inv.MultiUse}
+	info.Hostname = info.Kind == transport.KindTCP && net.ParseIP(inv.Addr) == nil
+	return info, nil
 }

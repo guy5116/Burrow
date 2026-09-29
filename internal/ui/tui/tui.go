@@ -52,6 +52,7 @@ type model struct {
 	busy       bool
 	prog       *tea.Program
 	showInline func()
+	nextImage  uint8 // Kitty image ids 1–255, reused in a cycle
 }
 
 // Run starts the TUI and blocks until it exits.
@@ -97,6 +98,7 @@ func (m *model) Init() tea.Cmd {
 		cmds = append(cmds, m.exec("/connect "+m.target.Name))
 	}
 	m.system = append(m.system, "listening on "+m.addrs+" — your fingerprint "+m.ctl.E.Identity().Display, Keys, "type /help for commands")
+	m.system = append(m.system, m.ctl.StartupNotes(false)...)
 	return tea.Batch(cmds...)
 }
 
@@ -188,6 +190,15 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case evMsg:
 		m.ctl.Observe(msg.ev)
 		m.onEvent(msg.ev)
+		if d, ok := msg.ev.(core.TransferDone); ok && !d.Peer.Outgoing && common.DetectTerminal() == common.TermKitty {
+			m.render()
+			return m, m.inline(d.Peer.Peer, d.Path)
+		}
+	case inlineMsg:
+		// The placeholder rows scroll with the conversation; the upload goes out raw, once.
+		m.logs[msg.peer] = append(m.logs[msg.peer], msg.img.Lines...)
+		m.render()
+		return m, tea.Raw(msg.img.Transmit)
 	default:
 		var cmd tea.Cmd
 		m.in, cmd = m.in.Update(msg)
@@ -286,20 +297,7 @@ func (m *model) View() tea.View {
 	}
 	sidebar := lipgloss.NewStyle().Width(sidebarWidth).Height(m.vp.Height()).Render(strings.Join(side, "\n"))
 	body := lipgloss.JoinHorizontal(lipgloss.Top, sidebar, dim.Render("│"), m.vp.View())
-	st := "me " + m.ctl.E.Identity().ID.Short()
-	if m.ctl.Current != nil {
-		if c, err := m.ctl.E.Contact(*m.ctl.Current); err == nil {
-			ver := "UNVERIFIED"
-			if c.Verified {
-				ver = "verified"
-			}
-			on := "offline"
-			if c.Online {
-				on = "online"
-			}
-			st += fmt.Sprintf(" · talking to %s (%s, %s, %s)", c.Nickname, c.ID.Short(), ver, on)
-		}
-	}
+	st := m.ctl.Status()
 	if m.busy {
 		st += " · working…"
 	}
@@ -344,6 +342,33 @@ func (m *model) view(arg string) tea.Cmd {
 }
 
 type viewMsg struct{}
+
+type inlineMsg struct {
+	peer core.PeerID
+	img  common.InlineImage
+}
+
+// inline decodes a thumbnail off the render thread and prepares it for inline
+// display (Kitty Unicode placeholders). Failures are silent: the saved path is
+// already in the conversation.
+func (m *model) inline(peer core.PeerID, path string) tea.Cmd {
+	m.nextImage++
+	if m.nextImage == 0 {
+		m.nextImage = 1
+	}
+	id := m.nextImage
+	return func() tea.Msg {
+		img, err := core.DecodeImage(path, 320)
+		if err != nil {
+			return nil
+		}
+		in, err := common.KittyInline(img, id, 32)
+		if err != nil {
+			return nil
+		}
+		return inlineMsg{peer: peer, img: in}
+	}
+}
 
 func padRight(s string, w int) string {
 	if n := w - lipgloss.Width(s); n > 0 {

@@ -9,9 +9,11 @@ import (
 	"image/png"
 	"io"
 	"math/rand/v2"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -313,4 +315,76 @@ func (p *proc) countEvents(name string) int {
 		}
 	}
 	return n
+}
+
+// The README's first-message walkthrough, with the real binary: invite from
+// the command line, `connect -`, a first message, renaming the contact, then
+// reconnecting by that name without an invite.
+func TestReadmeFlow(t *testing.T) {
+	if testing.Short() {
+		t.Skip("spawns processes")
+	}
+	run := func(home string, args ...string) string {
+		t.Helper()
+		full := append([]string{"--config", home, "--data", home}, args...)
+		out, err := exec.CommandContext(context.Background(), binPath, full...).Output()
+		if err != nil {
+			t.Fatalf("%v: %v", args, err)
+		}
+		return strings.TrimSpace(string(out))
+	}
+	alice := t.TempDir()
+	run(alice, "init", "--insecure-no-passphrase")
+	// Pick a free port for Alice so the invite and the listener agree.
+	ln, err := (&net.ListenConfig{}).Listen(context.Background(), "tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	port := strconv.Itoa(ln.Addr().(*net.TCPAddr).Port)
+	_ = ln.Close()
+	run(alice, "config", "set", "listen_port", port)
+	if got := run(alice, "config", "get", "listen_port"); got != port {
+		t.Fatal(got)
+	}
+	inv := run(alice, "invite", "--host", "127.0.0.1")
+	if !strings.HasPrefix(inv, "burrow1:") || strings.Contains(inv, "\n") {
+		t.Fatalf("invite output: %q", inv)
+	}
+	fp := run(alice, "id")
+	if len(strings.ReplaceAll(fp, " ", "")) != 52 {
+		t.Fatal(fp)
+	}
+
+	a := newProc(t, alice, "listen")
+	a.wait("Ready", is("Ready"))
+	// Bob picks any free port so the test does not depend on the default one being unused.
+	b := newProc(t, "", "connect", "--listen", "127.0.0.1:0", "-")
+	b.send(inv) // first line on stdin is the invite; the chat commands follow on the same stream
+	b.wait("PeerConnected", is("PeerConnected"))
+	a.wait("PeerConnected", is("PeerConnected"))
+	b.send("hello alice")
+	if m := a.wait("MessageReceived", is("MessageReceived")); m["text"] != "hello alice" {
+		t.Fatalf("%v", m)
+	}
+	short := strings.ReplaceAll(fp, " ", "")[:8]
+	b.send("/rename " + short + " Alice")
+	b.wait("renamed", func(m map[string]any) bool {
+		s, _ := m["text"].(string)
+		return m["event"] == "Output" && strings.Contains(s, "Alice")
+	})
+	b.send("/quit")
+	_ = b.cmd.Wait()
+	a.wait("PeerDisconnected", is("PeerDisconnected"))
+
+	// Next time: no invite, just the name.
+	b2 := newProc(t, b.home, "connect", "--listen", "127.0.0.1:0", "Alice")
+	b2.wait("PeerConnected", is("PeerConnected"))
+	b2.send("second visit")
+	a.wait("second message", func(m map[string]any) bool { return m["event"] == "MessageReceived" && m["text"] == "second visit" })
+	// The contact list of the offline tool shows the chosen name.
+	b2.send("/quit")
+	_ = b2.cmd.Wait()
+	if list := run(b.home, "contacts", "list"); !strings.Contains(list, "Alice") {
+		t.Fatal(list)
+	}
 }

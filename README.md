@@ -1,58 +1,307 @@
 # Burrow
 
-Peer-to-peer, end-to-end-encrypted, one-to-one chat for text and images. No servers, no
-accounts, no third parties. Written in Go.
+Burrow is a private chat program for two people. You send text and pictures straight
+from your computer to your friend's computer. There is no company in the middle, no
+account to create, no phone number, and no server that stores your messages.
 
-**Status: Phases 1–4 are complete.** Text and images work between `burrow` CLIs and the
-`burrow-gui` desktop app over direct TCP or Tor onion services, with optional LAN
-discovery and optional encrypted history. Hardening and release (Phase 5) is next. See `docs/STATUS.md`
-for the current step and `CLAUDE.md` for the full design.
+Everything you send is end-to-end encrypted: only you and the person you are talking
+to can read it.
 
-## Quick start (two machines on one LAN or VPN)
+- [What you need](#what-you-need)
+- [Install](#install)
+- [Your first message, step by step](#your-first-message-step-by-step)
+- [Everyday use](#everyday-use)
+- [Make sure it is really them](#make-sure-it-is-really-them)
+- [Sending pictures](#sending-pictures)
+- [If something does not work](#if-something-does-not-work)
+- [The desktop app](#the-desktop-app)
+- [What Burrow protects, and what it does not](#what-burrow-protects-and-what-it-does-not)
+- [More options](#more-options)
+- [For developers](#for-developers)
+
+## What you need
+
+- A computer running Linux, macOS or Windows.
+- A terminal (on Windows: PowerShell or Windows Terminal).
+- [Go](https://go.dev/dl/) 1.24 or newer, to build the program.
+- A friend who also has Burrow.
+- **One of you must be reachable by the other.** The easiest cases:
+  - you are both on the same home or office network, or
+  - you both use the same VPN (for example Tailscale or WireGuard), or
+  - one of you has forwarded port `47337` on their router.
+
+  If none of those fit, see [More options](#more-options) for Tor, which needs no
+  network setup at all.
+
+## Install
 
 ```
-# both sides, once
-burrow init                          # choose a passphrase
-# the reachable side
-burrow invite                        # prints a one-hour, single-use invite; share it privately
-burrow listen                        # opens the chat
-# the other side
-burrow connect                       # prompts for the invite (no echo), then opens the chat
+git clone https://github.com/guy5116/burrow.git
+cd burrow
+make build
 ```
 
-In the chat: type to send, `/image <path> [caption]` to offer a picture (EXIF and other
-metadata are stripped first; the receiver must `/accept`), `/help` for commands, `/safety <contact>` to compare safety numbers
-out of band and `/verify <contact>` once they match. `burrow --plain --json listen` gives a
-scriptable line mode. The default port is 47337; change it with `burrow config set listen_port`.
+No `make` on your system (common on Windows)? This does the same:
 
-## What it will protect
+```
+go build ./cmd/burrow
+```
 
-Content confidentiality (including against future quantum computers via a hybrid
-X25519 + ML-KEM-768 root key), mutual authentication with pinned keys and safety
-numbers, forward secrecy per session and per message, post-compromise security through
-periodic static-key-bound rekeys, resistance to scanners that do not hold your key,
-image metadata stripping, and encrypted local storage.
+This creates a program called `burrow` in the current folder. On Windows it is
+`burrow.exe`. You can run it from there as `./burrow`, or move it somewhere on your
+`PATH`. The examples below write `burrow`.
 
-## What it will not protect
+## Your first message, step by step
 
-A compromised endpoint; a peer who shares what they received; your online presence from
-anyone who ever held your public key; protocol fingerprinting by deep packet inspection;
-traffic analysis (timing and coarse sizes); your IP address from your peer in direct-TCP
-mode (use the Tor transport once it exists). Full list in `docs/THREAT_MODEL.md`.
+Two people are involved. In this guide **Alice** is the one who can be reached, and
+**Bob** connects to her. Decide between you who is who. If you are on the same
+network it does not matter.
 
-## Connectivity and the trade-offs
+### Step 1. Both of you: create your identity (once)
 
-| Mode | Set with | Hides your IP from the peer | Needs | Trade-off |
-|---|---|---|---|---|
-| Direct TCP (default) | `transport = "tcp"` | no | one side reachable: same LAN, a port forward, or a VPN such as WireGuard/Tailscale | fastest; your IP and the peer's are visible to each other and to the network path |
-| Tor onion service | `transport = "tor"` (or `"both"`) plus a system `tor` binary | yes, both ways | nothing to forward; tor bootstraps in seconds to minutes | slower and higher latency; Tor sees connection timing but never content or identities |
-| LAN discovery (mDNS) | `mdns = true` | n/a | same LAN | announces that *a* Burrow instance exists (random name, keyed tag); only your contacts can tell it is you. Off by default because it is a presence beacon |
+```
+burrow init
+```
 
-Hostnames in invites work but reveal the peer's hostname to your DNS resolver; IP
-literals and onion addresses are preferred. History is off by default; `history = true`
-stores messages encrypted at rest in opaque files, and `burrow burn` wipes them.
+You are asked to choose a passphrase and type it twice. Nothing appears while you
+type; that is normal. The passphrase protects your identity and contact list on
+your disk. **There is no way to recover it**, so pick something you will remember.
 
-## Building
+You will see your **fingerprint**, a long code in groups of four letters. That is
+your identity in Burrow. It is not secret.
+
+### Step 2. Alice: create an invite
+
+```
+burrow invite
+```
+
+After your passphrase, Burrow prints one long line starting with `burrow1:`. That
+line is the invite. It works **once** and expires after **one hour**.
+
+Burrow guesses your network address. If it guesses wrong, or you use a VPN, tell it
+which address Bob should connect to:
+
+```
+burrow invite --host 192.168.1.20
+```
+
+### Step 3. Alice: send the invite to Bob
+
+Send the `burrow1:...` line to Bob over a channel you already trust. **Treat it
+like a password**: anyone who gets it within the hour can connect to you as a new
+contact.
+
+### Step 4. Alice: start listening
+
+```
+burrow listen
+```
+
+The chat window opens and waits.
+
+### Step 5. Bob: connect
+
+```
+burrow connect
+```
+
+Bob pastes the invite when asked and presses Enter, then types his passphrase.
+Nothing appears while pasting or typing; that is on purpose, so neither ends up on
+screen or in the shell history.
+
+Within a few seconds both of you see that the other has connected. You are now in
+each other's contact list.
+
+### Step 6. Say hello
+
+Type a message and press Enter. It shows up on the other side. That is it.
+
+To leave, type `/quit` or press Ctrl+C.
+
+### Step 7. Give your contact a name
+
+Burrow does not send your name to anyone unless you set one, so a new contact first
+appears under the first eight characters of their fingerprint, for example
+`4pktanvk`. Type `/contacts` to see it, then give it a name you will recognise:
+
+```
+/rename 4pktanvk Alice
+```
+
+The name is only for you. It is stored on your computer and never sent.
+
+### Next time
+
+You do not need a new invite. You are contacts now.
+
+- Alice runs `burrow listen`.
+- Bob runs `burrow connect Alice`, using the name he gave her.
+
+## Everyday use
+
+Inside the chat, anything you type is sent as a message. Lines that start with `/`
+are commands.
+
+| Type this | What happens |
+|---|---|
+| `/help` | Shows every command |
+| `/contacts` | Lists your contacts. `*` means online, `✓` means verified |
+| `/to Alice` | Switches the conversation to Alice |
+| `/image photo.jpg` | Offers a picture to the current contact |
+| `/accept 1` or `/reject 1` | Answers a picture someone offered you |
+| `/safety Alice` | Shows the safety number for Alice |
+| `/verify Alice` | Marks Alice as verified |
+| `/rename Alice Ali` | Gives a contact a nickname of your choice |
+| `/invite` | Creates an invite without leaving the chat |
+| `/quit` | Leaves |
+
+Keys: **Enter** sends, **Tab** switches between contacts, **Page Up** and
+**Page Down** scroll.
+
+If the connection drops, your messages wait and are delivered when you are
+connected again, as long as you keep Burrow open. Messages that were still waiting
+when you quit are not kept.
+
+## Make sure it is really them
+
+The first time you connect, Burrow marks the contact as **UNVERIFIED**. The
+connection is already encrypted, but you have not yet confirmed that the person on
+the other end is who you think.
+
+To confirm:
+
+1. Both of you type `/safety` followed by the other's name.
+2. Each of you sees twelve groups of five digits.
+3. Compare them over a phone call or in person. They must match exactly.
+4. If they match, both type `/verify` followed by the name.
+
+If the numbers do **not** match, stop. Someone may be in the middle. Remove the
+contact and exchange a new invite over a channel you trust more.
+
+## Sending pictures
+
+```
+/image holiday.jpg A caption if you like
+```
+
+- Before anything is sent, Burrow removes hidden information from the file, such as
+  where and when the photo was taken and which camera took it.
+- The file name is never sent.
+- The other person is asked first. Nothing is downloaded until they type `/accept`.
+- Received pictures are saved in Burrow's `images` folder, and the chat shows the
+  exact path.
+- If the connection drops halfway, send the same picture again and the download
+  continues where it stopped.
+
+PNG, JPEG, WebP and GIF are supported, up to 25 MiB.
+
+## If something does not work
+
+**"Could not establish a secure session"**
+Burrow cannot tell these apart on purpose, so check them in order:
+
+1. Is the other person running `burrow listen` right now?
+2. Are you on the same network or VPN? Can you reach their address at all?
+3. Was the invite older than one hour, or already used? Ask for a new one.
+4. Did the invite contain the right address? Alice can run
+   `burrow invite --host <her address>`.
+
+**"address already in use"**
+Something on your computer already uses port `47337`, most likely another Burrow
+that is still running. Close it, or pick another port with
+`burrow config set listen_port 47338` and create a new invite.
+
+**"store in use"**
+Burrow is already running somewhere, maybe in another terminal or as the desktop
+app. Close it first.
+
+**"wrong passphrase or corrupted store"**
+The passphrase was mistyped. Try again.
+
+**"no identity yet; run `burrow init` first"**
+Do [Step 1](#step-1-both-of-you-create-your-identity-once).
+
+**A firewall asks whether to allow Burrow**
+Allow it on private networks. The side that listens must accept incoming
+connections on port `47337`.
+
+**I forgot my passphrase**
+It cannot be recovered. Delete Burrow's data folder, run `burrow init` again, and
+exchange new invites with your contacts. To them you will be a new person.
+
+| System | Data folder |
+|---|---|
+| Linux | `~/.local/share/burrow` |
+| macOS | `~/Library/Application Support/burrow` |
+| Windows | `%APPDATA%\burrow` |
+
+## The desktop app
+
+If you prefer windows and buttons, there is a desktop version with the same
+features:
+
+```
+make build-gui
+./burrow-gui
+```
+
+Building it needs a C compiler and the graphics development packages for your
+system. On Debian or Ubuntu: `sudo apt install gcc libgl1-mesa-dev xorg-dev`.
+
+The desktop app and the terminal program share the same identity and contacts, but
+only one of them can run at a time.
+
+## What Burrow protects, and what it does not
+
+**Protected**
+
+- The content of your messages and pictures, from anyone watching the network,
+  including someone who records the traffic today and gets a quantum computer later.
+- Against someone pretending to be your contact, once you have verified each other.
+- Past conversations, even if a key is stolen later.
+- Hidden data inside pictures.
+- Your identity and contact list on disk, by your passphrase.
+- By default no message history is kept at all.
+
+**Not protected**
+
+- A computer that is already compromised, for example by malware or someone looking
+  at your screen.
+- What the other person does with what you sent them.
+- Your IP address from the person you talk to, when you connect directly. Tor hides
+  it; see below.
+- The fact that you are using Burrow, and when. Someone watching the network can see
+  that two computers talk and roughly how much, but not what is said.
+- Anyone who ever had your invite or your fingerprint can tell whether you are
+  online at a given address.
+
+The full list is in [docs/THREAT_MODEL.md](docs/THREAT_MODEL.md).
+
+## More options
+
+These are optional. Change them with `burrow config set <name> <value>` and see all
+of them with `burrow config get`.
+
+| Setting | What it does | Default |
+|---|---|---|
+| `transport` | `tcp` connects directly. `tor` hides both IP addresses and needs no port forwarding, but is slower and needs the `tor` program installed. `both` does both | `tcp` |
+| `display_name` | A name shown to new contacts | empty |
+| `listen_port` | The port others connect to | `47337` |
+| `history` | Keep an encrypted copy of your conversations. `burrow burn` deletes it | off |
+| `mdns` | Find contacts on the same local network automatically. It reveals that some Burrow user is on the network | off |
+| `typing` | Show "is typing…" | off |
+| `paranoid_images` | Re-encode every picture so not even the camera model can be guessed | off |
+| `auto_accept_from_verified` | Skip the accept question for verified contacts | off |
+
+With `transport` set to `tor`, create invites from inside the chat with
+`/invite tor`.
+
+Other commands: `burrow id` shows your fingerprint, `burrow contacts list` shows
+your contacts, `burrow passphrase` changes your passphrase, and
+`burrow --plain --json listen` gives a line-based mode for scripts.
+
+## For developers
 
 ```
 make build        # CLI, no CGo
@@ -60,4 +309,11 @@ make build-gui    # desktop GUI (needs CGo + OpenGL/X11 dev packages)
 make test         # go test -race ./...
 make lint         # gofmt, vet, staticcheck, gosec, govulncheck, golangci-lint (run `make tools` once)
 make docs-check   # docs/PROTOCOL.md constants match internal/wire
+make bench        # benchmarks compared with bench/baseline.json
 ```
+
+- Design and rules: [CLAUDE.md](CLAUDE.md)
+- Wire protocol: [docs/PROTOCOL.md](docs/PROTOCOL.md)
+- Security notes and how to report a vulnerability: [docs/SECURITY.md](docs/SECURITY.md)
+- Release status: [docs/RELEASE_CHECKLIST.md](docs/RELEASE_CHECKLIST.md)
+- Current work: [docs/STATUS.md](docs/STATUS.md)

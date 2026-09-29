@@ -22,6 +22,8 @@ type Controller struct {
 	InviteHost string       // default host for /invite
 	Onion      string       // our onion address when Tor is running
 	Typing     bool
+	// QR renders text as a terminal QR code; set by the CLI (nil → /invite qr is unavailable).
+	QR func(string) string
 
 	mu      sync.Mutex
 	nextNum int
@@ -127,7 +129,7 @@ const Help = `/connect <invite|contact>   connect (an invite string starts with 
 /to <contact>               select the conversation for plain text lines
 /msg <contact> <text>       send to a specific contact
 /contacts                   list contacts (✓ verified, * online)
-/invite [multi] [tor] [host] create an invite (default single-use, 1 h; tor = onion invite)
+/invite [multi] [tor] [qr] [host] create an invite (single-use, 1 h; tor = onion, qr = also as QR code)
 /safety <contact>           show the safety number to compare out of band
 /verify <contact>           mark verified after comparing safety numbers
 /rename <contact> <name>    set a nickname
@@ -138,6 +140,7 @@ const Help = `/connect <invite|contact>   connect (an invite string starts with 
 /accept <n> | /reject <n>   answer an image offer by its number
 /cancel <n>                 cancel a transfer
 /transfers                  list pending offers
+/partials                   list partial downloads that can resume
 /view <n>                   show a received image inline (Kitty/iTerm2), n from /images
 /images                     list received images
 /history [n]                show the last n stored messages (needs history = true)
@@ -200,6 +203,9 @@ func (c *Controller) Exec(ctx context.Context, line string) (out []string, quit 
 		var target core.Target
 		if strings.HasPrefix(rest, "burrow1:") {
 			target.Invite = rest
+			if info, err := core.DescribeInvite(rest); err == nil && info.Hostname {
+				out = append(out, "note: this invite uses the hostname "+info.Host+"; looking it up tells your DNS resolver which host you are contacting")
+			}
 		} else {
 			id, err := c.Resolve(rest)
 			if err != nil {
@@ -211,10 +217,10 @@ func (c *Controller) Exec(ctx context.Context, line string) (out []string, quit 
 		defer cancel()
 		id, err := c.E.Connect(cctx, target)
 		if err != nil {
-			return fail(err)
+			return append(out, "! "+err.Error()), false
 		}
 		c.Current = &id
-		return []string{"* connected to " + c.Names.Label(id) + "; now talking to them"}, false
+		return append(out, "* connected to "+c.Names.Label(id)+"; now talking to them"), false
 	case "to":
 		id, err := c.Resolve(rest)
 		if err != nil {
@@ -252,10 +258,13 @@ func (c *Controller) Exec(ctx context.Context, line string) (out []string, quit 
 		return out, false
 	case "invite":
 		opts := core.InviteOptions{Host: c.InviteHost}
+		wantQR := false
 		for _, f := range strings.Fields(rest) {
 			switch f {
 			case "multi", "--multi-use":
 				opts.MultiUse = true
+			case "qr", "--qr":
+				wantQR = true
 			case "tor":
 				if c.Onion == "" {
 					return fail(errors.New("tor is not running (config: transport = tor or both)"))
@@ -273,7 +282,15 @@ func (c *Controller) Exec(ctx context.Context, line string) (out []string, quit 
 		if inv.MultiUse {
 			kind = "multi-use"
 		}
-		return []string{fmt.Sprintf("invite (%s, expires %s) — share it over a channel you trust, treat it like a password:", kind, inv.Expiry.Local().Format(time.RFC822)), inv.String}, false
+		out = []string{fmt.Sprintf("invite (%s, expires %s) — share it over a channel you trust, treat it like a password:", kind, inv.Expiry.Local().Format(time.RFC822)), inv.String}
+		if wantQR {
+			if c.QR == nil {
+				out = append(out, "! QR codes are not available here")
+			} else {
+				out = append(out, strings.Split(strings.TrimRight(c.QR(inv.String), "\n"), "\n")...)
+			}
+		}
+		return out, false
 	case "safety":
 		id, err := c.Resolve(rest)
 		if err != nil {
@@ -380,6 +397,8 @@ func (c *Controller) Exec(ctx context.Context, line string) (out []string, quit 
 			out = append(out, fmt.Sprintf("#%d %s", n, hexID(c.offers[n])[:8]))
 		}
 		return out, false
+	case "partials":
+		return c.StartupNotes(true), false
 	case "images":
 		imgs := c.Images()
 		if len(imgs) == 0 {
@@ -404,4 +423,43 @@ func (c *Controller) send(id core.PeerID, text string) []string {
 		return []string{"! " + err.Error()}
 	}
 	return []string{fmt.Sprintf("* queued %016x to %s", uint64(mid), c.Names.Nick(id))}
+}
+
+// StartupNotes lists partial downloads that can resume. With always set it
+// reports an empty list too (the /partials command); at startup it stays quiet.
+func (c *Controller) StartupNotes(always bool) []string {
+	parts := c.E.Resumable()
+	if len(parts) == 0 {
+		if always {
+			return []string{"(no partial downloads)"}
+		}
+		return nil
+	}
+	out := []string{fmt.Sprintf("* %d partial download(s) will resume when the sender offers the same image again:", len(parts))}
+	for _, p := range parts {
+		out = append(out, fmt.Sprintf("  from %s: %s of %s %s", c.Names.Nick(p.Peer), Size(p.Done), Size(p.Size), FormatName(p.Format)))
+	}
+	return out
+}
+
+// Status renders the status-bar text for the selected contact: short
+// fingerprint, verification state, presence and transport kind.
+func (c *Controller) Status() string {
+	s := "me " + c.E.Identity().ID.Short()
+	if c.Current == nil {
+		return s
+	}
+	ct, err := c.E.Contact(*c.Current)
+	if err != nil {
+		return s
+	}
+	ver := "UNVERIFIED"
+	if ct.Verified {
+		ver = "verified"
+	}
+	on := "offline"
+	if ct.Online {
+		on = "online via " + string(ct.Transport)
+	}
+	return s + fmt.Sprintf(" · talking to %s (%s, %s, %s)", ct.Nickname, ct.ID.Short(), ver, on)
 }

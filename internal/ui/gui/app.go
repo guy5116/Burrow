@@ -93,7 +93,7 @@ func (a *App) startEngine(st *store.Store) {
 	ecfg := core.Config{ListenPort: a.cfg.ListenPort, DisplayName: a.cfg.DisplayName, Typing: a.cfg.Typing,
 		NoTimestamp: !a.cfg.Timestamps, AutoReconnect: a.cfg.AutoReconnect, DataDir: a.paths.Data,
 		ImageDir: a.cfg.ImageDir, MaxImage: uint64(a.cfg.MaxImageMiB) << 20, Paranoid: a.cfg.ParanoidImages,
-		AutoAcceptFromVerified: a.cfg.AutoAcceptFromVerified, MDNS: a.cfg.MDNS, History: a.cfg.History}
+		AutoAcceptFromVerified: a.cfg.AutoAcceptFromVerified, MDNS: a.cfg.MDNS, History: a.cfg.History, MaxPeers: a.cfg.MaxPeers}
 	listen := ":" + strconv.Itoa(int(a.cfg.ListenPort))
 	var torOpts *core.TorOptions
 	if a.cfg.Transport == "tor" || a.cfg.Transport == "both" {

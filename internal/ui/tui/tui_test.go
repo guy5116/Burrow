@@ -2,7 +2,11 @@ package tui
 
 import (
 	"context"
+	"image"
+	"image/png"
 	"io"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -230,5 +234,64 @@ func TestRunQuitsOnContextCancel(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("TUI did not quit on cancel")
+	}
+}
+
+func TestInlineThumbnailFlow(t *testing.T) {
+	m := newModel(t)
+	m.Update(tea.WindowSizeMsg{Width: 120, Height: 40})
+	var p core.PeerID
+	p[0] = 8
+	m.ctl.Current = &p
+	// A PNG on disk, as TransferDone would report it.
+	path := filepath.Join(t.TempDir(), "img-abcd.png")
+	f, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := png.Encode(f, image.NewNRGBA(image.Rect(0, 0, 64, 32))); err != nil {
+		t.Fatal(err)
+	}
+	_ = f.Close()
+	for _, k := range []string{"KITTY_WINDOW_ID", "TERM_PROGRAM"} {
+		t.Setenv(k, "")
+	}
+	// Without Kitty: only the saved path appears.
+	t.Setenv("TERM", "xterm-256color")
+	if _, cmd := m.Update(evMsg{core.TransferDone{Peer: core.TransferPeer{Peer: p}, Path: path}}); cmd != nil {
+		t.Fatal("inline command issued for a terminal without image support")
+	}
+	// With Kitty: the thumbnail is prepared off the render thread, its rows join the conversation
+	// and the upload is sent raw.
+	t.Setenv("TERM", "xterm-kitty")
+	_, cmd := m.Update(evMsg{core.TransferDone{Peer: core.TransferPeer{Peer: p}, Path: path}})
+	if cmd == nil {
+		t.Fatal("no inline command on Kitty")
+	}
+	msg := cmd()
+	in, ok := msg.(inlineMsg)
+	if !ok || in.peer != p || len(in.img.Lines) == 0 {
+		t.Fatalf("%T", msg)
+	}
+	before := len(m.logs[p])
+	_, raw := m.Update(in)
+	if raw == nil || len(m.logs[p]) != before+len(in.img.Lines) {
+		t.Fatal("placeholder rows not added or upload not issued")
+	}
+	if !strings.ContainsRune(m.logs[p][len(m.logs[p])-1], 0x10EEEE) {
+		t.Fatal("placeholder cells missing")
+	}
+	// A missing file fails silently (the path line is already there).
+	if got := m.inline(p, filepath.Join(t.TempDir(), "gone.png"))(); got != nil {
+		t.Fatalf("%v", got)
+	}
+	// Ids cycle through 1–255 and never use 0.
+	m.nextImage = 255
+	_ = m.inline(p, path)
+	if m.nextImage != 1 {
+		t.Fatal(m.nextImage)
+	}
+	if !strings.Contains(m.View().Content, "me ") {
+		t.Fatal("status bar")
 	}
 }

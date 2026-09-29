@@ -43,3 +43,20 @@ binary and the Tor network; run `BURROW_TOR_TEST=1 go test ./internal/transport/
 - Run the Tor conformance test with tor installed.
 - Execute `docs/gui-test-plan.md` on all three OSes.
 - Decide on the optional `memguard` build tag (CLAUDE.md §3.6: ask first).
+- Look at an inline thumbnail on a real Kitty terminal (the escape sequences are unit
+  tested, the rendering has not been seen).
+
+## Performance budgets (CLAUDE.md §11), measured on the development machine
+
+| Metric | Budget | Measured | Where |
+|---|---|---|---|
+| Handshake CPU per side | < 5 ms | ≈ 1 ms for both sides | `BenchmarkHandshake` |
+| Added latency for a TEXT frame | < 1 ms | ≈ 13 µs | `BenchmarkTextOverSession` − `BenchmarkTextOverRawTCP` |
+| AEAD + chain throughput | ≥ 300 MB/s | ≈ 1200 MB/s | `BenchmarkSealOpen` |
+| Image transfer end to end, with disk | ≥ 90 MB/s | ≈ 419 MB/s on loopback | `TestImageThroughput` |
+| Heap allocations per frame | ≤ 8 | 8 | `TestSealOpenAllocs` |
+| CLI RSS idle, one peer | < 30 MiB | ≈ 19 MiB | `TestFootprint` |
+| CLI startup to ready | < 300 ms | ≈ 23 ms | `TestFootprint` |
+| Idle CPU | < 0.5 % | ≈ 0 % | `TestFootprint` |
+| Rekey cost | < 1.5 ms | ≈ 1.2 ms for both sides | `BenchmarkRekey` |
+| GUI RSS idle | < 150 MiB | not measured | needs a desktop session |

@@ -292,11 +292,11 @@ func TestPrepareAndStreamErrors(t *testing.T) {
 	if err := Stream(p, func(uint32, []byte) error { return nil }); err == nil {
 		t.Fatal("stream of a missing file succeeded")
 	}
-	// Replacing the file with another format diverges.
+	// Replacing the file with another format is caught by the extension check.
 	if err := os.WriteFile(path, dirtyJPEG(t, testImage(300, 300), 1), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := Stream(p, func(uint32, []byte) error { return nil }); !errors.Is(err, ErrDiverged) {
+	if err := Stream(p, func(uint32, []byte) error { return nil }); !errors.Is(err, ErrMismatch) {
 		t.Fatal(err)
 	}
 	// Re-encode paths surface decode failures.

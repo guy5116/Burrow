@@ -4,6 +4,9 @@ import (
 	"context"
 	"encoding/hex"
 	"net"
+	"os"
+	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -146,5 +149,25 @@ func TestRunAndBrowseStopOnCancel(t *testing.T) {
 		case <-time.After(3 * time.Second):
 			t.Fatal("did not stop on cancel")
 		}
+	}
+}
+
+// TestWriteFuzzSeeds regenerates testdata/fuzz (run with BURROW_WRITE_SEEDS=1).
+func TestWriteFuzzSeeds(t *testing.T) {
+	if os.Getenv("BURROW_WRITE_SEEDS") == "" {
+		t.Skip("set BURROW_WRITE_SEEDS=1 to regenerate the seed corpus")
+	}
+	var n, tg [16]byte
+	n[0], tg[0] = 1, 2
+	a, _ := NewAnnouncer(47337, n, tg)
+	a.name = "0123456789abcdef"
+	pkt, _ := a.Packet()
+	dir := filepath.Join("testdata", "fuzz", "FuzzParse")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	body := "go test fuzz v1\n[]byte(" + strconv.Quote(string(pkt)) + ")\n"
+	if err := os.WriteFile(filepath.Join(dir, "seed-0"), []byte(body), 0o644); err != nil {
+		t.Fatal(err)
 	}
 }

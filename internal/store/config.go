@@ -28,11 +28,12 @@ type Config struct {
 	Transport              string `toml:"transport"` // tcp | tor | both
 	TorExe                 string `toml:"tor_exe"`
 	History                bool   `toml:"history"`
+	MaxPeers               int    `toml:"max_peers"`
 }
 
 // DefaultConfig returns the shipped defaults.
 func DefaultConfig() Config {
-	return Config{ListenPort: 47337, Timestamps: true, AutoReconnect: true, MaxImageMiB: 25, Transport: "tcp"}
+	return Config{ListenPort: 47337, Timestamps: true, AutoReconnect: true, MaxImageMiB: 25, Transport: "tcp", MaxPeers: 32}
 }
 
 // ConfigFile is the file name under the config directory.
@@ -103,6 +104,8 @@ func (c *Config) Get(key string) (string, error) {
 		return c.TorExe, nil
 	case "history":
 		return strconv.FormatBool(c.History), nil
+	case "max_peers":
+		return strconv.Itoa(c.MaxPeers), nil
 	}
 	return "", ErrConfigKey
 }
@@ -162,6 +165,12 @@ func (c *Config) Set(key, value string) error {
 		c.TorExe = value
 	case "history":
 		return parseBool(&c.History)
+	case "max_peers":
+		n, err := strconv.Atoi(value)
+		if err != nil || n < 1 || n > 32 {
+			return errors.New("store: max_peers must be 1–32")
+		}
+		c.MaxPeers = n
 	default:
 		return ErrConfigKey
 	}
@@ -172,5 +181,5 @@ func (c *Config) Set(key, value string) error {
 func ConfigKeys() []string {
 	return []string{"listen_port", "display_name", "typing", "timestamps", "auto_reconnect",
 		"auto_accept_from_verified", "paranoid_images", "mdns", "open_links", "image_dir", "max_image_mib", "invite_host",
-		"transport", "tor_exe", "history"}
+		"transport", "tor_exe", "history", "max_peers"}
 }

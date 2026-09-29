@@ -29,6 +29,9 @@ commands:
   passphrase [--insecure-no-passphrase]   change the passphrase or mode
   burn                                 wipe optional history and partial transfers
 
+chat keys (full-screen mode): enter send · tab / shift+tab next / previous contact ·
+  pgup / pgdn scroll · ctrl+c quit · /help lists the chat commands
+
 global flags:
   --plain        line mode: no alternate screen, stdin commands, stdout events
   --json         with --plain: newline-delimited JSON events on stdout
@@ -47,7 +50,7 @@ type app struct {
 }
 
 func main() {
-	harden()
+	store.HardenProcess()
 	os.Exit(run(os.Args[1:], os.Stdin, os.Stdout, os.Stderr))
 }
 

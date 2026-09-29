@@ -95,6 +95,11 @@ func (a *app) cmdRun(ctx context.Context, cmd string, args []string, stdin io.Re
 	}
 	ctl := common.NewController(e, inviteHost)
 	ctl.Onion = e.OnionAddress()
+	ctl.QR = func(text string) string {
+		var sb strings.Builder
+		printQR(&sb, text)
+		return sb.String()
+	}
 	var code int
 	if a.plain {
 		code = runPlain(ctx, ctl, target, a.json, stdin, stdout, stderr)
