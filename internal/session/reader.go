@@ -134,13 +134,7 @@ func (s *Session) dispatch(in wire.Inner) error {
 	default:
 		return ErrProtocol
 	}
-	msg := Inbound{Type: in.Type, Stream: in.Stream, Payload: append([]byte(nil), in.Payload...)}
-	select {
-	case s.inbound <- msg:
-		return nil
-	case <-s.ctx.Done():
-		return ErrClosed
-	}
+	return s.deliver(Inbound{Type: in.Type, Stream: in.Stream, Payload: append([]byte(nil), in.Payload...)})
 }
 
 // pushControlCtx enqueues a reply the reader must send, waiting up to

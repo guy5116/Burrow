@@ -35,6 +35,7 @@ type stream struct {
 	next     uint32        // receiver: next expected chunk index
 	queue    chan outFrame // sender/receiver frames for the writer (cap TransferQueueCap)
 	done     chan struct{} // closed when the stream closes; late senders get ErrStreamState
+	sink     chan<- []byte // receiver: where chunk data goes (set by the owner)
 }
 
 // streamTable is the mutex-guarded per-stream state shared by reader, writer
@@ -421,14 +422,40 @@ func (t *streamTable) markClosed(id uint16) {
 // deliverLocked hands the frame to the owner (releasing the table lock while blocked).
 func (s *Session) deliverLocked(in wire.Inner) error {
 	msg := Inbound{Type: in.Type, Stream: in.Stream, Payload: append([]byte(nil), in.Payload...)}
+	var sink chan<- []byte
+	if st := s.streams.open[in.Stream]; st != nil && in.Type == wire.TypeImgChunk {
+		sink = st.sink
+	}
 	s.streams.mu.Unlock()
 	defer s.streams.mu.Lock()
-	select {
-	case s.inbound <- msg:
-		return nil
-	case <-s.ctx.Done():
-		return ErrClosed
+	if sink != nil {
+		// Chunk data goes straight from the reader to the transfer's file-writer
+		// (bounded; a slow disk becomes TCP backpressure), never through the engine.
+		c, err := wire.DecodeImgChunk(msg.Payload)
+		if err != nil {
+			return ErrProtocol
+		}
+		select {
+		case sink <- c.Data:
+			return nil
+		case <-s.ctx.Done():
+			return ErrClosed
+		}
 	}
+	return s.deliver(msg)
+}
+
+// SetChunkSink routes the data of IMG_CHUNK frames on an accepted incoming
+// stream to sink instead of the inbound channel. Call it before IMG_ACCEPT.
+func (s *Session) SetChunkSink(id uint16, sink chan<- []byte) error {
+	s.streams.mu.Lock()
+	defer s.streams.mu.Unlock()
+	st, ok := s.streams.open[id]
+	if !ok || st.outgoing {
+		return ErrStreamState
+	}
+	st.sink = sink
+	return nil
 }
 
 // StreamOpen reports whether id is still open (tests and core bookkeeping).

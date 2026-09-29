@@ -483,3 +483,19 @@ func BenchmarkTransfer(b *testing.B) {
 	}
 	p.cancel()
 }
+
+// acceptOfferWithSink is acceptOffer with chunk data routed to sink.
+func (a *adv) acceptOfferWithSink(t *testing.T, id uint16, size uint64, sink chan<- []byte) {
+	t.Helper()
+	if err := a.p.SendFrame(wire.TypeImgOffer, id, offerPayload(size)); err != nil {
+		t.Fatal(err)
+	}
+	a.recvType(t, wire.TypeImgOffer)
+	if err := a.s.SetChunkSink(id, sink); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.s.SendStream(context.Background(), id, wire.TypeImgAccept, wire.AppendImgAccept(nil, 0)); err != nil {
+		t.Fatal(err)
+	}
+	a.recv(t, wire.TypeImgAccept)
+}

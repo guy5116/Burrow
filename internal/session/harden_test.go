@@ -1,6 +1,7 @@
 package session
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"net"
@@ -436,12 +437,10 @@ func TestStreamIDsExhaust(t *testing.T) {
 func TestPanicsFailTests(t *testing.T) {
 	p := newPair(t, time.Hour)
 	got := make(chan any, 1)
-	p.i.wg.Add(1)
 	go func() {
 		defer func() { got <- recover() }()
 		// The supervisor's deferred handler, run directly so the re-raised panic can be observed.
 		func() {
-			defer p.i.wg.Done()
 			defer func() {
 				if r := recover(); r != nil {
 					if testing.Testing() && !p.i.cfg.RecoverInTests {
@@ -457,5 +456,101 @@ func TestPanicsFailTests(t *testing.T) {
 	}
 	if p.i.Err() != nil {
 		t.Fatal("session torn down instead of failing loudly")
+	}
+}
+
+func TestSharedInboundAttachAndTrySend(t *testing.T) {
+	idI, _ := identity.Generate()
+	idR, _ := identity.Generate()
+	root, _ := secret.Random(wire.RootKeySize)
+	root2 := secret.From(append([]byte(nil), root.Bytes()...))
+	ci, cr := net.Pipe()
+	shared := make(chan Inbound, 8)
+	closed := make(chan *Session, 2)
+	ctx, cancel := context.WithCancel(context.Background())
+	mk := func(c net.Conn, r *secret.Buffer, init bool, self *identity.Identity, peer identity.PeerID) *Session {
+		s, err := New(Config{Conn: c, Root: r, Initiator: init, Self: self, Peer: peer, Tick: time.Hour,
+			Inbound: shared, OnClose: func(s *Session) { closed <- s }})
+		if err != nil {
+			t.Fatal(err)
+		}
+		s.Start(ctx)
+		return s
+	}
+	i, r := mk(ci, root, true, idI, idR.Public()), mk(cr, root2, false, idR, idI.Public())
+	<-i.Ready()
+	<-r.Ready()
+	if i.Inbound() != nil {
+		t.Fatal("a session with a shared channel must not expose its own")
+	}
+	payload, _ := wire.AppendText(nil, wire.Text{MsgID: 1, Text: []byte("held back")})
+	if ok, err := i.TrySend(wire.TypeText, payload); !ok || err != nil {
+		t.Fatal(ok, err)
+	}
+	select {
+	case in := <-shared:
+		t.Fatalf("frame %#x delivered before Attach", in.Type)
+	case <-time.After(100 * time.Millisecond):
+	}
+	r.Attach()
+	r.Attach() // idempotent
+	select {
+	case in := <-shared:
+		if in.From != r || in.Type != wire.TypeText {
+			t.Fatalf("%+v", in)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("frame not delivered after Attach")
+	}
+	// TrySend never blocks: a full queue is reported, not waited for.
+	if ok, err := i.TrySend(wire.TypeHello, nil); ok || !errors.Is(err, wire.ErrStream) {
+		t.Fatal(ok, err)
+	}
+	for n := 0; n < wire.ChatQueueCap+8; n++ {
+		if ok, _ := i.TrySend(wire.TypeTyping, []byte{0}); !ok {
+			goto full
+		}
+	}
+	t.Log("queue never filled (the writer kept up)")
+full:
+	cancel()
+	for n := 0; n < 2; n++ {
+		select {
+		case s := <-closed:
+			if s != i && s != r {
+				t.Fatal("OnClose for a stranger")
+			}
+			<-s.Done()
+		case <-time.After(3 * time.Second):
+			t.Fatal("OnClose not called")
+		}
+	}
+	if ok, err := i.TrySend(wire.TypeTyping, []byte{0}); ok || !errors.Is(err, ErrClosed) {
+		t.Fatal(ok, err)
+	}
+}
+
+func TestChunkSink(t *testing.T) {
+	a := newAdv(t, false, true)
+	sink := make(chan []byte, 4)
+	if err := a.s.SetChunkSink(2, sink); !errors.Is(err, ErrStreamState) {
+		t.Fatal("sink on an unknown stream", err)
+	}
+	a.acceptOfferWithSink(t, 2, wire.ChunkData+5, sink)
+	c0, _ := wire.AppendImgChunk(nil, wire.ImgChunk{Index: 0, Data: bytes.Repeat([]byte{7}, wire.ChunkData)})
+	c1, _ := wire.AppendImgChunk(nil, wire.ImgChunk{Index: 1, Data: []byte{1, 2, 3, 4, 5}})
+	_ = a.p.SendFrame(wire.TypeImgChunk, 2, c0)
+	_ = a.p.SendFrame(wire.TypeImgChunk, 2, c1)
+	_ = a.p.SendFrame(wire.TypeImgDone, 2, nil)
+	if d := <-sink; len(d) != wire.ChunkData || d[0] != 7 {
+		t.Fatal(len(d))
+	}
+	if d := <-sink; !bytes.Equal(d, []byte{1, 2, 3, 4, 5}) {
+		t.Fatal(d)
+	}
+	a.recvType(t, wire.TypeImgDone) // DONE still goes to the owner; chunks never did
+	id, _ := a.s.OpenStream(1)
+	if err := a.s.SetChunkSink(id, sink); !errors.Is(err, ErrStreamState) {
+		t.Fatal("sink on an outgoing stream", err)
 	}
 }

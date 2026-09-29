@@ -33,10 +33,17 @@ type Config struct {
 	// RecoverInTests lets the one test of the supervisor's recovery path opt in;
 	// everywhere else a panic under `go test` is re-raised and fails the test.
 	RecoverInTests bool
+	// Inbound, when set, receives this session's application frames instead of
+	// the session's own channel, so one engine goroutine can serve every peer.
+	// Nothing is delivered until Attach is called.
+	Inbound chan<- Inbound
+	// OnClose is called once, after the session has fully torn down.
+	OnClose func(*Session)
 }
 
 // Inbound is an application frame delivered to the owner. Payload is a copy.
 type Inbound struct {
+	From    *Session
 	Type    wire.FrameType
 	Stream  uint16
 	Payload []byte
@@ -108,9 +115,10 @@ type Session struct {
 	log  *slog.Logger
 	now  func() time.Time
 
-	ctx    context.Context
-	cancel context.CancelFunc
-	wg     sync.WaitGroup
+	ctx      context.Context
+	cancel   context.CancelFunc
+	live     atomic.Int32 // supervised goroutines still running
+	connOnce sync.Once
 
 	// Writer-owned, published atomically.
 	sendCounter    atomic.Uint64
@@ -139,9 +147,12 @@ type Session struct {
 
 	pending chan *pendingRekey // cap 1, writer → reader
 
-	control chan ctrl
-	chat    chan outFrame
-	inbound chan Inbound
+	control    chan ctrl
+	chat       chan outFrame
+	inbound    chan<- Inbound // where frames go (own or shared)
+	own        chan Inbound   // the session's own channel when none was supplied
+	attached   chan struct{}  // closed once the owner is ready to receive
+	attachOnce sync.Once
 
 	streams      *streamTable
 	transferWake chan struct{}
@@ -153,11 +164,10 @@ type Session struct {
 	readyCh   chan struct{} // closed when both HELLOs are done (ours written, theirs validated)
 	ready     atomic.Bool
 
-	closeOnce sync.Once
-	closed    chan struct{}
-	errMu     sync.Mutex
-	err       error
-	byeSent   atomic.Bool
+	closed  chan struct{}
+	errMu   sync.Mutex
+	err     error
+	byeSent atomic.Bool
 
 	// TYPING rate limiting (reader).
 	typingTimes []time.Time
@@ -188,13 +198,20 @@ func New(cfg Config) (*Session, error) {
 		pending:      make(chan *pendingRekey, 1),
 		control:      make(chan ctrl, wire.ControlQueueCap),
 		chat:         make(chan outFrame, wire.ChatQueueCap),
-		inbound:      make(chan Inbound, wire.ChatQueueCap),
+		attached:     make(chan struct{}),
 		streams:      newStreamTable(cfg.Initiator),
 		transferWake: make(chan struct{}, 1),
 		closedQueues: map[uint16]chan outFrame{},
 		helloRecv:    make(chan struct{}),
 		readyCh:      make(chan struct{}),
 		closed:       make(chan struct{}),
+	}
+	if cfg.Inbound != nil {
+		s.inbound = cfg.Inbound
+	} else {
+		s.own = make(chan Inbound, wire.ChatQueueCap)
+		s.inbound = s.own
+		close(s.attached) // standalone use: deliver right away
 	}
 	if cfg.Initiator {
 		s.send, s.recv = newChain(i2r, 0), newChain(r2i, 0)
@@ -208,26 +225,24 @@ func New(cfg Config) (*Session, error) {
 	return s, nil
 }
 
-// Start launches the reader, writer and controller. It returns immediately;
-// Ready() closes when both HELLOs validated, Done() when the session ends.
+// Start launches the reader, writer and controller: exactly three goroutines
+// per session. It returns immediately; Ready() closes when both HELLOs
+// validated, Done() when the session ends.
 func (s *Session) Start(ctx context.Context) {
 	s.ctx, s.cancel = context.WithCancel(ctx)
+	s.live.Store(3)
 	s.spawn("reader", s.readLoop)
 	s.spawn("writer", s.writeLoop)
 	s.spawn("controller", s.controlLoop)
-	// Tear down everything once any goroutine exits or the context ends.
-	go func() {
-		<-s.ctx.Done()
-		s.teardown()
-	}()
 }
 
-// spawn is the supervisor: a panic becomes a redacted log line and a clean
-// teardown of this session only.
+// spawn is the supervisor: it records the goroutine, converts a panic into a
+// redacted log line, and tears the session down when goroutines exit. The
+// first exit cancels the context and closes the connection so the others
+// unwind; the last one clears the secrets.
 func (s *Session) spawn(name string, fn func()) {
-	s.wg.Add(1)
 	go func() {
-		defer s.wg.Done()
+		defer s.exit()
 		defer func() {
 			if r := recover(); r != nil {
 				if testing.Testing() && !s.cfg.RecoverInTests {
@@ -239,6 +254,15 @@ func (s *Session) spawn(name string, fn func()) {
 		}()
 		fn()
 	}()
+}
+
+// exit runs when a supervised goroutine returns.
+func (s *Session) exit() {
+	s.cancel()
+	s.connOnce.Do(func() { _ = s.conn.Close() })
+	if s.live.Add(-1) == 0 {
+		s.finalize()
+	}
 }
 
 // redactStack keeps function names and file:line pairs and drops argument
@@ -276,36 +300,56 @@ func (s *Session) fail(err error) {
 	s.cancel()
 }
 
-func (s *Session) teardown() {
-	s.closeOnce.Do(func() {
-		_ = s.conn.Close()
-		s.wg.Wait()
-		// Clear every secret still in flight.
+// finalize clears every secret still in flight and reports the end of the session.
+func (s *Session) finalize() {
+	select {
+	case p := <-s.pending:
+		p.clear()
+	default:
+	}
+	for {
 		select {
-		case p := <-s.pending:
-			p.clear()
+		case c := <-s.control:
+			c.chain.Clear()
+			continue
 		default:
 		}
-		for {
-			select {
-			case c := <-s.control:
-				c.chain.Clear()
-				continue
-			default:
-			}
-			break
-		}
-		s.send.clear()
-		s.recv.clear()
-		s.nextRecv.clear()
-		s.root.Clear()
-		s.errMu.Lock()
-		if s.err == nil {
-			s.err = ErrClosed
-		}
-		s.errMu.Unlock()
-		close(s.closed)
-	})
+		break
+	}
+	s.send.clear()
+	s.recv.clear()
+	s.nextRecv.clear()
+	s.root.Clear()
+	s.errMu.Lock()
+	if s.err == nil {
+		s.err = ErrClosed
+	}
+	s.errMu.Unlock()
+	close(s.closed)
+	if s.cfg.OnClose != nil {
+		s.cfg.OnClose(s)
+	}
+}
+
+// Attach tells the session that its owner is ready for frames. Until then the
+// reader holds them back (the peer feels it as TCP backpressure), so nothing
+// is delivered before the owner knows the peer.
+func (s *Session) Attach() { s.attachOnce.Do(func() { close(s.attached) }) }
+
+// deliver hands one frame to the owner once attached.
+func (s *Session) deliver(msg Inbound) error {
+	msg.From = s
+	select {
+	case <-s.attached:
+	case <-s.ctx.Done():
+		return ErrClosed
+	}
+	select {
+	case s.inbound <- msg:
+		return nil
+	case <-s.ctx.Done():
+		return ErrClosed
+	}
 }
 
 // Close ends the session, sending BYE with reason first when the session is
@@ -339,8 +383,9 @@ func (s *Session) Err() error {
 	return s.err
 }
 
-// Inbound delivers application frames (TEXT, ACK, TYPING, and in Phase 2 IMG_*).
-func (s *Session) Inbound() <-chan Inbound { return s.inbound }
+// Inbound delivers application frames when no shared channel was configured
+// (nil otherwise).
+func (s *Session) Inbound() <-chan Inbound { return s.own }
 
 // PeerHello returns the validated peer HELLO (valid after Ready).
 func (s *Session) PeerHello() wire.Hello { return s.peerHello }
@@ -373,6 +418,28 @@ func (s *Session) Send(ctx context.Context, typ wire.FrameType, payload []byte) 
 		return ctx.Err()
 	case <-s.closed:
 		return ErrClosed
+	}
+}
+
+// TrySend queues a chat frame without blocking. It reports false when the
+// chat queue is full; the caller keeps the frame and tries again later.
+func (s *Session) TrySend(typ wire.FrameType, payload []byte) (bool, error) {
+	if typ.Class() != wire.ClassChat {
+		return false, wire.ErrStream
+	}
+	if !s.ready.Load() {
+		return false, ErrNotReady
+	}
+	select {
+	case <-s.closed:
+		return false, ErrClosed
+	default:
+	}
+	select {
+	case s.chat <- outFrame{typ: typ, stream: wire.StreamChat, payload: append([]byte(nil), payload...)}:
+		return true, nil
+	default:
+		return false, nil
 	}
 }
 
