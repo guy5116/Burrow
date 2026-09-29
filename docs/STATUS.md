@@ -19,6 +19,5 @@ See docs/phases/PHASE-5.md and docs/RELEASE_CHECKLIST.md.
 ## Open questions for the user
 - memguard (mlock for the identity key, behind a build tag): add it? CLAUDE.md §3.6 says
   to ask first.
-- GitHub repo rename to lowercase still needs doing in the repository settings.
 - Earlier unconfirmed choices: §0.3 placeholders (module path, port 47337, Bubble Tea v2),
   engine mutex instead of a single goroutine, reconnect policy, `/view` for inline images.

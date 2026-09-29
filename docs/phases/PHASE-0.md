@@ -33,9 +33,7 @@
 
 - §0.3 placeholders were adopted without confirmation (autonomous session): module path
   `github.com/guy5116/burrow`, port 47337, Bubble Tea **v2** (`charm.land/bubbletea/v2`,
-  v2.0.10 at the time; lipgloss/bubbles likewise v2). **The GitHub remote is spelled
-  `Burrow`; Go module paths are case-sensitive, so rename the repo to lowercase or change
-  the module path before publishing.**
+  v2.0.10 at the time; lipgloss/bubbles likewise v2). The GitHub repository was renamed to lowercase `burrow` on 2026-09-29, so the remote now matches the module path.
 - `buf.Put` wipes the whole buffer (privacy over the ~2 µs memset per frame).
 - Wire-level decode rejects: `ACK.status ≠ 1`, `IMG_OFFER.size = 0` or unknown format,
   `HS3` with `has_token = 0` but non-zero token bytes, empty `IMG_CHUNK` data.
