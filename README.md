@@ -1,11 +1,17 @@
 # Burrow
 
-Burrow is a private chat program for two people. You send text and pictures straight
-from your computer to your friend's computer. There is no company in the middle, no
+Burrow is a private chat program for two people. You send text, pictures and files
+straight from your computer to your friend's computer. There is no company in the middle, no
 account to create, no phone number, and no server that stores your messages.
 
 Everything you send is end-to-end encrypted: only you and the person you are talking
 to can read it.
+
+> **Warning: Burrow hides what you send, not where you are.**
+> By default the person you talk to sees your IP address. So does anyone watching
+> the network between you, such as someone on the same Wi-Fi or your internet
+> provider. They cannot read your messages or files. To hide your IP address, use
+> Tor: see [Who can see your IP address](#who-can-see-your-ip-address).
 
 - [What you need](#what-you-need)
 - [Install](#install)
@@ -14,9 +20,11 @@ to can read it.
 - [Everyday use](#everyday-use)
 - [Make sure it is really them](#make-sure-it-is-really-them)
 - [Sending pictures](#sending-pictures)
+- [Sending other files](#sending-other-files)
 - [Changing the port](#changing-the-port)
 - [If something does not work](#if-something-does-not-work)
 - [The desktop app](#the-desktop-app)
+- [Who can see your IP address](#who-can-see-your-ip-address)
 - [What Burrow protects, and what it does not](#what-burrow-protects-and-what-it-does-not)
 - [More options](#more-options)
 - [For developers](#for-developers)
@@ -71,6 +79,10 @@ your disk. **There is no way to recover it**, so pick something you will remembe
 
 You will see your **fingerprint**, a long code in groups of four letters. That is
 your identity in Burrow. It is not secret.
+
+You will also see a warning that Burrow does not hide your IP address by default.
+[Who can see your IP address](#who-can-see-your-ip-address) explains what that means
+and how to hide it.
 
 ### Step 2. Alice: create an invite
 
@@ -371,11 +383,55 @@ system. On Debian or Ubuntu: `sudo apt install gcc libgl1-mesa-dev xorg-dev`.
 The desktop app and the terminal program share the same identity and contacts, but
 only one of them can run at a time.
 
+## Who can see your IP address
+
+Burrow connects your computer directly to your contact's computer. That is why no
+company can read or store your messages. It also means your IP address is visible,
+unless you use Tor. An IP address shows roughly where you are and who your internet
+provider is.
+
+With the default setting, a network capture tool such as Wireshark shows this:
+
+| Visible | Hidden |
+|---|---|
+| Your IP address and your contact's | The text of your messages |
+| When data flows, and roughly how much | Pictures and files, and what kind they are |
+| That the program is Burrow | Your name, your key and your contact list |
+
+Who can see it:
+
+- **The person you talk to.** Their computer sees your IP address, and yours sees
+  theirs.
+- **Anyone on the same network**, such as shared Wi-Fi.
+- **Your internet provider**, and the networks between you and your contact.
+
+A stranger somewhere else on the internet cannot see it.
+
+### Hiding your IP address
+
+Install the `tor` program, then:
+
+```
+burrow config set transport tor
+```
+
+Create invites from inside the chat with `/invite tor`. Your contact then sees an
+onion address instead of your IP address, and someone watching your network sees
+only that you use Tor. Tor is slower, which you will notice with large files.
+
+A VPN such as Tailscale or WireGuard is a middle way. People on your local network
+no longer see who you talk to, but your contact and the VPN provider still can.
+
+Even with Tor, someone watching your network can tell when you are active and
+roughly how much data you send.
+
+`burrow init` prints a short version of this warning when you create your identity.
+
 ## What Burrow protects, and what it does not
 
 **Protected**
 
-- The content of your messages and pictures, from anyone watching the network,
+- The content of your messages, pictures and files, from anyone watching the network,
   including someone who records the traffic today and gets a quantum computer later.
 - Against someone pretending to be your contact, once you have verified each other.
 - Past conversations, even if a key is stolen later.
@@ -388,8 +444,9 @@ only one of them can run at a time.
 - A computer that is already compromised, for example by malware or someone looking
   at your screen.
 - What the other person does with what you sent them.
-- Your IP address from the person you talk to, when you connect directly. Tor hides
-  it; see below.
+- **Your IP address**, from the person you talk to and from anyone watching the
+  network, when you connect directly. Tor hides it; see
+  [Who can see your IP address](#who-can-see-your-ip-address).
 - The fact that you are using Burrow, and when. Someone watching the network can see
   that two computers talk and roughly how much, but not what is said.
 - Anyone who ever had your invite or your fingerprint can tell whether you are

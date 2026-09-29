@@ -66,6 +66,9 @@ func (a *app) cmdInit(args []string, stdin io.Reader, stdout, stderr io.Writer) 
 	}
 	fmt.Fprintf(stdout, "identity created\nfingerprint: %s\nstore: %s\nconfig: %s\n", id.Public().Display(),
 		filepath.Join(a.paths.Data, store.StoreDir), filepath.Join(a.paths.Config, store.ConfigFile))
+	if a.cfg.Transport != "tor" { // with Tor only, neither address is exposed
+		fmt.Fprintln(stderr, "\n"+common.IPWarning)
+	}
 	return 0
 }
 

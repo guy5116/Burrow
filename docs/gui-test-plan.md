@@ -65,6 +65,11 @@ same LAN or loopback with a different data directory.
 20. Idle with one peer for 20 minutes → still connected (rekeys happened silently:
     `--log-level debug` shows no errors).
 
+## First start
+
+1. With no store, the wizard shows the IP address warning below the Create button,
+   fully readable without scrolling.
+
 ## Files that are not images
 
 1. Click **File**, choose a `.zip` of a few MiB → the peer sees a "File offered" dialog

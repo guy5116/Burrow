@@ -120,6 +120,15 @@ func Size(n uint64) string {
 	return fmt.Sprintf("%d B", n)
 }
 
+// IPWarning is shown when an identity is created, by the CLI and the desktop
+// app alike: encryption hides the content, not the addresses.
+const IPWarning = `WARNING: Burrow hides what you send, not where you are.
+  - The person you talk to sees your IP address.
+  - Anyone watching the network between you, such as someone on the same Wi-Fi
+    or your internet provider, sees both IP addresses. They cannot read your
+    messages or files.
+  To hide your IP address, install tor and run: burrow config set transport tor`
+
 // Kind is "image" or "file".
 func Kind(image bool) string {
 	if image {

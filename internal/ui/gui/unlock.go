@@ -12,6 +12,7 @@ import (
 	"fyne.io/fyne/v2/widget"
 
 	"github.com/guy5116/burrow/internal/store"
+	"github.com/guy5116/burrow/internal/ui/common"
 )
 
 const insecureWarning = "Without a passphrase, anyone who can read your data directory can read your identity, contacts and invites."
@@ -114,9 +115,11 @@ func (a *App) wizard() fyne.CanvasObject {
 			status.SetText("")
 		}
 	}
+	ip := widget.NewLabel(common.IPWarning)
+	ip.Wrapping = fyne.TextWrapWord
 	form := container.NewVBox(
 		widget.NewLabelWithStyle("Welcome to Burrow", fyne.TextAlignCenter, fyne.TextStyle{Bold: true}),
 		widget.NewLabel(fmt.Sprintf("Your identity will be stored encrypted in\n%s", a.paths.Data)),
-		pw1, pw2, insecure, create, status)
-	return container.NewCenter(container.NewGridWrap(fyne.NewSize(420, 320), form))
+		pw1, pw2, insecure, create, status, ip)
+	return container.NewCenter(container.NewGridWrap(fyne.NewSize(520, 520), form))
 }

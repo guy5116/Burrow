@@ -334,7 +334,21 @@ func TestReadmeFlow(t *testing.T) {
 		return strings.TrimSpace(string(out))
 	}
 	alice := t.TempDir()
-	run(alice, "init", "--insecure-no-passphrase")
+	// init warns that IP addresses are visible; the warning goes to stderr so
+	// stdout stays what scripts read.
+	initCmd := exec.CommandContext(context.Background(), binPath, "--config", alice, "--data", alice, "init", "--insecure-no-passphrase")
+	var initErr bytes.Buffer
+	initCmd.Stderr = &initErr
+	initOut, err := initCmd.Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(initErr.String(), "sees your IP address") || !strings.Contains(initErr.String(), "transport tor") {
+		t.Fatalf("init did not warn about IP addresses:\n%s", initErr.String())
+	}
+	if strings.Contains(string(initOut), "WARNING") || !strings.Contains(string(initOut), "fingerprint:") {
+		t.Fatalf("stdout: %s", initOut)
+	}
 	// Pick a free port for Alice so the invite and the listener agree.
 	ln, err := (&net.ListenConfig{}).Listen(context.Background(), "tcp", "127.0.0.1:0")
 	if err != nil {

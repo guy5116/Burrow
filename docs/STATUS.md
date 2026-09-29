@@ -13,6 +13,8 @@ See docs/phases/PHASE-5.md and docs/RELEASE_CHECKLIST.md.
   file-writer; typing notices are the only events dropped for a slow screen.
 - Go 1.26 minimum and a 200 MiB desktop app memory budget (user decisions, recorded in
   CLAUDE.md §1.2 and §11).
+- IP visibility warning in the README, `burrow init` and the desktop wizard
+  (`common.IPWarning`).
 - File transfer for any file type (CLAUDE.md §6.5): `/file`, `max_file_mib`, size shown
   before accepting. Protocol v1 amended in place (HELLO `max_file`, FILE_OFFER 0x27).
 
