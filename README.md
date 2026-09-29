@@ -10,9 +10,11 @@ to can read it.
 - [What you need](#what-you-need)
 - [Install](#install)
 - [Your first message, step by step](#your-first-message-step-by-step)
+- [Try it on one computer first](#try-it-on-one-computer-first)
 - [Everyday use](#everyday-use)
 - [Make sure it is really them](#make-sure-it-is-really-them)
 - [Sending pictures](#sending-pictures)
+- [Changing the port](#changing-the-port)
 - [If something does not work](#if-something-does-not-work)
 - [The desktop app](#the-desktop-app)
 - [What Burrow protects, and what it does not](#what-burrow-protects-and-what-it-does-not)
@@ -138,6 +140,56 @@ You do not need a new invite. You are contacts now.
 - Alice runs `burrow listen`.
 - Bob runs `burrow connect Alice`, using the name he gave her.
 
+## Try it on one computer first
+
+You can try everything alone before involving a friend, by running Burrow twice on
+the same computer. You play both people. Open **two terminal windows**.
+
+Two copies on one computer need two things kept apart:
+
+- **their own folder**, so each has its own identity and contacts, and
+- **their own port**, because two programs cannot listen on the same one.
+
+Your normal Burrow is "Alice". The second copy is "Bob" and keeps everything in a
+folder called `burrow-test`.
+
+### Terminal 1: Alice
+
+```
+burrow init
+burrow invite --host 127.0.0.1
+burrow listen
+```
+
+Skip `burrow init` if you already have an identity. `127.0.0.1` is the address that
+always means "this computer". Copy the `burrow1:...` line that `invite` prints.
+
+### Terminal 2: Bob
+
+```
+burrow --config burrow-test --data burrow-test init
+burrow --config burrow-test --data burrow-test connect --listen :47338
+```
+
+Paste the invite when asked, then type Bob's passphrase.
+
+The order matters: `--config` and `--data` go **before** the command, and
+`--listen` goes **after** it.
+
+### Chat with yourself
+
+Type in either window and the message appears in the other. Try `/contacts`,
+`/safety` and `/image` as well.
+
+### Clean up
+
+When you are done:
+
+1. Type `/quit` in both windows.
+2. Delete the `burrow-test` folder. That removes Bob completely.
+3. Remove the test contact from your real identity: start `burrow listen`, type
+   `/contacts` to see its name, then `/remove` followed by that name.
+
 ## Everyday use
 
 Inside the chat, anything you type is sent as a message. Lines that start with `/`
@@ -196,6 +248,39 @@ contact and exchange a new invite over a channel you trust more.
 
 PNG, JPEG, WebP and GIF are supported, up to 25 MiB.
 
+## Changing the port
+
+Burrow listens on port `47337`. Change it when something else uses that port, when
+you run two copies on one computer, or when your router forwards a different one.
+
+**For good.** This is saved in your settings:
+
+```
+burrow config set listen_port 47338
+```
+
+Check the current value with `burrow config get listen_port`.
+
+**For one run only.** This changes nothing in your settings:
+
+```
+burrow listen --listen :47338
+burrow connect --listen :47338 Alice
+```
+
+**After changing the port, remember:**
+
+- **Make a new invite.** An invite contains the port it was made for, so older
+  invites point at the old port.
+- **If you used `--listen`, create the invite inside the chat** by typing
+  `/invite`. That uses the port you are really listening on. The separate
+  `burrow invite` command uses the port saved in your settings.
+- **Contacts who connect to you need a new invite.** They saved your old port.
+  Contacts that you connect to are not affected.
+- **Port forwarding and firewalls** must allow the new port.
+
+Any port between 1024 and 65535 that nothing else uses is fine.
+
 ## If something does not work
 
 **"Could not establish a secure session"**
@@ -209,8 +294,8 @@ Burrow cannot tell these apart on purpose, so check them in order:
 
 **"address already in use"**
 Something on your computer already uses port `47337`, most likely another Burrow
-that is still running. Close it, or pick another port with
-`burrow config set listen_port 47338` and create a new invite.
+that is still running. Close it, or use another port: see
+[Changing the port](#changing-the-port).
 
 **"store in use"**
 Burrow is already running somewhere, maybe in another terminal or as the desktop
