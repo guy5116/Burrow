@@ -250,7 +250,7 @@ func TestInviteFlowTextAckTyping(t *testing.T) {
 	if c, err := e2.Contact(a.id()); err != nil || c.Nickname != "Alice" || !c.Verified {
 		t.Fatalf("%+v %v", c, err)
 	}
-	e2.id.Clear()
+	e2.Close()
 	// A saw B leave with BYE.
 	a.wait(t, "PeerDisconnected", func(ev Event) bool { pd, ok := ev.(PeerDisconnected); return ok && pd.Reason == "peer left" })
 }
@@ -532,12 +532,8 @@ func TestSessionReplacement(t *testing.T) {
 	if a.count(isType[PeerDisconnected]) != 0 || b.count(isType[PeerDisconnected]) != 0 {
 		t.Fatalf("replacement emitted PeerDisconnected: a=%s b=%s", a.dump(), b.dump())
 	}
-	a.e.mu.Lock()
-	na := len(a.e.peers)
-	a.e.mu.Unlock()
-	b.e.mu.Lock()
-	nb := len(b.e.peers)
-	b.e.mu.Unlock()
+	na := a.peerCount()
+	nb := b.peerCount()
 	if na != 1 || nb != 1 {
 		t.Fatal(na, nb)
 	}
@@ -555,7 +551,9 @@ func TestSimultaneousDialGlare(t *testing.T) {
 	a.wait(t, "PeerDisconnected", isType[PeerDisconnected])
 	b.wait(t, "PeerDisconnected", isType[PeerDisconnected])
 	// Give A B's address, then dial both ways at once.
-	a.e.rememberAddr(b.id(), transport.Address{Kind: transport.KindTCP, Host: "127.0.0.1", Port: b.port})
+	a.e.do(func() {
+		a.e.rememberAddrL(b.id(), transport.Address{Kind: transport.KindTCP, Host: "127.0.0.1", Port: b.port})
+	})
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	var wg sync.WaitGroup
@@ -570,12 +568,8 @@ func TestSimultaneousDialGlare(t *testing.T) {
 	// Settle: exactly one live session on each side, and it works.
 	deadline := time.Now().Add(5 * time.Second)
 	for {
-		a.e.mu.Lock()
-		na := len(a.e.peers)
-		a.e.mu.Unlock()
-		b.e.mu.Lock()
-		nb := len(b.e.peers)
-		b.e.mu.Unlock()
+		na := a.peerCount()
+		nb := b.peerCount()
 		if na == 1 && nb == 1 {
 			break
 		}
@@ -589,9 +583,7 @@ func TestSimultaneousDialGlare(t *testing.T) {
 	}
 	b.wait(t, "text", func(ev Event) bool { m, ok := ev.(MessageReceived); return ok && m.Text == "glare ok" })
 	// Both kept the session whose initiator has the smaller key.
-	a.e.mu.Lock()
-	pa := a.e.peers[b.id()]
-	a.e.mu.Unlock()
+	pa := a.peerOf(b.id())
 	wantAInit := string(a.id().Fingerprint()) < string(b.id().Fingerprint())
 	if pa != nil && pa.s.Initiator() != wantAInit {
 		t.Logf("note: glare resolved by reconnect rather than tie-break (allowed)")
@@ -620,9 +612,7 @@ func TestAutoReconnect(t *testing.T) {
 	b.e.rand = func() time.Duration { return 10 * time.Millisecond } // small jitter
 	connect(t, b, a, a.invite(t, false).String)
 	// A drops the connection without BYE (simulate a crash by closing the raw session).
-	a.e.mu.Lock()
-	pa := a.e.peers[b.id()]
-	a.e.mu.Unlock()
+	pa := a.peerOf(b.id())
 	pa.s.Close(wire.ByeLocalError) // BYE reason 2: peer did not cause it → B still reconnects
 	b.wait(t, "Reconnecting", isType[Reconnecting])
 	b.waitN(t, "PeerConnected", isType[PeerConnected], 2)

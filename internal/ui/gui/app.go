@@ -118,7 +118,12 @@ func (a *App) startEngine(st *store.Store) {
 	a.cancel = cancel
 	a.done = make(chan struct{})
 	errc := make(chan error, 1)
-	go func() { errc <- e.Start(ctx); close(a.done) }()
+	go func() {
+		err := e.Start(ctx)
+		e.Close() // a failed Start leaves the engine running
+		errc <- err
+		close(a.done)
+	}()
 	// Drain events on a dedicated goroutine; marshal to the UI thread.
 	go func() {
 		for {

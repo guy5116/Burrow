@@ -12,6 +12,7 @@ import (
 
 	"github.com/guy5116/burrow/internal/identity"
 	"github.com/guy5116/burrow/internal/invite"
+	"github.com/guy5116/burrow/internal/store"
 	"github.com/guy5116/burrow/internal/testpeer"
 	"github.com/guy5116/burrow/internal/transport"
 	"github.com/guy5116/burrow/internal/wire"
@@ -72,9 +73,8 @@ func TestReservedToken(t *testing.T) {
 	_ = p1
 	deadline := time.Now().Add(15 * time.Second)
 	for {
-		a.e.mu.Lock()
-		n := len(a.e.reserved)
-		a.e.mu.Unlock()
+		n := 0
+		a.e.do(func() { n = len(a.e.reserved) })
 		if n == 0 {
 			break
 		}
@@ -179,9 +179,7 @@ func TestStreamExhaustionReconnects(t *testing.T) {
 	b := newNode(t, Config{AutoReconnect: true})
 	b.e.rand = func() time.Duration { return 5 * time.Millisecond }
 	connect(t, b, a, a.invite(t, false).String)
-	b.e.mu.Lock()
-	p := b.e.peers[a.id()]
-	b.e.mu.Unlock()
+	p := b.peerOf(a.id())
 	b.e.onStreamsExhausted(p)
 	a.wait(t, "peer left", func(ev Event) bool { d, ok := ev.(PeerDisconnected); return ok && d.Reason == "peer left" })
 	b.waitN(t, "PeerConnected", isType[PeerConnected], 2)
@@ -315,13 +313,13 @@ func TestReceiverIgnoresDeclaredFormat(t *testing.T) {
 func TestContactCapWhenDialing(t *testing.T) {
 	a := newNode(t, Config{})
 	b := newNode(t, Config{})
-	b.e.mu.Lock()
-	for i := 0; i < wire.MaxContacts; i++ {
-		var id PeerID
-		id[0], id[1], id[2] = 0xEE, byte(i>>8), byte(i)
-		b.e.contacts[id] = &Contact{ID: id, Nickname: "filler"}
-	}
-	b.e.mu.Unlock()
+	b.e.do(func() {
+		for i := 0; i < wire.MaxContacts; i++ {
+			var id PeerID
+			id[0], id[1], id[2] = 0xEE, byte(i>>8), byte(i)
+			b.e.contacts[id] = &Contact{ID: id, Nickname: "filler"}
+		}
+	})
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	if _, err := b.e.Connect(ctx, Target{Invite: a.invite(t, false).String}); !errors.Is(err, ErrContactLimit) {
@@ -331,9 +329,7 @@ func TestContactCapWhenDialing(t *testing.T) {
 		t.Fatal("a refused dial reached the responder or burned the invite")
 	}
 	// Invites from a prompt arrive as bytes and are wiped by Connect.
-	b.e.mu.Lock()
-	b.e.contacts = map[PeerID]*Contact{}
-	b.e.mu.Unlock()
+	b.e.do(func() { b.e.contacts = map[PeerID]*Contact{} })
 	raw := []byte(a.invite(t, false).String)
 	if _, err := b.e.Connect(ctx, Target{InviteBytes: raw}); err != nil {
 		t.Fatal(err)
@@ -342,5 +338,53 @@ func TestContactCapWhenDialing(t *testing.T) {
 		if c != 0 {
 			t.Fatal("invite bytes not wiped after Connect")
 		}
+	}
+}
+
+// A UI that stops draining events loses typing notices and nothing else, and
+// API calls keep working meanwhile (CLAUDE.md §2.3).
+func TestSlowConsumerDropsOnlyTyping(t *testing.T) {
+	st, err := store.Init(t.TempDir(), []byte("pw"), fast)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	e, err := New(Config{}, st, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer e.Close()
+	e.do(func() {
+		for i := 0; i < eventsCap; i++ {
+			e.queueL(MessageReceived{ID: MsgID(i)})
+		}
+		for i := 0; i < 5; i++ {
+			e.queueL(Typing{Typing: true})
+		}
+		e.queueL(MessageReceived{ID: eventsCap})
+	})
+	// Served only while the engine waits on the full channel with the last message.
+	waiting := -1
+	e.do(func() { waiting = len(e.out) })
+	if waiting != 1 {
+		t.Fatalf("%d events waiting, want 1", waiting)
+	}
+	if len(e.Contacts()) != 0 { // an API call does not deadlock against the stalled UI
+		t.Fatal("unexpected contacts")
+	}
+	for i := 0; i <= eventsCap; i++ {
+		select {
+		case ev := <-e.Events():
+			if m, ok := ev.(MessageReceived); !ok || m.ID != MsgID(i) {
+				t.Fatalf("event %d: %#v", i, ev)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatalf("message %d never arrived", i)
+		}
+	}
+	select {
+	case ev := <-e.Events():
+		t.Fatalf("unexpected %#v", ev)
+	case <-time.After(50 * time.Millisecond):
 	}
 }

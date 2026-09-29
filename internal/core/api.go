@@ -1,7 +1,6 @@
 package core
 
 import (
-	"context"
 	"errors"
 	"net"
 	"strings"
@@ -17,33 +16,52 @@ import (
 
 // Contacts returns a snapshot of the contact list.
 func (e *Engine) Contacts() []Contact {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	out := make([]Contact, 0, len(e.contacts))
-	for _, c := range e.contacts {
-		cc := *c
-		cc.Addrs = append([]transport.Address(nil), c.Addrs...)
-		if p := e.peers[c.ID]; p != nil {
-			cc.Transport = p.kind
+	var out []Contact
+	e.do(func() {
+		out = make([]Contact, 0, len(e.contacts))
+		for id := range e.contacts {
+			out = append(out, e.contactL(id))
 		}
-		out = append(out, cc)
-	}
+	})
 	return out
+}
+
+func (e *Engine) contactL(id PeerID) Contact {
+	cc := *e.contacts[id]
+	cc.Addrs = append([]transport.Address(nil), cc.Addrs...)
+	if p := e.peers[id]; p != nil {
+		cc.Transport = p.kind
+	}
+	return cc
 }
 
 // Contact returns one contact.
 func (e *Engine) Contact(id PeerID) (Contact, error) {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	c, ok := e.contacts[id]
-	if !ok {
-		return Contact{}, ErrUnknownContact
-	}
-	cc := *c
-	if p := e.peers[id]; p != nil {
-		cc.Transport = p.kind
-	}
-	return cc, nil
+	var cc Contact
+	err := ErrUnknownContact
+	e.do(func() {
+		if _, ok := e.contacts[id]; ok {
+			cc, err = e.contactL(id), nil
+		}
+	})
+	return cc, err
+}
+
+// editContact applies fn to a contact on the engine goroutine and saves the
+// list. It returns the contact's live peer, if any.
+func (e *Engine) editContact(id PeerID, fn func(c *Contact)) (*peer, error) {
+	var p *peer
+	err := ErrUnknownContact
+	e.do(func() {
+		c, ok := e.contacts[id]
+		if !ok {
+			return
+		}
+		p = e.peers[id]
+		fn(c)
+		err = e.saveContacts()
+	})
+	return p, err
 }
 
 // RenameContact sets a user-chosen nickname (sanitized, single line, ≤ 64 chars).
@@ -56,85 +74,52 @@ func (e *Engine) RenameContact(id PeerID, name string) error {
 	if clean == "" || len(clean) > 64 {
 		return errors.New("core: nickname must be 1–64 characters")
 	}
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	c, ok := e.contacts[id]
-	if !ok {
-		return ErrUnknownContact
-	}
-	c.Nickname = clean
-	return e.saveContacts()
+	_, err = e.editContact(id, func(c *Contact) { c.Nickname = clean })
+	return err
 }
 
 // VerifyContact marks a contact verified after an out-of-band safety-number check.
 func (e *Engine) VerifyContact(id PeerID) error {
-	e.mu.Lock()
-	c, ok := e.contacts[id]
-	if !ok {
-		e.mu.Unlock()
-		return ErrUnknownContact
-	}
-	c.Verified = true
-	err := e.saveContacts()
-	e.mu.Unlock()
-	if err != nil {
-		return err
-	}
-	e.emit(PeerVerified{Peer: id})
-	return nil
+	_, err := e.editContact(id, func(c *Contact) {
+		c.Verified = true
+		e.queueL(PeerVerified{Peer: id})
+	})
+	return err
 }
 
 // BlockContact blocks or unblocks; blocking closes any live session.
 func (e *Engine) BlockContact(id PeerID, blocked bool) error {
-	e.mu.Lock()
-	c, ok := e.contacts[id]
-	if !ok {
-		e.mu.Unlock()
-		return ErrUnknownContact
-	}
-	c.Blocked = blocked
-	err := e.saveContacts()
-	p := e.peers[id]
-	if blocked {
-		if cancel := e.reconnects[id]; cancel != nil {
+	p, err := e.editContact(id, func(c *Contact) {
+		c.Blocked = blocked
+		if cancel := e.reconnects[id]; blocked && cancel != nil {
 			cancel()
 		}
-	}
-	e.mu.Unlock()
+	})
 	if blocked && p != nil {
-		p.close(wire.ByeUserQuit)
+		p.s.Close(wire.ByeUserQuit)
 	}
 	return err
 }
 
 // RemoveContact deletes a contact, its queue and any live session.
 func (e *Engine) RemoveContact(id PeerID) error {
-	e.mu.Lock()
-	if _, ok := e.contacts[id]; !ok {
-		e.mu.Unlock()
-		return ErrUnknownContact
-	}
-	delete(e.contacts, id)
-	delete(e.orphanQueues, id)
-	if cancel := e.reconnects[id]; cancel != nil {
-		cancel()
-	}
-	p := e.peers[id]
-	err := e.saveContacts()
-	e.mu.Unlock()
+	p, err := e.editContact(id, func(*Contact) {
+		delete(e.contacts, id)
+		delete(e.orphanQueues, id)
+		if cancel := e.reconnects[id]; cancel != nil {
+			cancel()
+		}
+	})
 	if p != nil {
-		p.close(wire.ByeUserQuit)
+		p.s.Close(wire.ByeUserQuit)
 	}
 	return err
 }
 
 // SafetyNumber computes the verification string for a contact.
 func (e *Engine) SafetyNumber(id PeerID) (SafetyNumber, error) {
-	e.mu.Lock()
-	_, ok := e.contacts[id]
-	e.mu.Unlock()
-	if !ok {
-		return SafetyNumber{}, ErrUnknownContact
+	if _, err := e.Contact(id); err != nil {
+		return SafetyNumber{}, err
 	}
 	return identity.ComputeSafetyNumber(e.id.Public(), id), nil
 }
@@ -178,11 +163,13 @@ func (e *Engine) CreateInvite(opts InviteOptions) (Invite, error) {
 	}
 	rec := &inviteRec{ID: id, Token: hexOf(inv.Token[:]), Kind: opts.Kind, Host: opts.Host, Port: opts.Port,
 		Expiry: inv.Expiry, MultiUse: opts.MultiUse}
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	e.invites[inv.Token] = rec
-	if err := e.saveInvites(); err != nil {
-		delete(e.invites, inv.Token)
+	e.do(func() {
+		e.invites[inv.Token] = rec
+		if err = e.saveInvites(); err != nil {
+			delete(e.invites, inv.Token)
+		}
+	})
+	if err != nil {
 		return Invite{}, err
 	}
 	return Invite{ID: id, String: s, Expiry: inv.Expiry, MultiUse: opts.MultiUse}, nil
@@ -190,40 +177,43 @@ func (e *Engine) CreateInvite(opts InviteOptions) (Invite, error) {
 
 // Invites lists unexpired issued invites (without their strings).
 func (e *Engine) Invites() []Invite {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	out := make([]Invite, 0, len(e.invites))
-	for _, r := range e.invites {
-		out = append(out, Invite{ID: r.ID, Expiry: r.Expiry, MultiUse: r.MultiUse})
-	}
+	var out []Invite
+	e.do(func() {
+		out = make([]Invite, 0, len(e.invites))
+		for _, r := range e.invites {
+			out = append(out, Invite{ID: r.ID, Expiry: r.Expiry, MultiUse: r.MultiUse})
+		}
+	})
 	return out
 }
 
 // RevokeInvite deletes an invite by id.
 func (e *Engine) RevokeInvite(id string) error {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	for tok, r := range e.invites {
-		if r.ID == id {
-			delete(e.invites, tok)
-			return e.saveInvites()
+	err := errors.New("core: no such invite")
+	e.do(func() {
+		for tok, r := range e.invites {
+			if r.ID == id {
+				delete(e.invites, tok)
+				err = e.saveInvites()
+				return
+			}
 		}
-	}
-	return errors.New("core: no such invite")
+	})
+	return err
 }
 
 // Disconnect closes the session with a contact and cancels reconnects.
 func (e *Engine) Disconnect(id PeerID) error {
-	e.mu.Lock()
-	p := e.peers[id]
-	if cancel := e.reconnects[id]; cancel != nil {
-		cancel()
+	var p *peer
+	e.do(func() {
+		p = e.peers[id]
+		if cancel := e.reconnects[id]; cancel != nil {
+			cancel()
+		}
+	})
+	if p != nil {
+		p.s.Close(wire.ByeUserQuit)
 	}
-	e.mu.Unlock()
-	if p == nil {
-		return nil
-	}
-	p.close(wire.ByeUserQuit)
 	return nil
 }
 
@@ -241,76 +231,62 @@ func (e *Engine) SendText(id PeerID, msg string) (MsgID, error) {
 	if !e.cfg.NoTimestamp {
 		q.sentAt = e.now().Unix()
 	}
-	e.mu.Lock()
-	c, ok := e.contacts[id]
-	if !ok {
-		e.mu.Unlock()
-		return 0, ErrUnknownContact
-	}
-	if c.Blocked {
-		e.mu.Unlock()
-		return 0, ErrBlocked
-	}
-	p := e.peers[id]
-	if p != nil {
-		if len(p.queue) >= wire.MaxQueuedMessages {
-			e.mu.Unlock()
-			return 0, ErrQueueFull
+	e.do(func() {
+		c, ok := e.contacts[id]
+		p := e.peers[id]
+		switch {
+		case !ok:
+			err = ErrUnknownContact
+		case c.Blocked:
+			err = ErrBlocked
+		case p != nil && len(p.queue) >= wire.MaxQueuedMessages, p == nil && len(e.orphanQueues[id]) >= wire.MaxQueuedMessages:
+			err = ErrQueueFull
+		case p != nil:
+			p.queue = append(p.queue, q)
+			e.queueL(MessageStatus{Peer: id, ID: q.id, Status: StatusPending})
+			e.sendPendingL(p)
+		default:
+			e.orphanQueues[id] = append(e.orphanQueues[id], q)
+			e.queueL(MessageStatus{Peer: id, ID: q.id, Status: StatusPending})
 		}
-		p.queue = append(p.queue, q)
-	} else {
-		if len(e.orphanQueues[id]) >= wire.MaxQueuedMessages {
-			e.mu.Unlock()
-			return 0, ErrQueueFull
-		}
-		e.orphanQueues[id] = append(e.orphanQueues[id], q)
+	})
+	if err != nil {
+		return 0, err
 	}
-	e.mu.Unlock()
 	e.recordHistory(id, q.id, true, clean, e.now())
-	e.emit(MessageStatus{Peer: id, ID: q.id, Status: StatusPending})
-	if p != nil {
-		select {
-		case p.sendCh <- q:
-		default: // cannot happen: the channel is as large as the queue bound
-		}
-	}
 	return q.id, nil
 }
 
-// SetTyping sends a typing indicator when enabled locally and supported by the peer.
+// SetTyping sends a typing indicator when enabled locally and supported by
+// the peer. It is dropped when the chat queue is full.
 func (e *Engine) SetTyping(id PeerID, typing bool) {
 	if !e.cfg.Typing {
-		return
-	}
-	e.mu.Lock()
-	p := e.peers[id]
-	e.mu.Unlock()
-	if p == nil || p.s.PeerHello().Features&wire.FeatureTyping == 0 {
 		return
 	}
 	st := uint8(wire.TypingStop)
 	if typing {
 		st = wire.TypingStart
 	}
-	ctx, cancel := context.WithTimeout(e.ctx, time.Second)
-	defer cancel()
-	_ = p.s.Send(ctx, wire.TypeTyping, wire.AppendTyping(nil, st))
+	e.do(func() {
+		if p := e.peers[id]; p != nil && p.s.PeerHello().Features&wire.FeatureTyping != 0 {
+			_, _ = p.s.TrySend(wire.TypeTyping, wire.AppendTyping(nil, st))
+		}
+	})
 }
 
 // Queue returns the pending/sent messages for a contact (oldest first).
 func (e *Engine) Queue(id PeerID) []MessageStatus {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	var src []*queued
-	if p := e.peers[id]; p != nil {
-		src = p.queue
-	} else {
-		src = e.orphanQueues[id]
-	}
-	out := make([]MessageStatus, 0, len(src))
-	for _, q := range src {
-		out = append(out, MessageStatus{Peer: id, ID: q.id, Status: q.status})
-	}
+	var out []MessageStatus
+	e.do(func() {
+		src := e.orphanQueues[id]
+		if p := e.peers[id]; p != nil {
+			src = p.queue
+		}
+		out = make([]MessageStatus, 0, len(src))
+		for _, q := range src {
+			out = append(out, MessageStatus{Peer: id, ID: q.id, Status: q.status})
+		}
+	})
 	return out
 }
 

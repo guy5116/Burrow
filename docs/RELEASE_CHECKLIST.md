@@ -58,4 +58,4 @@ binary and the Tor network; run `BURROW_TOR_TEST=1 go test ./internal/transport/
 | CLI startup to ready | < 300 ms | ≈ 23 ms | `TestFootprint` |
 | Idle CPU | < 0.5 % | ≈ 0 % | `TestFootprint` |
 | Rekey cost | < 1.5 ms | ≈ 1.2 ms for both sides | `BenchmarkRekey` |
-| GUI RSS idle | < 150 MiB | not measured | needs a desktop session |
+| GUI RSS idle, one peer | < 150 MiB | **172–179 MiB, over budget**; ≈ 95 MiB of it is graphics driver libraries and shared buffers | `TestGUIFootprint` with `BURROW_GUI_FOOTPRINT=1` |

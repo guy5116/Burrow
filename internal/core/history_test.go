@@ -49,7 +49,7 @@ func TestHistoryRoundTripAndBurn(t *testing.T) {
 	if h, _ := e2.History(b.id(), 2); len(h) != 2 {
 		t.Fatal("history lost after restart")
 	}
-	e2.id.Clear()
+	e2.Close()
 	n, err := a.e.Burn()
 	if err != nil || n != 3 {
 		t.Fatal(n, err)

@@ -48,37 +48,36 @@ func (e *Engine) onAnnouncement(an mdns.Announcement) {
 			defer e.wg.Done()
 			ctx, cancel := context.WithCancel(e.ctx)
 			defer cancel()
-			if err := e.dial(ctx, addr, id, nil, ""); err == nil {
-				e.rememberAddr(id, addr)
-			}
+			_ = e.dial(ctx, addr, id, nil, "") // dial records the address on success
 		}()
 	}
 }
 
 // matchAnnouncement returns the contact whose key produces tag for nonce, if
 // any, and records the nonce so the same announcement is not dialed twice.
-func (e *Engine) matchAnnouncement(nonce, tag [16]byte) (PeerID, bool) {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	if e.mdnsSeen == nil {
-		e.mdnsSeen = map[[16]byte]bool{}
-	}
-	if e.mdnsSeen[nonce] {
-		return PeerID{}, false
-	}
-	for id, c := range e.contacts {
-		if c.Blocked || e.peers[id] != nil {
-			continue
+func (e *Engine) matchAnnouncement(nonce, tag [16]byte) (id PeerID, ok bool) {
+	e.do(func() {
+		if e.mdnsSeen == nil {
+			e.mdnsSeen = map[[16]byte]bool{}
 		}
-		if identity.MDNSTag(nonce, id) == tag {
-			e.mdnsSeen[nonce] = true
-			if len(e.mdnsSeen) > 4096 {
-				e.mdnsSeen = map[[16]byte]bool{nonce: true}
+		if e.mdnsSeen[nonce] {
+			return
+		}
+		for cid, c := range e.contacts {
+			if c.Blocked || e.peers[cid] != nil {
+				continue
 			}
-			return id, true
+			if identity.MDNSTag(nonce, cid) == tag {
+				e.mdnsSeen[nonce] = true
+				if len(e.mdnsSeen) > 4096 {
+					e.mdnsSeen = map[[16]byte]bool{nonce: true}
+				}
+				id, ok = cid, true
+				return
+			}
 		}
-	}
-	return PeerID{}, false
+	})
+	return id, ok
 }
 
 // listenPortOf finds the TCP listener's port for announcements.

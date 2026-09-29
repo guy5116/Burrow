@@ -87,7 +87,7 @@ func (e *Engine) readJSON(rel string, v any) error {
 	return json.Unmarshal(b, v)
 }
 
-// saveContacts/saveInvites are called with e.mu held.
+// saveContacts/saveInvites run on the engine goroutine.
 func (e *Engine) saveContacts() error {
 	crs := make([]contactRec, 0, len(e.contacts))
 	for _, c := range e.contacts {

@@ -51,7 +51,10 @@ func (e *Engine) loadHistIndex() histIndex {
 
 func segName(n int) string { return historyDir + "/seg-" + strconv.Itoa(n) }
 
-// recordHistory appends one message when history is enabled. Caller must not hold e.mu.
+// recordHistory appends one message when history is enabled.
+// ponytail: received messages are written on the engine goroutine (one fsync
+// per message while history is on); give history its own writer goroutine if
+// that latency ever shows up.
 func (e *Engine) recordHistory(peer PeerID, id MsgID, mine bool, text string, at time.Time) {
 	if !e.cfg.History {
 		return

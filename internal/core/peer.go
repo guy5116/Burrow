@@ -19,7 +19,13 @@ type queued struct {
 	status Status
 }
 
-// peer is one live session plus the per-contact queue and dedup state.
+// maxPendingAcks bounds ACKs waiting for room in the chat queue. A peer that
+// floods TEXT without reading loses ACKs beyond this; it resends after
+// reconnecting and the dedup set makes that harmless.
+const maxPendingAcks = 1024
+
+// peer is the engine's record of one live session. It is owned by the engine
+// goroutine; there is no goroutine per peer in core.
 type peer struct {
 	e        *Engine
 	s        *session.Session
@@ -27,53 +33,23 @@ type peer struct {
 	since    time.Time
 	replaced bool
 
-	// Engine-mutex-guarded.
 	queue     []*queued
+	acks      []uint64 // ACKs not yet queued on the session
 	seen      map[MsgID]struct{}
-	order     []MsgID // ring of the last MsgIDDedupSet received ids
-	stop      chan struct{}
+	order     []MsgID              // ring of the last MsgIDDedupSet received ids
 	transfers map[uint16]*transfer // by stream id
-	sendCh    chan *queued         // ordered outbound TEXTs for this session's sender goroutine
 }
 
 func newPeer(e *Engine, s *session.Session, kind transport.Kind) *peer {
-	return &peer{e: e, s: s, kind: kind, since: e.now(), seen: map[MsgID]struct{}{}, stop: make(chan struct{}), transfers: map[uint16]*transfer{},
-		sendCh: make(chan *queued, wire.MaxQueuedMessages)}
+	return &peer{e: e, s: s, kind: kind, since: e.now(), seen: map[MsgID]struct{}{}, transfers: map[uint16]*transfer{}}
 }
 
-// run pumps inbound frames until the session ends, then handles teardown,
-// queue reversion and reconnect scheduling. Runs on its own goroutine.
-func (p *peer) run() {
-	defer p.e.wg.Done()
-	p.flushQueue()
-	// One sender per session keeps TEXT frames in the order SendText was called.
-	p.e.wg.Add(1)
-	go func() {
-		defer p.e.wg.Done()
-		for {
-			select {
-			case q := <-p.sendCh:
-				if err := p.send(q); err != nil {
-					return
-				}
-			case <-p.s.Done():
-				return
-			}
-		}
-	}()
-	for {
-		select {
-		case in := <-p.s.Inbound():
-			p.handle(in)
-			continue
-		case <-p.s.Done():
-		}
-		break
+// onInboundL handles one frame from a registered session.
+func (e *Engine) onInboundL(in session.Inbound) {
+	p := e.bySession[in.From]
+	if p == nil {
+		return
 	}
-	p.onClosed()
-}
-
-func (p *peer) handle(in session.Inbound) {
 	id := p.s.Peer()
 	switch in.Type {
 	case wire.TypeText:
@@ -86,7 +62,6 @@ func (p *peer) handle(in session.Inbound) {
 			return
 		}
 		mid := MsgID(tx.MsgID)
-		p.e.mu.Lock()
 		_, dup := p.seen[mid]
 		if !dup {
 			p.seen[mid] = struct{}{}
@@ -96,9 +71,11 @@ func (p *peer) handle(in session.Inbound) {
 				p.order = p.order[1:]
 			}
 		}
-		p.e.mu.Unlock()
 		// ACK always (re-sent for duplicates); deliver once.
-		_ = p.s.Send(p.e.sessCtx, wire.TypeAck, wire.AppendAck(nil, wire.Ack{MsgID: tx.MsgID, Status: wire.AckDelivered}))
+		if len(p.acks) < maxPendingAcks {
+			p.acks = append(p.acks, tx.MsgID)
+		}
+		e.sendPendingL(p)
 		if dup {
 			return
 		}
@@ -106,89 +83,77 @@ func (p *peer) handle(in session.Inbound) {
 		if tx.SentAt != 0 {
 			at = time.Unix(tx.SentAt, 0)
 		}
-		p.e.recordHistory(id, mid, false, body, p.e.now())
-		p.e.emit(MessageReceived{Peer: id, ID: mid, Text: body, SentAt: at})
+		e.recordHistory(id, mid, false, body, e.now())
+		e.queueL(MessageReceived{Peer: id, ID: mid, Text: body, SentAt: at})
 	case wire.TypeAck:
 		a, err := wire.DecodeAck(in.Payload)
 		if err != nil {
 			return
 		}
-		p.e.mu.Lock()
-		var hit bool
 		for i, q := range p.queue {
 			if q.id == MsgID(a.MsgID) {
 				p.queue = append(p.queue[:i], p.queue[i+1:]...)
-				hit = true
+				e.queueL(MessageStatus{Peer: id, ID: MsgID(a.MsgID), Status: StatusDelivered})
 				break
 			}
 		}
-		p.e.mu.Unlock()
-		if hit {
-			p.e.emit(MessageStatus{Peer: id, ID: MsgID(a.MsgID), Status: StatusDelivered})
-		}
+		e.sendPendingL(p) // an ACK means the peer is reading: there may be room again
 	case wire.TypeTyping:
-		if !p.e.cfg.Typing {
+		if !e.cfg.Typing {
 			return
 		}
 		st, err := wire.DecodeTyping(in.Payload)
 		if err != nil {
 			return
 		}
-		p.e.emit(Typing{Peer: id, Typing: st == wire.TypingStart})
+		e.queueL(Typing{Peer: id, Typing: st == wire.TypingStart})
 	default:
 		if in.Type.Class() == wire.ClassTransfer {
-			p.e.onStreamInbound(p, in)
+			e.onStreamInboundL(p, in)
 		}
 	}
 }
 
-// flushQueue hands every pending message to the sender in order (after the HELLO exchange).
-func (p *peer) flushQueue() {
-	p.e.mu.Lock()
-	var items []*queued
-	for _, q := range p.queue {
-		if q.status == StatusPending {
-			items = append(items, q)
-		}
-	}
-	p.e.mu.Unlock()
-	for _, q := range items {
-		select {
-		case p.sendCh <- q:
-		default:
+// sendPendingL moves waiting ACKs and pending messages onto the session's
+// chat queue, in order, without ever blocking the engine: what does not fit
+// stays here and is tried again on the next tick or the next ACK.
+func (e *Engine) sendPendingL(p *peer) {
+	for len(p.acks) > 0 {
+		ok, err := p.s.TrySend(wire.TypeAck, wire.AppendAck(nil, wire.Ack{MsgID: p.acks[0], Status: wire.AckDelivered}))
+		if err != nil || !ok {
 			return
 		}
+		p.acks = p.acks[1:]
 	}
-}
-
-func (p *peer) send(q *queued) error {
-	payload, err := wire.AppendText(nil, wire.Text{MsgID: uint64(q.id), SentAt: q.sentAt, Text: []byte(q.text)})
-	if err != nil {
-		return err
-	}
-	if err := p.s.Send(p.e.sessCtx, wire.TypeText, payload); err != nil {
-		return err
-	}
-	p.e.mu.Lock()
-	if q.status == StatusPending {
+	for _, q := range p.queue {
+		if q.status != StatusPending {
+			continue
+		}
+		payload, err := wire.AppendText(nil, wire.Text{MsgID: uint64(q.id), SentAt: q.sentAt, Text: []byte(q.text)})
+		if err != nil {
+			q.status = StatusFailed
+			e.queueL(MessageStatus{Peer: p.s.Peer(), ID: q.id, Status: StatusFailed})
+			continue
+		}
+		ok, err := p.s.TrySend(wire.TypeText, payload)
+		if err != nil || !ok {
+			return // keep the order: nothing later may overtake this one
+		}
 		q.status = StatusSent
+		e.queueL(MessageStatus{Peer: p.s.Peer(), ID: q.id, Status: StatusSent})
 	}
-	p.e.mu.Unlock()
-	p.e.emit(MessageStatus{Peer: p.s.Peer(), ID: q.id, Status: StatusSent})
-	return nil
 }
 
-func (p *peer) close(reason uint8) {
-	p.s.Close(reason)
-}
-
-// onClosed runs once the session is done.
-func (p *peer) onClosed() {
-	id := p.s.Peer()
-	err := p.s.Err()
-	e := p.e
-	e.failPeerTransfers(p)
-	e.mu.Lock()
+// onSessionClosedL runs once a session has fully torn down.
+func (e *Engine) onSessionClosedL(s *session.Session) {
+	p := e.bySession[s]
+	if p == nil {
+		return // never registered (the HELLO exchange failed)
+	}
+	delete(e.bySession, s)
+	id := s.Peer()
+	err := s.Err()
+	e.failPeerTransfersL(p)
 	current := e.peers[id] == p
 	if current {
 		delete(e.peers, id)
@@ -197,35 +162,25 @@ func (p *peer) onClosed() {
 		}
 	}
 	// Every sent-but-undelivered message reverts to pending; the next session resends it.
-	var reverted []MsgID
 	for _, q := range p.queue {
 		if q.status == StatusSent {
 			q.status = StatusPending
-			reverted = append(reverted, q.id)
+			e.queueL(MessageStatus{Peer: id, ID: q.id, Status: StatusPending})
 		}
 	}
 	// Hand the queue to the contact's holding slot so it survives the session.
 	if current {
 		e.orphanQueues[id] = append(e.orphanQueues[id], p.queue...)
 	}
-	c, known := e.contacts[id]
-	var addrs []transport.Address
-	if known {
-		addrs = c.Addrs
-	}
+	p.queue = nil
 	// A BYE "replaced" from the peer means a newer session exists (ours or theirs): not a disconnect.
 	var be *session.ByeError
-	replaced := p.replaced || (errors.As(err, &be) && be.Reason == wire.ByeReplaced)
-	e.mu.Unlock()
-	for _, mid := range reverted {
-		e.emit(MessageStatus{Peer: id, ID: mid, Status: StatusPending})
+	if p.replaced || (errors.As(err, &be) && be.Reason == wire.ByeReplaced) {
+		return
 	}
-	if replaced {
-		return // the replacing session already emitted PeerConnected; no disconnect event
-	}
-	e.emit(PeerDisconnected{Peer: id, Reason: disconnectReason(err)})
-	if current && known && e.cfg.AutoReconnect && len(addrs) > 0 && e.ctx.Err() == nil && shouldReconnect(err) {
-		e.scheduleReconnect(id)
+	e.queueL(PeerDisconnected{Peer: id, Reason: disconnectReason(err)})
+	if c, known := e.contacts[id]; current && known && e.cfg.AutoReconnect && len(c.Addrs) > 0 && e.ctx.Err() == nil && shouldReconnect(err) {
+		e.scheduleReconnectL(id)
 	}
 }
 
@@ -255,57 +210,51 @@ func disconnectReason(err error) string {
 	return "connection lost"
 }
 
-// scheduleReconnect starts (or keeps) one reconnect loop per contact.
-func (e *Engine) scheduleReconnect(id PeerID) {
-	e.mu.Lock()
+// scheduleReconnectL starts (or keeps) one reconnect loop per contact.
+func (e *Engine) scheduleReconnectL(id PeerID) {
 	if _, running := e.reconnects[id]; running {
-		e.mu.Unlock()
 		return
 	}
 	ctx, cancel := context.WithCancel(e.ctx)
 	e.reconnects[id] = cancel
-	e.mu.Unlock()
 	e.wg.Add(1)
-	go func() {
-		defer e.wg.Done()
-		defer func() {
-			e.mu.Lock()
-			if e.reconnects[id] != nil {
-				delete(e.reconnects, id)
-			}
-			e.mu.Unlock()
-		}()
-		backoff := wire.ReconnectMinBackoff
-		for attempt := 1; ; attempt++ {
-			// Full jitter: uniform in [0, backoff].
-			wait := time.Duration(float64(backoff) * float64(e.rand()) / float64(time.Second))
-			e.emit(Reconnecting{Peer: id, Attempt: attempt, NextAt: e.now().Add(wait)})
-			select {
-			case <-time.After(wait):
-			case <-ctx.Done():
-				return
-			}
-			e.mu.Lock()
+	go e.reconnectLoop(ctx, id)
+}
+
+// reconnectLoop dials a contact with exponential backoff and full jitter
+// until it connects, the contact goes away, or the loop is cancelled.
+func (e *Engine) reconnectLoop(ctx context.Context, id PeerID) {
+	defer e.wg.Done()
+	defer e.do(func() { delete(e.reconnects, id) })
+	backoff := wire.ReconnectMinBackoff
+	for attempt := 1; ; attempt++ {
+		// Full jitter: uniform in [0, backoff].
+		wait := time.Duration(float64(backoff) * float64(e.rand()) / float64(time.Second))
+		e.emit(Reconnecting{Peer: id, Attempt: attempt, NextAt: e.now().Add(wait)})
+		select {
+		case <-time.After(wait):
+		case <-ctx.Done():
+			return
+		}
+		var addr transport.Address
+		give := false
+		e.do(func() {
 			c, ok := e.contacts[id]
 			_, online := e.peers[id]
-			var addr transport.Address
-			if ok && len(c.Addrs) > 0 {
-				addr = c.Addrs[0]
-			}
-			blocked := ok && c.Blocked
-			e.mu.Unlock()
-			if !ok || online || blocked || addr.Host == "" {
+			if !ok || online || c.Blocked || len(c.Addrs) == 0 {
+				give = true
 				return
 			}
-			if err := e.dial(ctx, addr, id, nil, ""); err == nil {
-				return
-			}
-			if backoff < wire.ReconnectMaxBackoff {
-				backoff *= 2
-				if backoff > wire.ReconnectMaxBackoff {
-					backoff = wire.ReconnectMaxBackoff
-				}
-			}
+			addr = c.Addrs[0]
+		})
+		if give {
+			return
 		}
-	}()
+		if err := e.dial(ctx, addr, id, nil, ""); err == nil {
+			return
+		}
+		if backoff < wire.ReconnectMaxBackoff {
+			backoff = min(backoff*2, wire.ReconnectMaxBackoff)
+		}
+	}
 }

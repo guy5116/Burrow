@@ -38,7 +38,11 @@ var (
 
 const eventsCap = 256
 
-// Engine is the chat engine.
+// Engine is the chat engine. One goroutine (loop) owns all peer, session,
+// contact, invite and transfer bookkeeping and the event fan-out; every other
+// goroutine reaches that state by handing the engine a closure (do).
+// Functions whose names end in L run on the engine goroutine and must never
+// call do or emit.
 type Engine struct {
 	cfg   Config
 	st    *store.Store
@@ -59,27 +63,41 @@ type Engine struct {
 	wg         sync.WaitGroup
 	events     chan Event
 	done       chan struct{}
+	doneOnce   sync.Once
+
+	// The engine goroutine's inputs.
+	cmds     chan func()           // closures from other goroutines
+	inbound  chan session.Inbound  // frames from every session
+	closedS  chan *session.Session // sessions that finished tearing down
+	emitCh   chan Event            // events raised by other goroutines
+	stop     chan struct{}
+	stopOnce sync.Once
+	loopDone chan struct{}
+	afterMu  sync.Mutex // serializes calls made after the engine goroutine has stopped
+	out      []Event    // events waiting for the UI (engine goroutine only)
 
 	replay   *handshake.ReplayLRU
 	limiters map[transport.Kind]*handshake.FailureLimiter
+	histMu   sync.Mutex // history blobs on disk (not engine state)
 
-	mu        sync.Mutex
-	started   bool
-	contacts  map[PeerID]*Contact
-	invites   map[[16]byte]*inviteRec
-	reserved  map[[16]byte]PeerID // single-use tokens reserved at msg3
-	peers     map[PeerID]*peer
-	pending   int // handshakes in progress
-	listeners []transport.Listener
-	// orphanQueues holds a contact's message queue while no session is live.
-	orphanQueues map[PeerID][]*queued
+	// Owned by the engine goroutine.
+	started      bool
+	contacts     map[PeerID]*Contact
+	invites      map[[16]byte]*inviteRec
+	reserved     map[[16]byte]PeerID // single-use tokens reserved at msg3
+	peers        map[PeerID]*peer
+	bySession    map[*session.Session]*peer // includes replaced sessions until they close
+	pending      int                        // handshakes in progress
+	listeners    []transport.Listener
+	orphanQueues map[PeerID][]*queued // a contact's message queue while no session is live
 	reconnects   map[PeerID]context.CancelFunc
 	transfers    map[TransferID]*transfer
-	histMu       sync.Mutex
 	mdnsSeen     map[[16]byte]bool
 }
 
-// New builds an engine over an unlocked store and the given transports.
+// New builds an engine over an unlocked store and the given transports and
+// starts its goroutine. Call Start to go online, or Close when the engine is
+// only used offline (listing contacts, creating an invite).
 func New(cfg Config, st *store.Store, trs []transport.Transport, logger *slog.Logger) (*Engine, error) {
 	if logger == nil {
 		logger = slog.New(slog.DiscardHandler)
@@ -91,7 +109,12 @@ func New(cfg Config, st *store.Store, trs []transport.Transport, logger *slog.Lo
 	e := &Engine{cfg: cfg, st: st, id: id, trs: map[transport.Kind]transport.Transport{}, log: logger,
 		clock: time.Now, events: make(chan Event, eventsCap), done: make(chan struct{}), replay: handshake.NewReplayLRU(),
 		limiters: map[transport.Kind]*handshake.FailureLimiter{}, reserved: map[[16]byte]PeerID{}, peers: map[PeerID]*peer{},
-		orphanQueues: map[PeerID][]*queued{}, reconnects: map[PeerID]context.CancelFunc{}, transfers: map[TransferID]*transfer{}}
+		bySession: map[*session.Session]*peer{}, orphanQueues: map[PeerID][]*queued{}, reconnects: map[PeerID]context.CancelFunc{},
+		transfers: map[TransferID]*transfer{},
+		cmds:      make(chan func()), inbound: make(chan session.Inbound, wire.ChatQueueCap), closedS: make(chan *session.Session),
+		emitCh: make(chan Event), stop: make(chan struct{}), loopDone: make(chan struct{})}
+	e.ctx, e.cancel = context.WithCancel(context.Background())
+	e.sessCtx, e.sessCancel = context.WithCancel(context.Background())
 	e.rand = func() time.Duration { return time.Duration(randUint64() % uint64(time.Second)) }
 	for _, tr := range trs {
 		e.trs[tr.Kind()] = tr
@@ -110,10 +133,94 @@ func New(cfg Config, st *store.Store, trs []transport.Transport, logger *slog.Lo
 		e.cfg.DataDir = filepath.Dir(st.Dir())
 	}
 	e.cleanPartials()
+	go e.loop()
 	return e, nil
 }
 
 func (e *Engine) now() time.Time { return e.clock().Add(time.Duration(e.clockOffset.Load())) }
+
+// loop is the engine goroutine.
+func (e *Engine) loop() {
+	defer close(e.loopDone)
+	tick := time.NewTicker(wire.ControllerTick)
+	defer tick.Stop()
+	for {
+		e.flushL()
+		select {
+		case fn := <-e.cmds:
+			fn()
+		case in := <-e.inbound:
+			e.onInboundL(in)
+		case s := <-e.closedS:
+			e.onSessionClosedL(s)
+		case ev := <-e.emitCh:
+			e.out = append(e.out, ev)
+		case <-tick.C:
+			for _, p := range e.peers {
+				e.sendPendingL(p)
+			}
+		case <-e.stop:
+			return
+		}
+	}
+}
+
+// flushL hands queued events to the UI. While the UI is slow, typing notices
+// are dropped and everything else waits (§2.3). The engine keeps serving
+// closures meanwhile, so API calls never deadlock against a full event
+// channel, but it takes no frames from peers: the stall becomes backpressure
+// on the readers and on the transfer goroutines.
+func (e *Engine) flushL() {
+	for len(e.out) > 0 {
+		ev := e.out[0]
+		select {
+		case e.events <- ev:
+			e.out = e.out[1:]
+			continue
+		default:
+		}
+		if _, typing := ev.(Typing); typing {
+			e.out = e.out[1:]
+			continue
+		}
+		select {
+		case e.events <- ev:
+			e.out = e.out[1:]
+		case fn := <-e.cmds:
+			fn()
+		case <-e.ctx.Done(): // shutting down: nobody is listening any more
+			e.out = nil
+			return
+		}
+	}
+	e.out = nil
+}
+
+// do runs fn on the engine goroutine and waits for it. After the engine
+// goroutine has stopped, fn runs on the caller under a lock instead.
+func (e *Engine) do(fn func()) {
+	done := make(chan struct{})
+	select {
+	case e.cmds <- func() { defer close(done); fn() }:
+		<-done
+	case <-e.loopDone:
+		e.afterMu.Lock()
+		defer e.afterMu.Unlock()
+		fn()
+	}
+}
+
+// queueL queues an event from code running on the engine goroutine.
+func (e *Engine) queueL(ev Event) { e.out = append(e.out, ev) }
+
+// emit raises an event from any other goroutine. It blocks while the UI is
+// not keeping up, which is what slows the emitting goroutine down.
+func (e *Engine) emit(ev Event) {
+	select {
+	case e.emitCh <- ev:
+	case <-e.ctx.Done():
+	}
+}
 
 // Events is the bounded event channel; drain it on a dedicated goroutine.
 func (e *Engine) Events() <-chan Event { return e.events }
@@ -127,9 +234,6 @@ func (e *Engine) Identity() Identity {
 // Start opens listeners and runs until ctx ends, then shuts down gracefully:
 // BYE to established peers (best effort), listeners closed, secrets cleared.
 func (e *Engine) Start(ctx context.Context) error {
-	e.ctx, e.cancel = context.WithCancel(ctx)
-	defer e.cancel()
-	e.sessCtx, e.sessCancel = context.WithCancel(context.Background())
 	var listeners []transport.Listener
 	for kind, tr := range e.trs {
 		ln, err := tr.Listen(e.ctx)
@@ -143,61 +247,78 @@ func (e *Engine) Start(ctx context.Context) error {
 		e.wg.Add(1)
 		go e.acceptLoop(tr, ln)
 	}
-	e.mu.Lock()
-	e.started = true
-	e.listeners = listeners
-	e.mu.Unlock()
+	e.do(func() {
+		e.started = true
+		e.listeners = listeners
+	})
 	if e.cfg.MDNS {
 		e.runMDNS(e.listenPortOf())
 	}
-	<-e.ctx.Done()
+	select {
+	case <-ctx.Done():
+	case <-e.ctx.Done():
+	}
+	e.cancel()
 	for _, l := range listeners {
 		_ = l.Close()
 	}
-	e.mu.Lock()
-	e.started = false
-	peers := make([]*peer, 0, len(e.peers))
-	for _, p := range e.peers {
-		peers = append(peers, p)
-	}
-	e.mu.Unlock()
+	var sessions []*session.Session
+	e.do(func() {
+		e.started = false
+		for _, p := range e.peers {
+			sessions = append(sessions, p.s)
+		}
+		for _, cancel := range e.reconnects {
+			cancel()
+		}
+	})
 	var wg sync.WaitGroup
-	for _, p := range peers {
+	for _, s := range sessions {
 		wg.Add(1)
-		go func(p *peer) { defer wg.Done(); p.close(wire.ByeShutdown) }(p)
+		go func(s *session.Session) { defer wg.Done(); s.Close(wire.ByeShutdown) }(s)
 	}
 	wg.Wait()
 	e.sessCancel()
 	e.wg.Wait()
-	for _, tr := range e.trs {
-		if c, ok := tr.(interface{ Close() error }); ok {
-			_ = c.Close()
-		}
-	}
-	e.id.Clear()
-	close(e.done)
+	e.Close()
 	return nil
 }
 
-// Done closes once Start has returned; Events is never closed (late emits are dropped).
+// Close stops the engine goroutine, closes transports that need it and wipes
+// the identity. Start calls it on the way out; engines that were never
+// started call it directly.
+func (e *Engine) Close() {
+	e.cancel()
+	e.sessCancel()
+	e.stopOnce.Do(func() { close(e.stop) })
+	<-e.loopDone
+	e.doneOnce.Do(func() {
+		for _, tr := range e.trs {
+			if c, ok := tr.(interface{ Close() error }); ok {
+				_ = c.Close()
+			}
+		}
+		e.id.Clear()
+		close(e.done)
+	})
+}
+
+// Done closes once the engine has shut down; Events is never closed (late emits are dropped).
 func (e *Engine) Done() <-chan struct{} { return e.done }
 
 // ListenAddrs returns the bound listener addresses (valid after Start).
 func (e *Engine) ListenAddrs() []net.Addr {
-	e.mu.Lock()
-	defer e.mu.Unlock()
+	var out []net.Addr
+	e.do(func() { out = e.listenAddrsL() })
+	return out
+}
+
+func (e *Engine) listenAddrsL() []net.Addr {
 	out := make([]net.Addr, 0, len(e.listeners))
 	for _, l := range e.listeners {
 		out = append(out, l.Addr())
 	}
 	return out
-}
-
-func (e *Engine) emit(ev Event) {
-	select {
-	case e.events <- ev:
-	case <-e.ctx.Done():
-	}
 }
 
 func (e *Engine) acceptLoop(tr transport.Transport, ln transport.Listener) {
@@ -209,28 +330,26 @@ func (e *Engine) acceptLoop(tr transport.Transport, ln transport.Listener) {
 		}
 		key := tr.RateKey(conn.RemoteAddr())
 		lim := e.limiters[tr.Kind()]
-		e.mu.Lock()
-		busy := e.pending >= wire.MaxPendingHandshakes || len(e.peers)+e.pending >= e.cfg.maxPeers()
 		limited := lim.Limited(key, e.now())
-		if tr.Kind() == transport.KindTor && limited {
-			limited = e.pending >= wire.TorLimitedSlots
-		}
-		if !busy && !limited {
-			e.pending++
-		}
-		e.mu.Unlock()
-		if busy || limited {
+		admit := false
+		e.do(func() {
+			busy := e.pending >= wire.MaxPendingHandshakes || len(e.peers)+e.pending >= e.cfg.maxPeers()
+			if tr.Kind() == transport.KindTor && limited {
+				limited = e.pending >= wire.TorLimitedSlots
+			}
+			if !busy && !limited {
+				e.pending++
+				admit = true
+			}
+		})
+		if !admit {
 			_ = conn.Close()
 			continue
 		}
 		e.wg.Add(1)
 		go func() {
 			defer e.wg.Done()
-			defer func() {
-				e.mu.Lock()
-				e.pending--
-				e.mu.Unlock()
-			}()
+			defer e.do(func() { e.pending-- })
 			e.serve(tr, conn, key, lim)
 		}()
 	}
@@ -262,63 +381,52 @@ func stageOf(err error) string {
 	return "unknown"
 }
 
-// authorize implements §4.6 for the responder. Runs on the accept goroutine.
+// authorize implements §4.6 for the responder. Called on a handshake goroutine.
 func (e *Engine) authorize(p PeerID, tok *[16]byte) handshake.Decision {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	if c, ok := e.contacts[p]; ok {
-		if c.Blocked {
-			return handshake.Reject
+	d := handshake.Reject
+	e.do(func() {
+		if c, ok := e.contacts[p]; ok {
+			if !c.Blocked {
+				d = handshake.Accept // a present token is ignored, never consumed
+			}
+			return
 		}
-		return handshake.Accept // a present token is ignored, never consumed
-	}
-	if tok == nil {
-		return handshake.Reject
-	}
-	inv, ok := e.invites[*tok]
-	if !ok || !e.now().Before(inv.Expiry) {
-		return handshake.Reject
-	}
-	if len(e.contacts) >= wire.MaxContacts || (inv.MultiUse && inv.Uses >= wire.MaxContactsPerInvite) {
-		return handshake.Reject
-	}
-	if !inv.MultiUse {
-		if _, taken := e.reserved[*tok]; taken {
-			return handshake.Reject
+		if tok == nil {
+			return
 		}
-		e.reserved[*tok] = p
-	}
-	return handshake.Accept
+		inv, ok := e.invites[*tok]
+		if !ok || !e.now().Before(inv.Expiry) {
+			return
+		}
+		if len(e.contacts) >= wire.MaxContacts || (inv.MultiUse && inv.Uses >= wire.MaxContactsPerInvite) {
+			return
+		}
+		if !inv.MultiUse {
+			if _, taken := e.reserved[*tok]; taken {
+				return
+			}
+			e.reserved[*tok] = p
+		}
+		d = handshake.Accept
+	})
+	return d
 }
 
 func (e *Engine) releaseToken(tok *[16]byte) {
 	if tok == nil {
 		return
 	}
-	e.mu.Lock()
-	delete(e.reserved, *tok)
-	e.mu.Unlock()
+	e.do(func() { delete(e.reserved, *tok) })
 }
 
 // Connect dials an invite or a saved contact and returns once the session is
 // established (both HELLOs) or fails.
 func (e *Engine) Connect(ctx context.Context, target Target) (PeerID, error) {
-	e.mu.Lock()
-	started := e.started
-	e.mu.Unlock()
-	if !started {
-		return PeerID{}, ErrNotRunning
-	}
-	var addr transport.Address
-	var peerID PeerID
-	var token *[16]byte
-	var inviteID string
 	if target.InviteBytes != nil {
 		defer clear(target.InviteBytes)
 	}
-	switch {
-	case target.InviteBytes != nil, target.Invite != "":
-		var inv *invite.Invite
+	var inv *invite.Invite
+	if target.InviteBytes != nil || target.Invite != "" {
 		var err error
 		if target.InviteBytes != nil {
 			inv, err = invite.ParseBytes(target.InviteBytes)
@@ -331,47 +439,51 @@ func (e *Engine) Connect(ctx context.Context, target Target) (PeerID, error) {
 		if inv.Expired(e.now()) {
 			return PeerID{}, errors.New("core: invite has expired")
 		}
-		addr = transport.Address{Kind: kindOf(inv.Kind), Host: inv.Addr, Port: inv.Port}
-		peerID = inv.PubKey
-		e.mu.Lock()
-		c, known := e.contacts[peerID]
-		e.mu.Unlock()
-		if known && c.Blocked {
-			return peerID, ErrBlocked
-		}
-		if !known {
-			e.mu.Lock()
-			full := len(e.contacts) >= wire.MaxContacts
-			e.mu.Unlock()
-			if full {
-				return peerID, ErrContactLimit
-			}
-			t := inv.Token
-			token = &t
-			inviteID = "peer"
-		}
-	case target.Contact != nil:
-		peerID = *target.Contact
-		e.mu.Lock()
-		c, ok := e.contacts[peerID]
-		if ok {
-			if c.Blocked {
-				e.mu.Unlock()
-				return peerID, ErrBlocked
-			}
-			if len(c.Addrs) > 0 {
-				addr = c.Addrs[0]
-			}
-		}
-		e.mu.Unlock()
-		if !ok {
-			return peerID, ErrUnknownContact
-		}
-		if addr.Host == "" {
-			return peerID, ErrNoAddress
-		}
-	default:
+	}
+	if inv == nil && target.Contact == nil {
 		return PeerID{}, errors.New("core: empty target")
+	}
+	var addr transport.Address
+	var peerID PeerID
+	var token *[16]byte
+	var inviteID string
+	var err error
+	e.do(func() {
+		if !e.started {
+			err = ErrNotRunning
+			return
+		}
+		if inv != nil {
+			addr = transport.Address{Kind: kindOf(inv.Kind), Host: inv.Addr, Port: inv.Port}
+			peerID = inv.PubKey
+			c, known := e.contacts[peerID]
+			switch {
+			case known && c.Blocked:
+				err = ErrBlocked
+			case !known && len(e.contacts) >= wire.MaxContacts:
+				err = ErrContactLimit
+			case !known:
+				t := inv.Token
+				token = &t
+				inviteID = "peer"
+			}
+			return
+		}
+		peerID = *target.Contact
+		c, ok := e.contacts[peerID]
+		switch {
+		case !ok:
+			err = ErrUnknownContact
+		case c.Blocked:
+			err = ErrBlocked
+		case len(c.Addrs) == 0:
+			err = ErrNoAddress
+		default:
+			addr = c.Addrs[0]
+		}
+	})
+	if err != nil {
+		return peerID, err
 	}
 	return peerID, e.dial(ctx, addr, peerID, token, inviteID)
 }
@@ -390,18 +502,18 @@ func (e *Engine) dial(ctx context.Context, addr transport.Address, peerID PeerID
 	if !ok {
 		return ErrNoTransport
 	}
-	e.mu.Lock()
-	if len(e.peers)+e.pending >= e.cfg.maxPeers() {
-		e.mu.Unlock()
+	full := false
+	e.do(func() {
+		if len(e.peers)+e.pending >= e.cfg.maxPeers() {
+			full = true
+			return
+		}
+		e.pending++
+	})
+	if full {
 		return ErrTooManyPeers
 	}
-	e.pending++
-	e.mu.Unlock()
-	defer func() {
-		e.mu.Lock()
-		e.pending--
-		e.mu.Unlock()
-	}()
+	defer e.do(func() { e.pending-- })
 	conn, err := tr.Dial(ctx, addr)
 	if err != nil {
 		e.emit(HandshakeFailed{Peer: peerID, Stage: "dial", Reason: "could not connect"})
@@ -417,7 +529,7 @@ func (e *Engine) dial(ctx context.Context, addr transport.Address, peerID PeerID
 		e.emit(HandshakeFailed{Peer: peerID, Stage: "hello", Reason: reasonOf(err)})
 		return err
 	}
-	e.rememberAddr(peerID, addr)
+	e.do(func() { e.rememberAddrL(peerID, addr) })
 	return nil
 }
 
@@ -429,16 +541,16 @@ func reasonOf(err error) string {
 	return "they may be offline, may have blocked you, or their key may have changed (a fresh invite would be needed)"
 }
 
-// establish wraps an authenticated conn in a session, runs the HELLO
-// exchange, then applies token consumption, contact creation, name-collision
-// and replacement/glare rules. token is the responder-side presented token.
+// establish wraps an authenticated conn in a session, runs the HELLO exchange
+// on the calling (handshake) goroutine, then asks the engine goroutine to
+// register the peer. token is the responder-side presented token.
 func (e *Engine) establish(conn net.Conn, kind transport.Kind, res *handshake.Result, token *[16]byte, inviteID string) error {
 	hello := wire.Hello{Name: []byte(e.cfg.DisplayName), Features: wire.FeatureImages | wire.FeatureAnimatedGIF, MaxImage: e.cfg.maxImage()}
 	if e.cfg.Typing {
 		hello.Features |= wire.FeatureTyping
 	}
 	s, err := session.New(session.Config{Conn: conn, Root: res.Root, Initiator: res.Initiator, Self: e.id,
-		Peer: res.Peer, Hello: hello, Logger: e.log})
+		Peer: res.Peer, Hello: hello, Logger: e.log, Inbound: e.inbound, OnClose: e.sessionClosed})
 	if err != nil {
 		_ = conn.Close()
 		e.releaseToken(token)
@@ -461,103 +573,119 @@ func (e *Engine) establish(conn net.Conn, kind transport.Kind, res *handshake.Re
 		e.releaseToken(token)
 		return err
 	}
-	p := newPeer(e, s, kind)
+	var old *session.Session
+	reason := uint8(wire.ByeLocalError)
+	e.do(func() { old, reason, err = e.registerL(s, kind, res, token, inviteID, name) })
+	if err != nil {
+		s.Close(reason)
+		return err
+	}
+	if old != nil {
+		old.Close(wire.ByeReplaced)
+	}
+	return nil
+}
 
-	e.mu.Lock()
+// registerL applies token consumption, contact creation, the name-collision
+// check and the replacement/glare rules, installs the peer and lets its frames
+// flow. It returns the session this one replaces, if any. On error the caller
+// closes s with the returned BYE reason.
+func (e *Engine) registerL(s *session.Session, kind transport.Kind, res *handshake.Result, token *[16]byte, inviteID, name string) (*session.Session, uint8, error) {
+	if token != nil {
+		defer delete(e.reserved, *token)
+	}
+	select {
+	case <-s.Done(): // died after its HELLO; its OnClose has fired or will find nothing
+		return nil, wire.ByeLocalError, s.Err()
+	default:
+	}
 	// Token consumption and contact creation (§4.6), both HELLOs validated.
 	var newContact *Contact
 	var collision *NameCollision
 	var consumedID string
-	if _, known := e.contacts[res.Peer]; !known {
+	c, known := e.contacts[res.Peer]
+	switch {
+	case known && c.Blocked:
+		return nil, wire.ByeLocalError, ErrBlocked
+	case !known:
+		if token == nil && inviteID == "" {
+			return nil, wire.ByeLocalError, ErrUnknownContact // authorize rejects these; be safe
+		}
+		if len(e.contacts) >= wire.MaxContacts {
+			return nil, wire.ByeResourceLimit, ErrContactLimit
+		}
 		if token != nil {
 			inv, ok := e.invites[*token]
 			if !ok || !e.now().Before(inv.Expiry) {
-				e.mu.Unlock()
-				delete(e.reserved, *token)
-				s.Close(wire.ByeLocalError)
-				return errors.New("core: invite vanished during handshake")
+				return nil, wire.ByeLocalError, errors.New("core: invite vanished during handshake")
 			}
 			inv.Uses++
-			consumedID = inv.ID
-			inviteID = inv.ID
+			consumedID, inviteID = inv.ID, inv.ID
 			if !inv.MultiUse {
 				delete(e.invites, *token)
 			}
-			delete(e.reserved, *token)
 			_ = e.saveInvites()
 		}
-		if inviteID != "" || token != nil {
-			// Only the side that issued the invite knows its id; the side that used
-			// one records none ("peer" above only marks "create the contact").
-			if res.Initiator {
-				inviteID = ""
-			}
-			if len(e.contacts) >= wire.MaxContacts {
-				e.mu.Unlock()
-				s.Close(wire.ByeResourceLimit)
-				return ErrContactLimit
-			}
-			newContact, collision = e.addContactLocked(res.Peer, name, inviteID)
+		// Only the side that issued the invite knows its id; the side that used
+		// one records none ("peer" only marks "create the contact").
+		if res.Initiator {
+			inviteID = ""
 		}
-	} else if c := e.contacts[res.Peer]; c.Blocked {
-		e.mu.Unlock()
-		s.Close(wire.ByeLocalError)
-		return ErrBlocked
-	}
-	if newContact == nil {
-		if _, known := e.contacts[res.Peer]; !known {
-			// Unknown peer without an invite path cannot happen (authorize rejects), but be safe.
-			e.mu.Unlock()
-			s.Close(wire.ByeLocalError)
-			return ErrUnknownContact
-		}
+		newContact, collision = e.addContactL(res.Peer, name, inviteID)
 	}
 	// Replacement / glare (§12).
+	var replaced *session.Session
 	if old, ok := e.peers[res.Peer]; ok {
 		if e.now().Sub(old.since) < wire.GlareWindow {
 			// True simultaneous dial: keep the session whose initiator has the smaller key.
 			keepNew := initiatorKey(e.id.Public(), res.Peer, res.Initiator) < initiatorKey(e.id.Public(), res.Peer, old.s.Initiator())
 			if !keepNew {
-				e.mu.Unlock()
-				s.Close(wire.ByeReplaced)
-				return errors.New("core: lost simultaneous-dial glare")
+				return nil, wire.ByeReplaced, errors.New("core: lost simultaneous-dial glare")
 			}
 		}
 		old.replaced = true
-		e.peers[res.Peer] = p
-		e.mu.Unlock()
-		old.close(wire.ByeReplaced)
-		e.mu.Lock()
-		if e.peers[res.Peer] != p { // lost a race with yet another session
-			e.mu.Unlock()
-			s.Close(wire.ByeReplaced)
-			return errors.New("core: replaced")
-		}
-	} else {
-		e.peers[res.Peer] = p
+		replaced = old.s
 	}
+	p := newPeer(e, s, kind)
+	e.peers[res.Peer] = p
+	e.bySession[s] = p
 	e.contacts[res.Peer].Online = true
+	if replaced != nil {
+		// Unacknowledged messages of the replaced session move over right away.
+		old := e.bySession[replaced]
+		for _, q := range old.queue {
+			q.status = StatusPending
+		}
+		p.queue = append(p.queue, old.queue...)
+		old.queue = nil
+	}
 	p.queue = append(p.queue, e.orphanQueues[res.Peer]...)
 	delete(e.orphanQueues, res.Peer)
 	if cancel := e.reconnects[res.Peer]; cancel != nil {
 		cancel()
 		delete(e.reconnects, res.Peer)
 	}
-	e.mu.Unlock()
-
 	if newContact != nil {
-		e.emit(NewPeerViaInvite{Peer: res.Peer, Nickname: newContact.Nickname, InviteID: inviteID})
+		e.queueL(NewPeerViaInvite{Peer: res.Peer, Nickname: newContact.Nickname, InviteID: inviteID})
 	}
 	if consumedID != "" {
-		e.emit(InviteConsumed{ID: consumedID})
+		e.queueL(InviteConsumed{ID: consumedID})
 	}
 	if collision != nil {
-		e.emit(*collision)
+		e.queueL(*collision)
 	}
-	e.emit(PeerConnected{Peer: res.Peer, Initiator: res.Initiator, Transport: kind, Name: name})
-	e.wg.Add(1)
-	go p.run()
-	return nil
+	e.queueL(PeerConnected{Peer: res.Peer, Initiator: res.Initiator, Transport: kind, Name: name})
+	s.Attach()
+	e.sendPendingL(p)
+	return replaced, 0, nil
+}
+
+// sessionClosed is the session's OnClose hook: it tells the engine goroutine.
+func (e *Engine) sessionClosed(s *session.Session) {
+	select {
+	case e.closedS <- s:
+	case <-e.loopDone:
+	}
 }
 
 // initiatorKey returns the public key of the initiator of a session between us and peer.
@@ -568,9 +696,9 @@ func initiatorKey(self, peer PeerID, weInitiated bool) string {
 	return string(peer[:])
 }
 
-// addContactLocked creates a contact with the default nickname and runs the
-// name-collision check. Caller holds e.mu.
-func (e *Engine) addContactLocked(id PeerID, helloName, inviteID string) (*Contact, *NameCollision) {
+// addContactL creates a contact with the default nickname and runs the
+// name-collision check.
+func (e *Engine) addContactL(id PeerID, helloName, inviteID string) (*Contact, *NameCollision) {
 	nick := helloName
 	if nick == "" {
 		nick = id.Short()
@@ -594,9 +722,7 @@ func (e *Engine) addContactLocked(id PeerID, helloName, inviteID string) (*Conta
 	return c, coll
 }
 
-func (e *Engine) rememberAddr(id PeerID, addr transport.Address) {
-	e.mu.Lock()
-	defer e.mu.Unlock()
+func (e *Engine) rememberAddrL(id PeerID, addr transport.Address) {
 	c, ok := e.contacts[id]
 	if !ok {
 		return

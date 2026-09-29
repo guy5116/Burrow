@@ -42,7 +42,19 @@ What we cannot wipe:
 - Swap: in the default build secrets may be paged to disk. The `memguard` build (below)
   locks the identity key; every other secret is still ordinary memory.
   `debug.FreeOSMemory()` after Argon2 returns its 64 MiB to the OS but does not scrub it.
-- Secrets are never stored in Go strings (immutable, unwipeable).
+- Keys, chain state, the master key and passphrases typed at a terminal prompt are never
+  held in Go strings (immutable, unwipeable). An invite read from the `connect` prompt or
+  from a pipe stays in bytes from the terminal to the parser and is wiped after use.
+- Secrets that **do** pass through Go strings, because a UI toolkit or the user's own
+  input line holds them, and therefore stay in memory until the garbage collector reuses
+  the space:
+  - the passphrase typed into the desktop app's unlock, wizard and passphrase-change
+    fields (Fyne's entry widget stores text as a string; we convert to bytes and wipe our
+    copy, the widget's copy is out of reach);
+  - an invite typed or pasted into a UI: `/connect <invite>` in the chat, the desktop
+    app's paste-invite field, and an invite given as a command-line argument;
+  - an invite we issued, while it is displayed (`/invite`, the invite dialog, the QR code).
+  Prefer `burrow connect` with no argument, or `connect -`, when that matters.
 
 Core dumps are disabled at startup by both `burrow` and `burrow-gui`
 (`store.HardenProcess`): on Linux `RLIMIT_CORE = 0` and `PR_SET_DUMPABLE = 0`, on macOS

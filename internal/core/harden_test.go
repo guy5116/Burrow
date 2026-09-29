@@ -202,7 +202,7 @@ func TestCorruptStateBlobs(t *testing.T) {
 	if err != nil || len(e2.Invites()) != 0 {
 		t.Fatal(err)
 	}
-	e2.id.Clear()
+	e2.Close()
 }
 
 func TestPartialCleanupRules(t *testing.T) {

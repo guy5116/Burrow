@@ -242,9 +242,7 @@ func TestImageResume(t *testing.T) {
 	b.e.chunkHook = func(tr *transfer, n uint32) {
 		if n == 20 && !killed {
 			killed = true
-			a.e.mu.Lock()
-			p := a.e.peers[b.id()]
-			a.e.mu.Unlock()
+			p := a.peerOf(b.id())
 			go p.s.Close(wire.ByeLocalError) // A's "local error": B keeps the partial and reconnects
 		}
 	}

@@ -75,6 +75,7 @@ func (a *app) cmdRun(ctx context.Context, cmd string, args []string, stdin io.Re
 	if err != nil {
 		return exitErr(stderr, err)
 	}
+	defer e.Close() // Start closes the engine too; this covers a failed Start
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	errc := make(chan error, 1)

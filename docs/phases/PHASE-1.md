@@ -17,7 +17,7 @@
   cannot rekey").
 - `internal/transport` interface with `RateKey`, `tcp` transport (keepalives, dual-stack),
   `conformance` suite.
-- `internal/core`: engine over a mutex (see below); invites (reserve at msg3, consume after
+- `internal/core`: engine (a mutex at first, one engine goroutine since the Phase 5 fixes); invites (reserve at msg3, consume after
   both HELLOs, multi-use caps); contacts with name-collision check; message queue with
   dedup, ACK re-send, sent→pending reversion and in-order resend with original ids; session
   replacement and simultaneous-dial glare; per-transport failure rate limiting; graceful
@@ -33,8 +33,9 @@
 
 ## Unspecified choices / deviations (conservative option each time)
 
-- §2.3 describes "one engine goroutine"; the engine uses one mutex over its bookkeeping and
-  never blocks while holding it. Same guarantees, less code.
+- §2.3 describes "one engine goroutine"; Phase 1 used one mutex over the bookkeeping
+  instead. **Replaced in Phase 5** by the single engine goroutine the spec describes (see
+  docs/phases/PHASE-5.md).
 - Reconnect only after a lost connection or BYE reason 2/4; never after a deliberate BYE,
   local close, block/remove, or a protocol violation (limits presence beacons).
 - Per-frame allocation budget is 8 per direction, the stdlib floor (`hmac.New` 5, two `Sum`
@@ -42,7 +43,7 @@
 - `flynn/noise` generates the handshake ephemeral itself; we wipe it via `LocalEphemeral()`
   (SECURITY.md). Handshake returns only `root_0`; `session.deriveChains` derives epoch 0.
 - `Send` on a session blocks under backpressure with a context; `core.SendText` returns
-  immediately and sends on a goroutine.
+  immediately (since Phase 5 the engine goroutine queues the frame without blocking).
 - HELLO exchange timeout reuses `HandshakeTimeout` (10 s).
 - Nickname rename: 1–64 characters after Name-profile sanitization.
 - Invite host: `--host`, then `invite_host` config, then the first non-loopback IPv4.

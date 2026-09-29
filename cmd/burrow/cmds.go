@@ -156,6 +156,7 @@ func (a *app) cmdInvite(ctx context.Context, args []string, stdin io.Reader, std
 	if err != nil {
 		return exitErr(stderr, err)
 	}
+	defer e.Close()
 	inv, err := e.CreateInvite(core.InviteOptions{Host: h, TTL: *ttl, MultiUse: *multi})
 	if err != nil {
 		return exitErr(stderr, err)
@@ -193,6 +194,7 @@ func (a *app) cmdContacts(args []string, stdin io.Reader, stdout, stderr io.Writ
 	if err != nil {
 		return exitErr(stderr, err)
 	}
+	defer e.Close()
 	c := common.NewController(e, "")
 	var line string
 	switch args[0] {
@@ -306,6 +308,7 @@ func (a *app) cmdBurn(stdin io.Reader, stdout, stderr io.Writer) int {
 	if err != nil {
 		return exitErr(stderr, err)
 	}
+	defer e.Close()
 	n, err := e.Burn()
 	if err != nil {
 		return exitErr(stderr, err)

@@ -64,5 +64,35 @@ scalar in locked, guarded, read-only memory when built with `-tags memguard`
 (`hold_memguard.go`); the default build is unchanged (`hold_default.go`). A failure to lock
 is an error, never a silent fallback. CI builds and tests the tagged variant.
 
-Still not done: the supervisor recovers panics in tests as well as in production (§12
-asks for panics to fail tests).
+## Spec deviations and test gaps closed (second audit, 2026-09-29)
+
+| Item | Spec | Fix |
+|---|---|---|
+| Engine used a mutex, plus a pump and a sender goroutine per peer | §2.3 | One engine goroutine owns peers, sessions, contacts, invites, transfers and the event fan-out. Other goroutines hand it closures. Sessions deliver into one shared channel and report their end through `OnClose`. TEXT and ACK are queued from the engine without blocking and retried on a 1 s tick |
+| Session had a fourth goroutine for teardown | §2.3 | Exactly reader, writer, controller; the last one to exit wipes the secrets |
+| Image chunks passed through the engine | §2.3, §11 | The reader hands chunk data straight to the transfer's file-writer (`SetChunkSink`) |
+| Two goroutines per outgoing transfer | §2.3 | One file-reader runs both stripping passes |
+| Slow screen handling undefined | §2.3 | Typing notices are dropped when the event channel is full; nothing else is. Progress events wait on the transfer's own goroutine, which is the backpressure on chunks. API calls keep working while the screen is stalled (`TestSlowConsumerDropsOnlyTyping`) |
+| Panics recovered under `go test` | §12 | Re-raised in tests (`TestPanicsFailTests`) |
+| Contact cap not checked when dialing | §3.3 | `ErrContactLimit` before any network action |
+| Invites travelled as strings | §1.3, §3.6 | Bytes from the prompt to the parser, wiped after use; the remaining string-held secrets are listed in SECURITY.md |
+| iTerm2 had no inline preview | §9.4 | Half-block previews for iTerm2 and true-colour terminals |
+| GUI thumbnail not clickable | §10.1 | Click opens the viewer |
+| goleak missing in handshake, media, mdns | §13.9 | Added |
+| Fuzz targets for PONG, REKEY_DONE, REKEY_REQUEST | §13.4 | Added with seeds |
+| Receiver trusting the declared format untested | §13.3 | `TestReceiverIgnoresDeclaredFormat` |
+| `make bench` not in CI | §11 | Pull requests compare base and head on one runner |
+| Desktop app memory unmeasured | §11 | `TestGUIFootprint` (runs only with `BURROW_GUI_FOOTPRINT=1`, it opens a window) |
+
+`go 1.26` is the minimum, by the user's decision; CLAUDE.md §1.2 says so.
+
+## Known issues
+
+- **The desktop app misses the 150 MiB budget on the development machine: 172–179 MiB**
+  idle with one peer (AMD Radeon, Mesa radeonsi, Wayland). Breakdown: ≈ 79 MiB anonymous
+  (Go heap ≈ 25–30 MiB, the rest allocated by the graphics driver), ≈ 72 MiB file-backed
+  (shared libraries, mostly Mesa and LLVM), ≈ 23 MiB shared buffers. Garbage-collector
+  tuning (GOGC 25, a 32 MiB memory limit) saves about 6 MiB, so it was not added. The
+  part Burrow controls is small; the budget or the metric is the user's call.
+- History, when enabled, writes each received message on the engine goroutine (one
+  fsync per message). Marked `ponytail:` in `internal/core/history.go`.

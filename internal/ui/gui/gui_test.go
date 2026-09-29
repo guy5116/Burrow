@@ -42,7 +42,7 @@ func newApp(t *testing.T) *App {
 	a.e = e
 	a.ctl = common.NewController(e, "127.0.0.1")
 	a.buildMain()
-	t.Cleanup(func() { st.Close() })
+	t.Cleanup(func() { e.Close(); st.Close() })
 	return a
 }
 
