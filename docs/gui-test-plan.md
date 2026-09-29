@@ -47,7 +47,7 @@ same LAN or loopback with a different data directory.
     bubble with the saved path. Drag a PNG onto the window → same flow.
 14. Open the saved file with `exiftool`: no EXIF/GPS/XMP/ICC. Thumbnail click → viewer
     window; "1:1" toggles between fit and actual size.
-15. Reject an offer → sender sees "image transfer to <nick> failed: rejected: declined".
+15. Reject an offer → sender sees "transfer to <nick> failed: rejected: declined".
     Leave an offer unanswered 10 minutes → it auto-rejects.
 16. Kill the receiving instance mid-transfer of a large image, relaunch, reconnect,
     re-send → the transfer completes and the file is intact (partials folder empty).
@@ -64,3 +64,18 @@ same LAN or loopback with a different data directory.
     2 s. No process remains; the lock is released (`burrow id` works immediately).
 20. Idle with one peer for 20 minutes → still connected (rekeys happened silently:
     `--log-level debug` shows no errors).
+
+## Files that are not images
+
+1. Click **File**, choose a `.zip` of a few MiB → the peer sees a "File offered" dialog
+   that states the size first and the type `.zip`; Reject is the default button.
+2. Accept → the conversation shows "file saved: …/file-<code>.zip". No thumbnail, no
+   viewer. The saved name contains nothing of the original name.
+3. Drag a `.pdf` onto the window → same flow. Drag a `.jpg` → it arrives as an image
+   with a thumbnail, and its EXIF data is gone.
+4. Settings → "Largest file" `1`, restart, have the peer send a 2 MiB file → the peer
+   sees "too large" at once and no dialog appears here.
+5. Settings → "Largest file" `0`, restart → the peer's attempt fails with "peer does
+   not accept files"; images still work.
+6. With "Auto-accept images from verified contacts" on and the peer verified, a file
+   still opens the dialog.

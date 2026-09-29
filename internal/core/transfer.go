@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"image"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -24,6 +25,7 @@ var (
 	ErrUnknownTransfer = errors.New("core: unknown transfer")
 	ErrNotOffered      = errors.New("core: transfer is not awaiting a decision")
 	ErrPeerNoImages    = errors.New("core: peer does not accept images")
+	ErrPeerNoFiles     = errors.New("core: peer does not accept files")
 	ErrNoSpace         = errors.New("core: not enough free disk space")
 	ErrOffline         = errors.New("core: contact is not connected")
 )
@@ -37,7 +39,7 @@ const (
 	metaBlobVersion = 1
 )
 
-// transfer is one image transfer in either direction. Fields written after
+// transfer is one transfer of an image or another file, in either direction. Fields written after
 // creation belong to the engine goroutine, except lastProg, which belongs to
 // the transfer's own file-reader or file-writer goroutine.
 type transfer struct {
@@ -52,6 +54,7 @@ type transfer struct {
 	width    uint32
 	height   uint32
 	caption  string
+	ext      string // files only
 	chunks   uint32
 
 	// outgoing
@@ -78,6 +81,7 @@ type metaRec struct {
 	Size     uint64 `json:"size"`
 	Hash     string `json:"hash"`
 	Format   uint8  `json:"format"`
+	Ext      string `json:"ext,omitempty"`
 	Dest     string `json:"dest"`
 	Complete uint32 `json:"complete"`
 }
@@ -139,7 +143,7 @@ func (e *Engine) metaRel(id TransferID) string {
 
 func (e *Engine) writeMeta(t *transfer, complete uint32) error {
 	m := metaRec{Version: metaBlobVersion, ID: hex.EncodeToString(t.id[:]), Peer: hex.EncodeToString(t.peer[:]),
-		Size: t.size, Hash: hex.EncodeToString(t.hash[:]), Format: t.format, Dest: t.destDir, Complete: complete}
+		Size: t.size, Hash: hex.EncodeToString(t.hash[:]), Format: t.format, Ext: t.ext, Dest: t.destDir, Complete: complete}
 	b, err := json.Marshal(m)
 	if err != nil {
 		return err
@@ -183,12 +187,41 @@ func (e *Engine) livePeer(id PeerID) (p *peer, err error) {
 // passes run on one file-reader goroutine; the returned id is valid
 // immediately.
 func (e *Engine) SendImage(ctx context.Context, id PeerID, path string, caption string) (TransferID, error) {
+	return e.send(id, path, caption, false)
+}
+
+// SendFile offers any file. A supported image goes through SendImage, so its
+// metadata is stripped; everything else is sent byte for byte, and only its
+// extension is revealed, never its name.
+func (e *Engine) SendFile(ctx context.Context, id PeerID, path string, caption string) (TransferID, error) {
+	return e.send(id, path, caption, !isImage(path))
+}
+
+// isImage reports whether path starts like a supported image format.
+func isImage(path string) bool {
+	f, err := os.Open(path) // #nosec G304 -- user-chosen file
+	if err != nil {
+		return false
+	}
+	defer func() { _ = f.Close() }()
+	head := make([]byte, media.SniffLen)
+	n, _ := io.ReadFull(f, head)
+	_, err = media.Sniff(head[:n])
+	return err == nil
+}
+
+func (e *Engine) send(id PeerID, path, caption string, raw bool) (TransferID, error) {
 	p, err := e.livePeer(id)
 	if err != nil {
 		return TransferID{}, err
 	}
 	ph := p.s.PeerHello()
-	if ph.Features&wire.FeatureImages == 0 {
+	switch {
+	case raw && e.cfg.maxFile() == 0:
+		return TransferID{}, errors.New("core: file transfer is turned off (max_file_mib is 0)")
+	case raw && ph.Features&wire.FeatureFiles == 0:
+		return TransferID{}, ErrPeerNoFiles
+	case !raw && ph.Features&wire.FeatureImages == 0:
 		return TransferID{}, ErrPeerNoImages
 	}
 	cap, err := text.Sanitize([]byte(caption), text.SingleLine)
@@ -199,6 +232,9 @@ func (e *Engine) SendImage(ctx context.Context, id PeerID, path string, caption 
 		return TransferID{}, errors.New("core: caption too long")
 	}
 	limit := min(e.cfg.maxImage(), ph.MaxImage)
+	if raw {
+		limit = min(e.cfg.maxFile(), ph.MaxFile)
+	}
 	mode := media.ModeStrip
 	if e.cfg.Paranoid {
 		mode = media.ModeParanoid
@@ -211,7 +247,13 @@ func (e *Engine) SendImage(ctx context.Context, id PeerID, path string, caption 
 	e.wg.Add(1)
 	go func() { // file-reader
 		defer e.wg.Done()
-		prep, err := media.Prepare(path, mode, limit)
+		var prep media.Prepared
+		var err error
+		if raw {
+			prep, err = media.PrepareFile(path, limit)
+		} else {
+			prep, err = media.Prepare(path, mode, limit)
+		}
 		if err == nil && prep.Animated && ph.Features&wire.FeatureAnimatedGIF == 0 {
 			err = errAnimatedUnsupported
 		}
@@ -238,7 +280,7 @@ func (e *Engine) SendImage(ctx context.Context, id PeerID, path string, caption 
 				e.failTransferL(t, "connection lost")
 				return
 			}
-			t.prep, t.size, t.hash, t.format = prep, prep.Size, prep.Hash, prep.Format
+			t.prep, t.size, t.hash, t.format, t.ext = prep, prep.Size, prep.Hash, prep.Format, prep.Ext
 			t.width, t.height = uint32(prep.Width), uint32(prep.Height)          // #nosec G115 -- gated ≤ 16384
 			t.chunks = uint32((prep.Size + wire.ChunkData - 1) / wire.ChunkData) // #nosec G115 -- Size ≤ limit from Prepare
 			t.stream, t.owner = stream, p
@@ -248,12 +290,17 @@ func (e *Engine) SendImage(ctx context.Context, id PeerID, path string, caption 
 		if !live {
 			return
 		}
+		typ := wire.TypeImgOffer
 		offer, err := wire.AppendImgOffer(nil, wire.ImgOffer{Size: prep.Size, Format: prep.Format, Width: t.width, Height: t.height, Hash: prep.Hash, Caption: []byte(cap)})
+		if raw {
+			typ = wire.TypeFileOffer
+			offer, err = wire.AppendFileOffer(nil, wire.FileOffer{Size: prep.Size, Hash: prep.Hash, Ext: []byte(prep.Ext), Caption: []byte(cap)})
+		}
 		if err != nil {
 			e.failTransfer(t, "bad offer")
 			return
 		}
-		if err := p.s.SendStream(e.sessCtx, stream, wire.TypeImgOffer, offer); err != nil {
+		if err := p.s.SendStream(e.sessCtx, stream, typ, offer); err != nil {
 			e.failTransfer(t, "connection lost")
 			return
 		}
@@ -274,7 +321,9 @@ func redactMediaErr(err error) string {
 	case errors.Is(err, media.ErrUnsupported):
 		return "unsupported image format"
 	case errors.Is(err, media.ErrTooLarge):
-		return "image too large"
+		return "too large: over your size limit or the one your contact allows"
+	case errors.Is(err, media.ErrEmpty):
+		return "file is empty"
 	case errors.Is(err, media.ErrAnimated):
 		return "animated WebP is not supported"
 	case errors.Is(err, media.ErrCorrupt):
@@ -319,7 +368,7 @@ func (e *Engine) forgetL(t *transfer) bool {
 
 func (e *Engine) finishTransferL(t *transfer, path string) {
 	if e.forgetL(t) {
-		e.queueL(TransferDone{Peer: TransferPeer{Peer: t.peer, Outgoing: t.outgoing}, ID: t.id, Path: path})
+		e.queueL(TransferDone{Peer: TransferPeer{Peer: t.peer, Outgoing: t.outgoing}, ID: t.id, Path: path, Image: t.format != FormatFile})
 	}
 }
 
@@ -372,9 +421,10 @@ func (e *Engine) streamOut(p *peer, t *transfer, start uint32) {
 
 // --- receiver side ---
 
-// onOfferL gates an incoming IMG_OFFER and reports ImageOffered (or rejects
-// it). REJECT is a terminal frame: the session queues it without blocking.
-func (e *Engine) onOfferL(p *peer, stream uint16, o wire.ImgOffer) {
+// onOfferL gates an incoming offer and reports ImageOffered (or rejects it).
+// o.Format is FormatFile for a file offer, whose size limit is the file
+// limit. REJECT is a terminal frame: the session queues it without blocking.
+func (e *Engine) onOfferL(p *peer, stream uint16, o wire.ImgOffer, ext string) {
 	caption, err := text.Sanitize(o.Caption, text.SingleLine)
 	if err != nil {
 		return
@@ -382,16 +432,20 @@ func (e *Engine) onOfferL(p *peer, stream uint16, o wire.ImgOffer) {
 	reject := func(reason uint8) {
 		_ = p.s.SendStream(e.sessCtx, stream, wire.TypeImgReject, wire.AppendImgReject(nil, reason))
 	}
-	if o.Size > e.cfg.maxImage() {
+	limit := e.cfg.maxImage()
+	if o.Format == FormatFile {
+		limit = e.cfg.maxFile()
+	}
+	if o.Size > limit { // over our limit: refused before the user is asked
 		reject(wire.RejectTooLarge)
 		return
 	}
-	if media.CheckDimensions(int(o.Width), int(o.Height)) != nil {
+	if o.Format != FormatFile && media.CheckDimensions(int(o.Width), int(o.Height)) != nil {
 		reject(wire.RejectUnsupported)
 		return
 	}
 	t := &transfer{peer: p.s.Peer(), owner: p, stream: stream, size: o.Size, hash: o.Hash, format: o.Format, width: o.Width,
-		height: o.Height, caption: caption, chunkCh: make(chan []byte, fileChunkQueue), doneCh: make(chan struct{}, 1), stop: make(chan struct{})}
+		height: o.Height, caption: caption, ext: ext, chunkCh: make(chan []byte, fileChunkQueue), doneCh: make(chan struct{}, 1), stop: make(chan struct{})}
 	if _, err := randomFill(t.id[:]); err != nil {
 		reject(wire.RejectUnsupported)
 		return
@@ -399,8 +453,9 @@ func (e *Engine) onOfferL(p *peer, stream uint16, o wire.ImgOffer) {
 	t.chunks = uint32((o.Size + wire.ChunkData - 1) / wire.ChunkData) // #nosec G115 -- Size ≤ maxImage checked above
 	e.transfers[t.id] = t
 	p.transfers[stream] = t
-	e.queueL(ImageOffered{Peer: t.peer, ID: t.id, Size: o.Size, Format: o.Format, Width: o.Width, Height: o.Height, Caption: caption})
-	if c := e.contacts[t.peer]; e.cfg.AutoAcceptFromVerified && c != nil && c.Verified {
+	e.queueL(ImageOffered{Peer: t.peer, ID: t.id, Size: o.Size, Format: o.Format, Ext: ext, Width: o.Width, Height: o.Height, Caption: caption})
+	// Auto-accept covers images only: a file is always the user's decision.
+	if c := e.contacts[t.peer]; e.cfg.AutoAcceptFromVerified && c != nil && c.Verified && o.Format != FormatFile {
 		t.accepted = true
 		e.wg.Add(1)
 		go func() { // this transfer's file-writer
@@ -634,8 +689,17 @@ func (e *Engine) fileWriter(p *peer, t *transfer, start uint32) {
 }
 
 // placeImage renames the verified .part to <dest>/img-<hash8>.<ext>, with the
-// extension from the sniffed bytes and -2, -3… on collision.
+// extension from the sniffed bytes and -2, -3… on collision. A file that is
+// not an image becomes file-<hash8>.<ext> with the extension its offer
+// carried (the wire codec admits a–z and 0–9 only), or .bin without one.
 func (e *Engine) placeImage(t *transfer) (string, error) {
+	if t.format == FormatFile {
+		ext := t.ext
+		if ext == "" {
+			ext = "bin"
+		}
+		return placeAs(t, "file-"+hex.EncodeToString(t.hash[:4]), ext)
+	}
 	head := make([]byte, media.SniffLen)
 	f, err := os.Open(t.partPath) // #nosec G304 -- our partials dir
 	if err != nil {
@@ -647,13 +711,16 @@ func (e *Engine) placeImage(t *transfer) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	base := "img-" + hex.EncodeToString(t.hash[:4])
+	return placeAs(t, "img-"+hex.EncodeToString(t.hash[:4]), media.Ext(format))
+}
+
+func placeAs(t *transfer, base, ext string) (string, error) {
 	for i := 1; i < 1000; i++ {
 		name := base
 		if i > 1 {
 			name = fmt.Sprintf("%s-%d", base, i)
 		}
-		dest := filepath.Join(t.destDir, name+"."+media.Ext(format))
+		dest := filepath.Join(t.destDir, name+"."+ext)
 		if _, err := os.Stat(dest); err == nil {
 			continue
 		}
@@ -708,9 +775,15 @@ func (e *Engine) CancelTransfer(id TransferID) error {
 // onStreamInboundL routes IMG_* frames for one peer. IMG_CHUNK never comes
 // through here: the reader hands chunk data to the file-writer directly.
 func (e *Engine) onStreamInboundL(p *peer, in session.Inbound) {
-	if in.Type == wire.TypeImgOffer {
+	switch in.Type {
+	case wire.TypeImgOffer:
 		if o, err := wire.DecodeImgOffer(in.Payload); err == nil {
-			e.onOfferL(p, in.Stream, o)
+			e.onOfferL(p, in.Stream, o, "")
+		}
+		return
+	case wire.TypeFileOffer:
+		if o, err := wire.DecodeFileOffer(in.Payload); err == nil {
+			e.onOfferL(p, in.Stream, wire.ImgOffer{Size: o.Size, Format: FormatFile, Hash: o.Hash, Caption: o.Caption}, string(o.Ext))
 		}
 		return
 	}
@@ -776,12 +849,17 @@ func (e *Engine) failPeerTransfersL(p *peer) {
 // DecodeImage safely loads a saved image for display, downscaled to fit
 // maxSide (0 = full size). Call it off the UI thread.
 func DecodeImage(path string, maxSide int) (image.Image, error) {
+	if st, err := os.Stat(path); err != nil {
+		return nil, err
+	} else if uint64(st.Size()) > wire.MaxImageDecodeBytes { // #nosec G115 -- a size is not negative
+		return nil, media.ErrTooLarge
+	}
+	if !isImage(path) { // a received file of another kind is never read into memory
+		return nil, media.ErrUnsupported
+	}
 	data, err := os.ReadFile(path) // #nosec G304 -- path came from TransferDone
 	if err != nil {
 		return nil, err
-	}
-	if uint64(len(data)) > wire.MaxImageDecodeBytes {
-		return nil, media.ErrTooLarge
 	}
 	img, _, err := media.Decode(data)
 	if err != nil {

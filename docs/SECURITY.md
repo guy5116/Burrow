@@ -71,6 +71,14 @@ Core dumps are disabled at startup by both `burrow` and `burrow-gui`
   `github.com/atotto/clipboard`, which executes `xclip`/`xsel`/`wl-paste`/`pbpaste`. That is
   a local, user-triggered action; Burrow never writes to the clipboard on its own.
 
+## Received files
+
+A file that is not an image is written to disk exactly as received, under a name Burrow
+picks (`file-<hash8>.<ext>`). The extension is the sender's claim, limited to eight
+characters from `a–z0–9`; it is never used to decide anything. Burrow does not open,
+execute, decode, preview or scan received files. Treat a file from an unverified contact
+like an e-mail attachment from a stranger.
+
 ## At-rest protection
 
 - Mode 1: master key = Argon2id(passphrase, salt) with t=3, m=64 MiB, p=4, computed once

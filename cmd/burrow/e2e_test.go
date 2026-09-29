@@ -388,3 +388,76 @@ func TestReadmeFlow(t *testing.T) {
 		t.Fatal(list)
 	}
 }
+
+// Two real processes: a file that is not an image is offered with its size and
+// type, nothing is downloaded before /accept, the name never travels, and a
+// receiver's max_file_mib keeps larger files away.
+func TestEndToEndFile(t *testing.T) {
+	if testing.Short() {
+		t.Skip("spawns processes")
+	}
+	run := func(home string, args ...string) {
+		t.Helper()
+		full := append([]string{"--config", home, "--data", home}, args...)
+		if out, err := exec.CommandContext(context.Background(), binPath, full...).CombinedOutput(); err != nil {
+			t.Fatalf("%v: %v\n%s", args, err, out)
+		}
+	}
+	a := newProc(t, "", "listen", "--listen", "127.0.0.1:0", "--host", "127.0.0.1")
+	a.wait("Ready", is("Ready"))
+	a.send("/invite 127.0.0.1")
+	inv := a.wait("invite", func(m map[string]any) bool {
+		s, _ := m["text"].(string)
+		return m["event"] == "Output" && strings.HasPrefix(s, "burrow1:")
+	})["text"].(string)
+	// B accepts files of at most 1 MiB.
+	bHome := t.TempDir()
+	run(bHome, "init", "--insecure-no-passphrase")
+	run(bHome, "config", "set", "max_file_mib", "1")
+	b := newProc(t, bHome, "listen", "--listen", "127.0.0.1:0")
+	bFP := b.wait("Ready", is("Ready"))["fingerprint"].(string)
+	b.send("/connect " + inv)
+	b.wait("PeerConnected", is("PeerConnected"))
+	a.wait("PeerConnected", is("PeerConnected"))
+
+	dir := t.TempDir()
+	small := filepath.Join(dir, "secret-project-name.zip")
+	data := append([]byte("PK\x03\x04"), bytes.Repeat([]byte("burrow "), 40000)...)
+	if err := os.WriteFile(small, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	huge := filepath.Join(dir, "huge.rar")
+	if err := os.WriteFile(huge, make([]byte, 1<<20+1), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	a.send("/to " + bFP[:12])
+	a.send("/file " + huge)
+	a.wait("too large", func(m map[string]any) bool {
+		r, _ := m["reason"].(string)
+		return m["event"] == "TransferFailed" && strings.HasPrefix(r, "too large")
+	})
+	a.send("/file " + small + " the archive")
+	off := b.wait("ImageOffered", is("ImageOffered"))
+	if off["format"] != "file" || off["ext"] != "zip" || off["size"] != float64(len(data)) || off["number"] != float64(1) {
+		t.Fatalf("%v", off) // the oversized file never produced an offer: this one is number 1
+	}
+	if parts, _ := filepath.Glob(filepath.Join(b.home, "partials", "*")); len(parts) != 0 {
+		t.Fatal("downloaded before /accept")
+	}
+	b.send("/transfers")
+	b.wait("listing", func(m map[string]any) bool {
+		s, _ := m["text"].(string)
+		return m["event"] == "Output" && strings.Contains(s, "a file: 273 KiB, type .zip")
+	})
+	b.send("/accept 1")
+	done := b.wait("TransferDone", is("TransferDone"))
+	path := done["path"].(string)
+	if done["image"] != false || !strings.HasSuffix(path, ".zip") || strings.Contains(path, "secret") {
+		t.Fatalf("%v", done)
+	}
+	if got, err := os.ReadFile(path); err != nil || !bytes.Equal(got, data) {
+		t.Fatal("received file differs", err)
+	}
+	b.send("/quit")
+	a.send("/quit")
+}

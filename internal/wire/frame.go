@@ -89,7 +89,7 @@ func (t FrameType) Class() StreamClass {
 	case TypeText, TypeAck, TypeTyping:
 		return ClassChat
 	case TypeImgOffer, TypeImgAccept, TypeImgReject, TypeImgChunk,
-		TypeImgDone, TypeImgResult, TypeImgCancel:
+		TypeImgDone, TypeImgResult, TypeImgCancel, TypeFileOffer:
 		return ClassTransfer
 	}
 	return ClassUnknown

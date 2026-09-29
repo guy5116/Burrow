@@ -16,6 +16,7 @@ import (
 	"fyne.io/fyne/v2/widget"
 
 	"github.com/guy5116/burrow/internal/core"
+	"github.com/guy5116/burrow/internal/ui/common"
 )
 
 // buildMain lays out sidebar + conversation + composer + status bar.
@@ -63,7 +64,7 @@ func (a *App) buildMain() {
 	a.composer.OnSubmitted = func(s string) { a.sendText(s) }
 	send := widget.NewButtonWithIcon("Send", theme.MailSendIcon(), func() { a.sendText(a.composer.Text) })
 	send.Importance = widget.HighImportance
-	imgBtn := widget.NewButtonWithIcon("Image", theme.FileImageIcon(), a.pickImage)
+	imgBtn := widget.NewButtonWithIcon("File", theme.FileIcon(), a.pickImage)
 	bottom := container.NewBorder(nil, nil, nil, container.NewHBox(imgBtn, send), a.composer)
 	a.status = widget.NewLabel("")
 	a.updateStatus()
@@ -263,14 +264,17 @@ func (a *App) apply(ev core.Event) {
 		// progress continues from the checkpoint; nothing to show
 	case core.TransferProgress:
 		if !e.Peer.Outgoing {
-			a.status.SetText(fmt.Sprintf("receiving image: %d%%", e.Done*100/max(e.Size, 1)))
+			a.status.SetText(fmt.Sprintf("receiving: %d%% of %s", e.Done*100/max(e.Size, 1), common.Size(e.Size)))
 		}
 	case core.TransferDone:
 		a.updateStatus()
-		if e.Peer.Outgoing {
-			a.addRow(e.Peer.Peer, &row{kind: rowSystem, text: "image delivered"})
-		} else {
+		switch {
+		case e.Peer.Outgoing:
+			a.addRow(e.Peer.Peer, &row{kind: rowSystem, text: common.Kind(e.Image) + " delivered"})
+		case e.Image:
 			a.addRow(e.Peer.Peer, &row{kind: rowImage, path: e.Path})
+		default: // never displayed, never opened
+			a.addRow(e.Peer.Peer, &row{kind: rowSystem, text: "file saved: " + e.Path})
 		}
 	case core.TransferFailed:
 		a.updateStatus()

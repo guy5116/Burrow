@@ -194,7 +194,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case evMsg:
 		m.ctl.Observe(msg.ev)
 		m.onEvent(msg.ev)
-		if d, ok := msg.ev.(core.TransferDone); ok && !d.Peer.Outgoing && common.DetectTerminal() != common.TermNone {
+		if d, ok := msg.ev.(core.TransferDone); ok && d.Image && !d.Peer.Outgoing && common.DetectTerminal() != common.TermNone {
 			m.render()
 			return m, m.inline(d.Peer.Peer, d.Path, common.DetectTerminal())
 		}
@@ -229,12 +229,15 @@ func (m *model) onEvent(ev core.Event) {
 			m.logs[e.Peer] = append(m.logs[e.Peer], dim.Render(line))
 		}
 	case core.ImageOffered:
-		m.logs[e.Peer] = append(m.logs[e.Peer], bold.Render(fmt.Sprintf("* image offer #%d: %s %s %d×%d%s — /accept %d or /reject %d",
-			m.ctl.Number(e.ID), common.Size(e.Size), common.FormatName(e.Format), e.Width, e.Height, captionOf(e.Caption), m.ctl.Number(e.ID), m.ctl.Number(e.ID))))
+		m.logs[e.Peer] = append(m.logs[e.Peer], bold.Render(fmt.Sprintf("* offer #%d, %s%s — /accept %d or /reject %d",
+			m.ctl.Number(e.ID), common.Offer(e), captionOf(e.Caption), m.ctl.Number(e.ID), m.ctl.Number(e.ID))))
 	case core.TransferDone:
-		if e.Peer.Outgoing {
-			m.logs[e.Peer.Peer] = append(m.logs[e.Peer.Peer], dim.Render("* image delivered"))
-		} else {
+		switch {
+		case e.Peer.Outgoing:
+			m.logs[e.Peer.Peer] = append(m.logs[e.Peer.Peer], dim.Render("* "+common.Kind(e.Image)+" delivered"))
+		case !e.Image:
+			m.logs[e.Peer.Peer] = append(m.logs[e.Peer.Peer], "* file saved: "+e.Path)
+		default:
 			n := len(m.ctl.Images())
 			m.logs[e.Peer.Peer] = append(m.logs[e.Peer.Peer], fmt.Sprintf("* image saved: %s  (/view %d)", e.Path, n))
 		}

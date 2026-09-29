@@ -86,6 +86,28 @@ is an error, never a silent fallback. CI builds and tests the tagged variant.
 
 `go 1.26` is the minimum, by the user's decision; CLAUDE.md §1.2 says so.
 
+## File transfer (added 2026-09-29 at the user's request)
+
+Built: `FILE_OFFER` (0x27) and `max_file` in HELLO (feature bit 3); `Engine.SendFile`;
+`/file` in the chat and a File button plus drag-and-drop in the desktop app;
+`max_file_mib` (default 100, 0 refuses files); offers that state the size first
+everywhere, including `/transfers`; resume for files; `TestEndToEndFile` with two
+processes; `FuzzFileOfferDecode` with a seed.
+
+Choices made without asking, each the more private or more cautious option:
+
+- **Protocol v1 was amended in place** instead of starting v2, because nothing has been
+  released. HELLO grew by eight bytes, so builds from before this change cannot talk to
+  builds after it.
+- **The file name is never sent**, only an extension of at most eight characters from
+  `a–z0–9`, checked by the wire codec. Received files are named `file-<hash8>.<ext>`.
+- **Images given to `/file` are still stripped**; only other files go byte for byte.
+- **Auto-accept never applies to files.**
+- An offer of a kind the receiver did not advertise now closes the session. This also
+  applies to image offers, which the spec already required but the code did not check.
+- Offer sizes above 1 TiB do not decode (chunk indexes are 32 bits).
+- Received files share the image folder (`image_dir`); there is no separate setting.
+
 ## Known issues
 
 - The desktop app idles at 172–179 MiB with one peer on the development machine (AMD

@@ -32,7 +32,7 @@ func newAdv(t *testing.T, sessionIsInitiator, hello bool) *adv {
 	cs, cp := net.Pipe()
 	ctx, cancel := context.WithCancel(context.Background())
 	s, err := New(Config{Conn: cs, Root: root, Initiator: sessionIsInitiator, Self: self, Peer: other.Public(),
-		Hello: wire.Hello{}, Logger: slog.Default(), Tick: time.Hour})
+		Hello: testHello(""), Logger: slog.Default(), Tick: time.Hour})
 	if err != nil {
 		t.Fatal(err)
 	}

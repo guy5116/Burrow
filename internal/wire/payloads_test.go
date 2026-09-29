@@ -2,6 +2,7 @@ package wire
 
 import (
 	"bytes"
+	"encoding/binary"
 	"errors"
 	"testing"
 )
@@ -14,12 +15,12 @@ func mustOK(t *testing.T, err error) {
 }
 
 func TestHello(t *testing.T) {
-	h := Hello{Features: FeatureImages | FeatureTyping, MaxImage: 1 << 20, Name: []byte("Zoë")}
+	h := Hello{Features: FeatureImages | FeatureTyping | FeatureFiles, MaxImage: 1 << 20, MaxFile: 1 << 30, Name: []byte("Zoë")}
 	p, err := AppendHello(nil, h)
 	mustOK(t, err)
 	got, err := DecodeHello(p)
 	mustOK(t, err)
-	if got.Features != h.Features || got.MaxImage != h.MaxImage || !bytes.Equal(got.Name, h.Name) {
+	if got.Features != h.Features || got.MaxImage != h.MaxImage || got.MaxFile != h.MaxFile || !bytes.Equal(got.Name, h.Name) {
 		t.Fatalf("%+v", got)
 	}
 	// default HELLO: no features, no image, empty name
@@ -35,7 +36,9 @@ func TestHello(t *testing.T) {
 		h    Hello
 		err  error
 	}{
-		{"reserved-bit", Hello{Features: 1 << 3}, ErrValue},
+		{"reserved-bit", Hello{Features: 1 << 4}, ErrValue},
+		{"files-no-max", Hello{Features: FeatureFiles}, ErrValue},
+		{"max-no-files", Hello{MaxFile: 5}, ErrValue},
 		{"high-bit", Hello{Features: 1 << 63}, ErrValue},
 		{"images-no-max", Hello{Features: FeatureImages}, ErrValue},
 		{"max-no-images", Hello{MaxImage: 5}, ErrValue},
@@ -51,11 +54,11 @@ func TestHello(t *testing.T) {
 		t.Fatal(err)
 	}
 	p, _ = AppendHello(nil, Hello{Name: []byte("ab")})
-	p[16] = 1 // name_len lies
+	p[24] = 1 // name_len lies
 	if _, err := DecodeHello(p); !errors.Is(err, ErrTrailing) {
 		t.Fatal(err)
 	}
-	p[16] = 40
+	p[24] = 40
 	if _, err := DecodeHello(p); !errors.Is(err, ErrTrailing) {
 		t.Fatal(err)
 	}
@@ -63,7 +66,7 @@ func TestHello(t *testing.T) {
 		t.Fatal(err)
 	}
 	long, _ := AppendHello(nil, Hello{Name: make([]byte, 32)})
-	long[16] = 33
+	long[24] = 33
 	long = append(long, 0)
 	if _, err := DecodeHello(long); !errors.Is(err, ErrTooLarge) {
 		t.Fatal(err)
@@ -176,6 +179,69 @@ func TestAck(t *testing.T) {
 	}
 	if _, err := DecodeAck(make([]byte, 10)); !errors.Is(err, ErrTrailing) {
 		t.Fatal(err)
+	}
+}
+
+func TestFileOffer(t *testing.T) {
+	o := FileOffer{Size: 5 << 30, Ext: []byte("7z"), Caption: []byte("backups")}
+	for i := range o.Hash {
+		o.Hash[i] = byte(i)
+	}
+	p, err := AppendFileOffer(nil, o)
+	mustOK(t, err)
+	got, err := DecodeFileOffer(p)
+	mustOK(t, err)
+	if got.Size != o.Size || got.Hash != o.Hash || !bytes.Equal(got.Ext, o.Ext) || !bytes.Equal(got.Caption, o.Caption) {
+		t.Fatalf("%+v", got)
+	}
+	for _, bad := range []FileOffer{{Size: 1, Ext: make([]byte, MaxFileExt+1)}, {Size: 1, Caption: make([]byte, MaxCaptionBytes+1)}} {
+		if _, err := AppendFileOffer(nil, bad); !errors.Is(err, ErrTooLarge) {
+			t.Fatal(err)
+		}
+	}
+	try := func(mod func(*FileOffer), want error) {
+		t.Helper()
+		x := o
+		mod(&x)
+		p, _ := AppendFileOffer(nil, x)
+		if _, err := DecodeFileOffer(p); !errors.Is(err, want) {
+			t.Fatalf("got %v want %v", err, want)
+		}
+	}
+	try(func(x *FileOffer) { x.Size = 0 }, ErrValue)
+	try(func(x *FileOffer) { x.Ext = nil }, nil)
+	try(func(x *FileOffer) { x.Caption = nil }, nil)
+	try(func(x *FileOffer) { x.Caption = []byte{0xff} }, ErrUTF8)
+	// The extension becomes part of a file name: only a–z and 0–9 are legal.
+	for _, ext := range []string{"ZIP", "a.b", "../x", "a/b", "a\\b", "a b", "é", "a\x00"} {
+		try(func(x *FileOffer) { x.Ext = []byte(ext) }, ErrValue)
+	}
+	if _, err := DecodeFileOffer(p[:fileOfferFixed-1]); !errors.Is(err, ErrShort) {
+		t.Fatal(err)
+	}
+	if _, err := DecodeFileOffer(append(append([]byte(nil), p...), 0)); !errors.Is(err, ErrTrailing) {
+		t.Fatal(err)
+	}
+	q := append([]byte(nil), p...)
+	q[8+HashSize] = MaxFileExt + 1 // ext_len lies
+	if _, err := DecodeFileOffer(q); !errors.Is(err, ErrTooLarge) {
+		t.Fatal("oversized extension accepted")
+	}
+	// The extension claims more bytes than the payload holds.
+	short, _ := AppendFileOffer(nil, FileOffer{Size: 1})
+	short[8+HashSize] = 4
+	if _, err := DecodeFileOffer(short); !errors.Is(err, ErrShort) {
+		t.Fatal(err)
+	}
+	// caption_len beyond the limit, with the bytes to match.
+	long, _ := AppendFileOffer(nil, FileOffer{Size: 1, Caption: make([]byte, MaxCaptionBytes)})
+	long = append(long, 0)
+	binary.BigEndian.PutUint16(long[fileOfferFixed-2:], MaxCaptionBytes+1)
+	if _, err := DecodeFileOffer(long); !errors.Is(err, ErrTooLarge) {
+		t.Fatal(err)
+	}
+	if _, err := DecodeFileOffer(append((&[8]byte{0xff})[:], p[8:]...)); !errors.Is(err, ErrValue) {
+		t.Fatal("a size above MaxTransferSize decoded")
 	}
 }
 
@@ -337,6 +403,8 @@ func TestHandshakePayloads(t *testing.T) {
 func FuzzHelloDecode(f *testing.F) {
 	p, _ := AppendHello(nil, Hello{Features: FeatureImages, MaxImage: 1, Name: []byte("n")})
 	f.Add(p)
+	p, _ = AppendHello(nil, Hello{Features: FeatureImages | FeatureFiles, MaxImage: 1, MaxFile: 2})
+	f.Add(p)
 	f.Add([]byte{})
 	f.Fuzz(func(t *testing.T, b []byte) {
 		h, err := DecodeHello(b)
@@ -398,6 +466,28 @@ func FuzzTypingDecode(f *testing.F) {
 	f.Add([]byte{1})
 	f.Fuzz(func(t *testing.T, b []byte) {
 		if s, err := DecodeTyping(b); err == nil && !bytes.Equal(AppendTyping(nil, s), b) {
+			t.Fatal("re-encode")
+		}
+	})
+}
+
+func FuzzFileOfferDecode(f *testing.F) {
+	p, _ := AppendFileOffer(nil, FileOffer{Size: 1, Ext: []byte("zip"), Caption: []byte("c")})
+	f.Add(p)
+	p, _ = AppendFileOffer(nil, FileOffer{Size: 1 << 40})
+	f.Add(p)
+	f.Add([]byte{})
+	f.Fuzz(func(t *testing.T, b []byte) {
+		o, err := DecodeFileOffer(b)
+		if err != nil {
+			return
+		}
+		for _, c := range o.Ext {
+			if (c < 'a' || c > 'z') && (c < '0' || c > '9') {
+				t.Fatalf("extension byte %#x accepted", c)
+			}
+		}
+		if re, err := AppendFileOffer(nil, o); err != nil || !bytes.Equal(re, b) {
 			t.Fatal("re-encode")
 		}
 	})

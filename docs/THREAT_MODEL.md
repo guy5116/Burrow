@@ -20,6 +20,7 @@ invites; the fact that two specific peers talk, and when; partial transfers on d
 | Image metadata leakage | EXIF/XMP/ICC/IPTC/comments stripped in every format; orientation applied then dropped; no filenames or timestamps on the wire; opaque `img-<hash8>` file names; paranoid mode re-encodes to drop encoder fingerprints | done |
 | Disk theft | Identity, contacts, invites, transfer metadata encrypted under an Argon2id-derived key (or a random key in `--insecure-no-passphrase` mode); no history by default; no core dumps (Linux/macOS) | Phase 0/1 |
 | Terminal/UI injection and name spoofing | Sanitization of every peer string (`internal/text`); NFKC + case-fold normalization for the name-collision check | Phase 0 |
+| Unwanted or oversized files | `max_file_mib` is advertised in HELLO and enforced on both sides; 0 refuses files entirely; an offer over the limit is rejected before the user is asked; every prompt shows the size first; nothing is downloaded before an explicit accept; free disk space is checked; auto-accept never applies to files; the extension is restricted to `a–z0–9` by the wire codec, so a peer cannot choose a path | done |
 | Memory exhaustion, decompression bombs | Hard caps before allocation (frame ≤ 65,552 bytes, rejected before the body is read); bounded queues; per-peer stream/offer caps; image dimension gates and GIF pre-scan before any decode; two-decode semaphore; nothing downloaded before an explicit accept | done |
 | A second local process corrupting the store | Exclusive lock on `store/lock` | Phase 0 |
 
@@ -41,6 +42,11 @@ invites; the fact that two specific peers talk, and when; partial transfers on d
 - Quantum attacks on authentication in *new* sessions (revisit with ML-DSA in v2).
 - IP exposure to the peer in direct-TCP mode (use the Tor transport to hide it).
 - Encoder fingerprints inside images in `strip` mode (`paranoid` mode removes them).
+- Metadata inside files that are not images: author and software fields in documents,
+  names and timestamps of files inside an archive. Such files are sent byte for byte.
+  Their own name and timestamps are never sent; their extension is.
+- What a received file does once the user opens it. Burrow never opens, runs, decodes
+  or previews one, and saves it under a name it chose itself.
 - Store rollback from backups resurrecting a consumed single-use invite token.
 - Perfect memory zeroization under Go's GC or inside library objects; secrets in swap
   (the opt-in `memguard` build keeps the identity key out of swap, nothing else).

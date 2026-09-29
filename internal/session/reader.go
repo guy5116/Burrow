@@ -129,7 +129,7 @@ func (s *Session) dispatch(in wire.Inner) error {
 			return nil // drop, do not close
 		}
 		s.typingTimes = append(s.typingTimes, now)
-	case wire.TypeImgOffer, wire.TypeImgAccept, wire.TypeImgReject, wire.TypeImgChunk, wire.TypeImgDone, wire.TypeImgResult, wire.TypeImgCancel:
+	case wire.TypeImgOffer, wire.TypeFileOffer, wire.TypeImgAccept, wire.TypeImgReject, wire.TypeImgChunk, wire.TypeImgDone, wire.TypeImgResult, wire.TypeImgCancel:
 		return s.onStreamFrame(in)
 	default:
 		return ErrProtocol

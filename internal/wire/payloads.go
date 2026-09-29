@@ -13,6 +13,7 @@ import (
 type Hello struct {
 	Features uint64
 	MaxImage uint64
+	MaxFile  uint64 // largest file accepted, in bytes; 0 iff FeatureFiles is clear
 	Name     []byte // ≤ MaxHelloName bytes, valid UTF-8; sanitized by core
 }
 
@@ -23,18 +24,19 @@ func AppendHello(dst []byte, h Hello) ([]byte, error) {
 	}
 	dst = binary.BigEndian.AppendUint64(dst, h.Features)
 	dst = binary.BigEndian.AppendUint64(dst, h.MaxImage)
+	dst = binary.BigEndian.AppendUint64(dst, h.MaxFile)
 	dst = append(dst, byte(len(h.Name))) // #nosec G115 -- ≤ MaxHelloName checked above
 	return append(dst, h.Name...), nil
 }
 
 // DecodeHello parses and validates a HELLO payload.
 func DecodeHello(p []byte) (Hello, error) {
-	if len(p) < 17 {
+	if len(p) < helloFixed {
 		return Hello{}, ErrShort
 	}
-	h := Hello{Features: binary.BigEndian.Uint64(p), MaxImage: binary.BigEndian.Uint64(p[8:])}
-	n := int(p[16])
-	if len(p) != 17+n {
+	h := Hello{Features: binary.BigEndian.Uint64(p), MaxImage: binary.BigEndian.Uint64(p[8:]), MaxFile: binary.BigEndian.Uint64(p[16:])}
+	n := int(p[24])
+	if len(p) != helloFixed+n {
 		return Hello{}, ErrTrailing
 	}
 	if n > MaxHelloName {
@@ -43,15 +45,17 @@ func DecodeHello(p []byte) (Hello, error) {
 	if h.Features&^FeatureMask != 0 {
 		return Hello{}, ErrValue
 	}
-	if (h.Features&FeatureImages == 0) != (h.MaxImage == 0) {
+	if (h.Features&FeatureImages == 0) != (h.MaxImage == 0) || (h.Features&FeatureFiles == 0) != (h.MaxFile == 0) {
 		return Hello{}, ErrValue
 	}
-	h.Name = p[17:]
+	h.Name = p[helloFixed:]
 	if !utf8.Valid(h.Name) {
 		return Hello{}, ErrUTF8
 	}
 	return h, nil
 }
+
+const helloFixed = 8 + 8 + 8 + 1
 
 // AppendPing appends a PING payload (nonce).
 func AppendPing(dst []byte, nonce uint64) []byte { return binary.BigEndian.AppendUint64(dst, nonce) }
@@ -179,6 +183,69 @@ func AppendImgOffer(dst []byte, o ImgOffer) ([]byte, error) {
 	return append(dst, o.Caption...), nil
 }
 
+// FileOffer is the FILE_OFFER payload: a file sent byte for byte. Only an
+// extension travels, never a name.
+type FileOffer struct {
+	Size    uint64
+	Hash    [HashSize]byte
+	Ext     []byte // ≤ MaxFileExt bytes, a–z and 0–9 only; may be empty
+	Caption []byte // ≤ MaxCaptionBytes, valid UTF-8, sanitized by core
+}
+
+const fileOfferFixed = 8 + HashSize + 1 + 2
+
+// AppendFileOffer appends a FILE_OFFER payload.
+func AppendFileOffer(dst []byte, o FileOffer) ([]byte, error) {
+	if len(o.Ext) > MaxFileExt || len(o.Caption) > MaxCaptionBytes {
+		return dst, ErrTooLarge
+	}
+	dst = binary.BigEndian.AppendUint64(dst, o.Size)
+	dst = append(dst, o.Hash[:]...)
+	dst = append(dst, byte(len(o.Ext))) // #nosec G115 -- ≤ MaxFileExt checked above
+	dst = append(dst, o.Ext...)
+	dst = binary.BigEndian.AppendUint16(dst, uint16(len(o.Caption))) // #nosec G115 -- ≤ MaxCaptionBytes checked above
+	return append(dst, o.Caption...), nil
+}
+
+// DecodeFileOffer parses a FILE_OFFER payload. The extension ends up in a
+// file name on the receiver, so anything but a–z and 0–9 is refused here.
+func DecodeFileOffer(p []byte) (FileOffer, error) {
+	if len(p) < fileOfferFixed {
+		return FileOffer{}, ErrShort
+	}
+	o := FileOffer{Size: binary.BigEndian.Uint64(p)}
+	copy(o.Hash[:], p[8:8+HashSize])
+	en := int(p[8+HashSize])
+	if en > MaxFileExt {
+		return FileOffer{}, ErrTooLarge
+	}
+	rest := p[8+HashSize+1:]
+	if len(rest) < en+2 {
+		return FileOffer{}, ErrShort
+	}
+	o.Ext = rest[:en]
+	cn := int(binary.BigEndian.Uint16(rest[en:]))
+	if len(rest) != en+2+cn {
+		return FileOffer{}, ErrTrailing
+	}
+	if cn > MaxCaptionBytes {
+		return FileOffer{}, ErrTooLarge
+	}
+	if o.Size == 0 || o.Size > MaxTransferSize {
+		return FileOffer{}, ErrValue
+	}
+	for _, c := range o.Ext {
+		if (c < 'a' || c > 'z') && (c < '0' || c > '9') {
+			return FileOffer{}, ErrValue
+		}
+	}
+	o.Caption = rest[en+2:]
+	if !utf8.Valid(o.Caption) {
+		return FileOffer{}, ErrUTF8
+	}
+	return o, nil
+}
+
 const imgOfferFixed = 8 + 1 + 4 + 4 + HashSize + 2
 
 // DecodeImgOffer parses an IMG_OFFER payload. It enforces size ≥ 1, a known
@@ -197,7 +264,7 @@ func DecodeImgOffer(p []byte) (ImgOffer, error) {
 	if n > MaxCaptionBytes {
 		return ImgOffer{}, ErrTooLarge
 	}
-	if o.Size == 0 || o.Format < FormatPNG || o.Format > FormatGIF {
+	if o.Size == 0 || o.Size > MaxTransferSize || o.Format < FormatPNG || o.Format > FormatGIF {
 		return ImgOffer{}, ErrValue
 	}
 	o.Caption = p[imgOfferFixed:]

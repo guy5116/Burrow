@@ -16,7 +16,7 @@ type PeerID = identity.PeerID
 // MsgID identifies a TEXT message (random, from crypto/rand).
 type MsgID uint64
 
-// TransferID identifies an image transfer (Phase 2).
+// TransferID identifies a transfer of an image or another file.
 type TransferID [16]byte
 
 // Config holds engine settings. Zero values select the defaults of CLAUDE.md §17.
@@ -36,9 +36,15 @@ type Config struct {
 	ImageDir string
 	// MaxImage is the largest image we send or accept, in bytes (0 → wire.DefaultMaxImage).
 	MaxImage uint64
+	// MaxFile is the largest non-image file we send or accept, in bytes
+	// (0 → wire.DefaultMaxFile). NoFiles refuses files altogether: the peer is
+	// told so in HELLO and cannot even offer one.
+	MaxFile uint64
+	NoFiles bool
 	// Paranoid re-encodes every outgoing image to PNG (drops encoder fingerprints).
 	Paranoid bool
-	// AutoAcceptFromVerified skips the accept prompt for verified contacts.
+	// AutoAcceptFromVerified skips the accept prompt for images from verified
+	// contacts. Files that are not images always wait for the user.
 	AutoAcceptFromVerified bool
 	// ChunkDelay slows the receive-side file-writer (debug/tests only; never from config.toml).
 	ChunkDelay time.Duration
@@ -196,13 +202,19 @@ type Typing struct {
 	Typing bool
 }
 
-// ImageOffered: a peer offers an image; nothing is downloaded until AcceptImage.
+// FormatFile is the Format of a transfer that is not an image.
+const FormatFile uint8 = 0
+
+// ImageOffered: a peer offers an image or, when Format is FormatFile, any
+// other file. Size is what would be downloaded; nothing is downloaded until
+// AcceptImage.
 type ImageOffered struct {
 	Peer    PeerID
 	ID      TransferID
 	Size    uint64
-	Format  uint8 // wire.Format*
-	Width   uint32
+	Format  uint8  // wire.Format*, or FormatFile
+	Ext     string // files only: extension claimed by the sender (a–z, 0–9; may be empty)
+	Width   uint32 // images only
 	Height  uint32
 	Caption string // sanitized, single line
 }
@@ -226,9 +238,10 @@ type TransferResumed struct{ ID TransferID }
 
 // TransferDone reports completion; Path is the saved file (incoming) or the source (outgoing).
 type TransferDone struct {
-	Peer TransferPeer
-	ID   TransferID
-	Path string
+	Peer  TransferPeer
+	ID    TransferID
+	Path  string
+	Image bool // false for a file that is not an image: never try to display it
 }
 
 // TransferFailed reports failure with a redacted reason.
@@ -271,6 +284,17 @@ func (c Config) maxImage() uint64 {
 		return wire.DefaultMaxImage
 	}
 	return c.MaxImage
+}
+
+// maxFile is the advertised and enforced file limit; 0 when files are refused.
+func (c Config) maxFile() uint64 {
+	switch {
+	case c.NoFiles:
+		return 0
+	case c.MaxFile == 0:
+		return wire.DefaultMaxFile
+	}
+	return min(c.MaxFile, wire.MaxTransferSize)
 }
 
 func (c Config) maxPeers() int {

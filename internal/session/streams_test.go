@@ -499,3 +499,77 @@ func (a *adv) acceptOfferWithSink(t *testing.T, id uint16, size uint64, sink cha
 	}
 	a.recv(t, wire.TypeImgAccept)
 }
+
+// A file offer opens a stream exactly like an image offer and the rest of the
+// transfer uses the same frames.
+func TestFileOfferOpensStream(t *testing.T) {
+	p := newPair(t, time.Hour)
+	ctx := context.Background()
+	data := []byte("PK\x03\x04 not really a zip")
+	id, err := p.i.OpenStream(uint64(len(data)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	op, _ := wire.AppendFileOffer(nil, wire.FileOffer{Size: uint64(len(data)), Hash: blake2b.Sum256(data), Ext: []byte("zip")})
+	if err := p.i.SendStream(ctx, id, wire.TypeFileOffer, op); err != nil {
+		t.Fatal(err)
+	}
+	in := <-p.r.Inbound()
+	o, err := wire.DecodeFileOffer(in.Payload)
+	if in.Type != wire.TypeFileOffer || err != nil || string(o.Ext) != "zip" {
+		t.Fatalf("%#x %v", in.Type, err)
+	}
+	if err := p.r.SendStream(ctx, id, wire.TypeImgAccept, wire.AppendImgAccept(nil, 0)); err != nil {
+		t.Fatal(err)
+	}
+	if in = <-p.i.Inbound(); in.Type != wire.TypeImgAccept {
+		t.Fatalf("%#x", in.Type)
+	}
+	cp, _ := wire.AppendImgChunk(nil, wire.ImgChunk{Index: 0, Data: data})
+	if err := p.i.SendStream(ctx, id, wire.TypeImgChunk, cp); err != nil {
+		t.Fatal(err)
+	}
+	if in = <-p.r.Inbound(); in.Type != wire.TypeImgChunk {
+		t.Fatalf("%#x", in.Type)
+	}
+	// A second offer on the same id is a violation, whatever its kind.
+	if err := p.i.SendStream(ctx, id, wire.TypeFileOffer, op); !errors.Is(err, ErrStreamState) {
+		t.Fatal(err)
+	}
+}
+
+// An offer of a kind we did not advertise, or one that does not decode, is a
+// protocol violation.
+func TestOfferNeedsAdvertisedFeature(t *testing.T) {
+	file, _ := wire.AppendFileOffer(nil, wire.FileOffer{Size: 1, Ext: []byte("pdf")})
+	img, _ := wire.AppendImgOffer(nil, wire.ImgOffer{Size: 1, Format: wire.FormatPNG, Width: 1, Height: 1})
+	for _, c := range []struct {
+		name string
+		typ  wire.FrameType
+		pay  []byte
+		ours uint64
+		ok   bool
+	}{
+		{"file advertised", wire.TypeFileOffer, file, wire.FeatureFiles, true},
+		{"file not advertised", wire.TypeFileOffer, file, wire.FeatureImages, false},
+		{"image advertised", wire.TypeImgOffer, img, wire.FeatureImages, true},
+		{"image not advertised", wire.TypeImgOffer, img, wire.FeatureFiles, false},
+		{"image payload in a file offer", wire.TypeFileOffer, img, wire.FeatureFiles, false},
+		{"empty", wire.TypeFileOffer, nil, wire.FeatureFiles, false},
+	} {
+		size, err := offerSize(wire.Inner{Type: c.typ, Stream: 2, Payload: c.pay}, c.ours)
+		if c.ok != (err == nil) || (c.ok && size != 1) {
+			t.Errorf("%s: size %d err %v", c.name, size, err)
+		}
+	}
+}
+
+func TestBadFileOfferClosesSession(t *testing.T) {
+	a := newAdv(t, true, true)
+	bad, _ := wire.AppendFileOffer(nil, wire.FileOffer{Size: 1, Ext: []byte("zip")})
+	bad[8+wire.HashSize+1] = '/' // path separator inside the extension
+	if err := a.p.SendFrame(wire.TypeFileOffer, 3, bad); err != nil {
+		t.Fatal(err)
+	}
+	a.expectViolation(t)
+}

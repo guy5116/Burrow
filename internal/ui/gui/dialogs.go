@@ -142,11 +142,15 @@ func (a *App) showSettingsDialog() {
 	host.SetText(c.InviteHost)
 	imgDir := widget.NewEntry()
 	imgDir.SetText(c.ImageDir)
+	maxImg := widget.NewEntry()
+	maxImg.SetText(strconv.Itoa(int(c.MaxImageMiB)))
+	maxFile := widget.NewEntry()
+	maxFile.SetText(strconv.Itoa(int(c.MaxFileMiB)))
 	typing := widget.NewCheck("Typing indicators", nil)
 	typing.Checked = c.Typing
 	stamps := widget.NewCheck("Send timestamps", nil)
 	stamps.Checked = c.Timestamps
-	auto := widget.NewCheck("Auto-accept images from verified contacts", nil)
+	auto := widget.NewCheck("Auto-accept images from verified contacts (files always ask)", nil)
 	auto.Checked = c.AutoAcceptFromVerified
 	paranoid := widget.NewCheck("Paranoid images (re-encode to PNG)", nil)
 	paranoid.Checked = c.ParanoidImages
@@ -163,7 +167,9 @@ func (a *App) showSettingsDialog() {
 	pass := widget.NewButton("Change passphrase…", a.showPassphraseDialog)
 	items := []*widget.FormItem{
 		widget.NewFormItem("Listen port", port), widget.NewFormItem("Display name", name), widget.NewFormItem("Invite host", host),
-		widget.NewFormItem("Image folder", imgDir), widget.NewFormItem("", typing), widget.NewFormItem("", stamps),
+		widget.NewFormItem("Download folder", imgDir),
+		widget.NewFormItem("Largest image (MiB)", maxImg), widget.NewFormItem("Largest file (MiB, 0 = refuse files)", maxFile),
+		widget.NewFormItem("", typing), widget.NewFormItem("", stamps),
 		widget.NewFormItem("", auto), widget.NewFormItem("", paranoid), widget.NewFormItem("", mdns), widget.NewFormItem("", links),
 		widget.NewFormItem("", reconnect), widget.NewFormItem("Transport", transport), widget.NewFormItem("", history),
 		widget.NewFormItem("", pass),
@@ -174,6 +180,7 @@ func (a *App) showSettingsDialog() {
 		}
 		n := c
 		for k, v := range map[string]string{"listen_port": port.Text, "display_name": name.Text, "invite_host": host.Text, "image_dir": imgDir.Text,
+			"max_image_mib": maxImg.Text, "max_file_mib": maxFile.Text,
 			"typing": strconv.FormatBool(typing.Checked), "timestamps": strconv.FormatBool(stamps.Checked),
 			"auto_accept_from_verified": strconv.FormatBool(auto.Checked), "paranoid_images": strconv.FormatBool(paranoid.Checked),
 			"mdns": strconv.FormatBool(mdns.Checked), "open_links": strconv.FormatBool(links.Checked), "auto_reconnect": strconv.FormatBool(reconnect.Checked),
@@ -188,7 +195,7 @@ func (a *App) showSettingsDialog() {
 			return
 		}
 		a.cfg = n
-		dialog.ShowInformation("Settings saved", "Port, name, image limits and reconnect changes apply after a restart.", a.win)
+		dialog.ShowInformation("Settings saved", "Port, name, size limits and reconnect changes apply after a restart.", a.win)
 	}, a.win)
 }
 
@@ -219,10 +226,15 @@ func (a *App) showPassphraseDialog() {
 	}, a.win)
 }
 
-// showOfferDialog asks about an incoming image; Reject is the default button.
+// showOfferDialog asks about an incoming image or file, size first; Reject is
+// the default button.
 func (a *App) showOfferDialog(o core.ImageOffered) {
-	msg := fmt.Sprintf("%s offers an image: %s %s, %d×%d.\nNothing is downloaded until you accept.",
-		a.ctl.Names.Nick(o.Peer), common.Size(o.Size), common.FormatName(o.Format), o.Width, o.Height)
+	msg := fmt.Sprintf("%s offers %s.\nNothing is downloaded until you accept.", a.ctl.Names.Nick(o.Peer), common.Offer(o))
+	title := "Image offered"
+	if o.Format == core.FormatFile {
+		title = "File offered"
+		msg += "\nBurrow never opens received files. Only open it yourself if you trust the sender."
+	}
 	if o.Caption != "" {
 		msg += fmt.Sprintf("\nCaption: %q", o.Caption)
 	}
@@ -236,7 +248,7 @@ func (a *App) showOfferDialog(o core.ImageOffered) {
 		a.errDialog(a.e.AcceptImage(o.ID, ""))
 	})
 	accept.Importance = widget.LowImportance
-	d := dialog.NewCustom("Image offered", "Reject", container.NewVBox(label, accept), a.win)
+	d := dialog.NewCustom(title, "Reject", container.NewVBox(label, accept), a.win)
 	d.SetOnClosed(func() {
 		if _, pending := a.offers[o.ID]; pending {
 			delete(a.offers, o.ID)
@@ -247,7 +259,7 @@ func (a *App) showOfferDialog(o core.ImageOffered) {
 	d.Show()
 }
 
-// pickImage opens a file chooser and offers the chosen file.
+// pickImage opens a file chooser and offers the chosen image or file.
 func (a *App) pickImage() {
 	if _, ok := a.selected(); !ok {
 		dialog.ShowInformation("No contact selected", "Pick a contact in the sidebar first.", a.win)
@@ -268,11 +280,11 @@ func (a *App) offerImage(path string) {
 	if !ok {
 		return
 	}
-	if _, err := a.e.SendImage(context.Background(), id, path, ""); err != nil {
+	if _, err := a.e.SendFile(context.Background(), id, path, ""); err != nil {
 		a.errDialog(err)
 		return
 	}
-	a.addRow(id, &row{kind: rowSystem, text: "sending image (metadata stripped)…"})
+	a.addRow(id, &row{kind: rowSystem, text: "sending (images lose their metadata; other files go as they are, without their name)…"})
 }
 
 // imageBubble is a tappable thumbnail; decoding happens off the UI thread.

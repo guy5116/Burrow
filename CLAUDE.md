@@ -18,7 +18,7 @@
 ## 0. What we are building
 
 **Burrow** is a **peer-to-peer, end-to-end-encrypted, one-to-one chat program in Go** that
-sends text and images with **no servers, no accounts, and no third parties**. The name is
+sends text, images and other files with **no servers, no accounts, and no third parties**. The name is
 "Burrow" in prose and documentation, `burrow` in code, paths, and binaries. It ships as:
 
 - `burrow` — a CLI with a full terminal UI (TUI) and a plain line-mode for scripting.
@@ -45,7 +45,7 @@ fix, not a trade-off to accept.
 
 ### 0.2 Scope
 
-- **In scope (v1):** one-to-one text + images with many simultaneous peers, CLI/TUI + GUI,
+- **In scope (v1):** one-to-one text + images + files (§6.5) with many simultaneous peers, CLI/TUI + GUI,
   direct TCP transport, Tor onion transport (Phase 4), Linux/macOS/Windows.
 - **Non-goals (v1):** group chats, voice/video, cross-device history sync, mobile apps,
   federation, a relay/discovery service of any kind, Sixel output. Do not build toward these.
@@ -539,6 +539,10 @@ status `pending` (§12).
 
 ## 4. Wire protocol (v1)
 
+Protocol v1 had not been released when file transfer (§6.5) was added on 2026-09-29 at
+the user's request, so HELLO and the frame table were amended in place instead of
+starting a v2. Once a release exists, any such change is a new major version.
+
 All integers are big-endian. All parsing is bounds-checked, allocation-free where possible,
 and fuzzed. `internal/wire` is the only place that knows frame byte layouts, and it exports
 every constant below by name.
@@ -580,14 +584,15 @@ could not have caused (our own I/O error, say).
 
 - `0` — control: `HELLO PING PONG BYE REKEY_*`
 - `1` — chat: `TEXT ACK TYPING`
-- `≥ 2` — one stream per image transfer. The handshake initiator allocates even ids
+- `≥ 2` — one stream per transfer (an image or another file). The handshake initiator allocates even ids
   (2, 4, …), the responder odd ids (3, 5, …); ids are never reused within a session.
   Exhaustion → `BYE reason=4` and reconnect.
 
 Stream rules (violations → close the session unless stated otherwise):
 
-- A frame on a stream that is not open, or an `IMG_OFFER` on an id of the wrong parity or
-  one already used → close. An `IMG_CANCEL` on one of the last 64 closed stream ids is ignored;
+- A frame on a stream that is not open, or an `IMG_OFFER`/`FILE_OFFER` on an id of the
+  wrong parity or one already used → close. An offer of a kind the receiver's own HELLO
+  did not advertise (bit0 for images, bit3 for files) → close. An `IMG_CANCEL` on one of the last 64 closed stream ids is ignored;
   any other frame on a closed id → close.
 - Per peer, per direction: at most **4 pending (unaccepted) offers** and **2 active
   transfers**. A 5th offer or 3rd transfer is answered with `IMG_REJECT reason=3` (busy)
@@ -610,7 +615,7 @@ behind more than one chunk. Concurrent transfers are round-robined.
 
 | Type | Name | Stream | Payload |
 |---|---|---|---|
-| 0x01 | HELLO | 0 | `features u64` bitmap (bit0 images, bit1 accepts TYPING, bit2 animated GIF; other bits must be 0 → else close), `max_image u64` (must be 0 iff bit0 is clear, else ≥ 1; else close), `name_len u8`, `name` (≤ 32 bytes UTF-8, sanitized, **empty by default**). **No version strings** (fingerprinting). The initiator sends HELLO immediately after msg3 and then waits; the responder answers with its own HELLO and may then send data; the initiator may send data once the responder's HELLO is validated. Any other frame before both HELLOs → close. |
+| 0x01 | HELLO | 0 | `features u64` bitmap (bit0 images, bit1 accepts TYPING, bit2 animated GIF, bit3 files; other bits must be 0 → else close), `max_image u64` (must be 0 iff bit0 is clear, else ≥ 1; else close), `max_file u64` (largest non-image file accepted, in bytes; must be 0 iff bit3 is clear; else close), `name_len u8`, `name` (≤ 32 bytes UTF-8, sanitized, **empty by default**). **No version strings** (fingerprinting). The initiator sends HELLO immediately after msg3 and then waits; the responder answers with its own HELLO and may then send data; the initiator may send data once the responder's HELLO is validated. Any other frame before both HELLOs → close. |
 | 0x02 | PING | 0 | `nonce u64` |
 | 0x03 | PONG | 0 | echoed `nonce u64` |
 | 0x04 | BYE | 0 | `reason u8` (0 user quit, 1 shutdown, 2 local error, 3 replaced by newer session, 4 resource limit). Best-effort. |
@@ -624,12 +629,13 @@ behind more than one chunk. Concurrent transfers are round-robined.
 | 0x24 | IMG_DONE | ≥2 | empty (sender → receiver, after the last chunk) |
 | 0x25 | IMG_RESULT | ≥2 | `status u8` (0 ok, 1 hash mismatch, 2 aborted) (receiver → sender) |
 | 0x26 | IMG_CANCEL | ≥2 | `reason u8` (0 user, 1 sender hash divergence, 2 local I/O error, 3 shutdown; other → close) (either side) |
+| 0x27 | FILE_OFFER | ≥2 | `size u64` (1 … 2^40), `blake2b256 [32]`, `ext_len u8`, `ext` (≤ 8 bytes, `a–z` and `0–9` only, may be empty; anything else → close), `caption_len u16`, `caption` (≤ 1,024 bytes, sanitized, single-line). Opens a stream like IMG_OFFER; the rest of the transfer uses the IMG_* frames. **No filename** is ever sent. Only sent if the peer's HELLO set bit3 and `size ≤` its `max_file`. |
 | 0x30 | REKEY_INIT | 0 | `e_pub [32]`, `kem_ek [1184]` |
 | 0x31 | REKEY_RESP | 0 | `e_pub [32]`, `kem_ct [1088]` |
 | 0x32 | REKEY_DONE | 0 | empty |
 | 0x33 | REKEY_REQUEST | 0 | empty |
 
-Unknown frame type, wrong stream for a type, or a payload that does not decode exactly →
+`IMG_OFFER` and `FILE_OFFER` sizes above 2^40 bytes (1 TiB) do not decode. Unknown frame type, wrong stream for a type, or a payload that does not decode exactly →
 close the session (v1 has no extensions; an extension is a new major version). The receiver
 keeps the last 4096 TEXT `msg_id`s per peer in memory and drops duplicates (resends after
 reconnect are idempotent); ACKs are re-sent for duplicates. The set is not persisted, so a
@@ -792,6 +798,34 @@ rejected at offer time.
 - Never send the original filename, path, or timestamps.
 - Never decode an image without the size gate — decompression bombs are the threat.
 - Never auto-open received files with the OS.
+- Never decode, display, or read into memory a received file that is not an image.
+
+### 6.5 Files that are not images
+
+Any regular, non-empty file can be offered (`FILE_OFFER`, §4.4): archives, documents,
+anything. Added on 2026-09-29 at the user's request.
+
+- **Size limit.** `max_file_mib` (default 100, range 0–1,048,576; **0 refuses files**: bit3
+  stays clear and the peer cannot even offer one). It is independent of `max_image`. The
+  limit is advertised in HELLO; the sender refuses locally, before reading the file, when
+  the size exceeds the min of both peers' limits. A peer that ignores the advertised limit
+  is answered with `IMG_REJECT reason=1` before the user is asked.
+- **The size is shown before anything is downloaded.** Every offer prompt (TUI, plain,
+  JSON, GUI, `/transfers`) states the size first, then the type. Nothing is downloaded
+  without an explicit accept. `auto_accept_from_verified` applies to images only, never
+  to files.
+- **No name, only a type.** The offer carries the file's extension (lower-cased, `a–z0–9`,
+  ≤ 8 bytes, else empty) and an optional caption. The receiver saves
+  `<dest>/file-<hash8>.<ext>` (`.bin` when empty). The extension is a claim by the
+  sender; the UI says so by showing it as "type".
+- **No stripping.** The bytes travel as they are: metadata inside documents and archives
+  (author fields, embedded file names and timestamps) is **not** removed (§15). A file
+  whose magic bytes are a supported image format always takes the image pipeline (§6.2)
+  instead, so a photo sent with `/file` still loses its metadata.
+- **Two passes**, like images: pass 1 hashes the file for the offer, pass 2 sends it; a
+  file that changed in between → `IMG_CANCEL reason=1`. Resume via `.meta` works the same.
+- The §6.1 gates, decoding and thumbnails do not apply. Burrow never opens, executes,
+  decodes or previews a received file.
 
 ---
 
@@ -875,6 +909,7 @@ func (e *Engine) Disconnect(id PeerID) error
 func (e *Engine) SendText(id PeerID, text string) (MsgID, error)        // queues if offline
 func (e *Engine) SetTyping(id PeerID, typing bool)                      // no-op unless enabled + peer supports it
 func (e *Engine) SendImage(ctx context.Context, id PeerID, path string, caption string) (TransferID, error)
+func (e *Engine) SendFile(ctx context.Context, id PeerID, path string, caption string) (TransferID, error)   // any file; images are stripped (§6.5)
 func (e *Engine) AcceptImage(t TransferID, destDir string) error
 func (e *Engine) RejectImage(t TransferID) error
 func (e *Engine) CancelTransfer(t TransferID) error
@@ -915,7 +950,7 @@ invites are read with `golang.org/x/term.ReadPassword`, never from flags or the 
 
 Bubble Tea (the major pinned in §0.3). Views: contact/peer list, conversation, input,
 status bar (peer fingerprint short form, verified marker, transport kind). Slash commands
-inside the conversation: `/image <path> [caption]`, `/accept <id>`, `/reject <id>`,
+inside the conversation: `/image <path> [caption]`, `/file <path> [caption]`, `/accept <id>`, `/reject <id>`,
 `/verify`, `/typing on|off`, `/quit`. Keyboard-only usable; keys documented in `--help`.
 The TUI never opens URLs.
 
@@ -980,7 +1015,9 @@ work for lists and dialogs).
 - Invite dialog: QR (`github.com/skip2/go-qrcode`) + copyable string + TTL. Paste-invite
   dialog for connecting (a password-style field).
 - Settings: listen port, transport, privacy toggles (typing, timestamps, auto-accept from
-  verified, paranoid images, mDNS, open links), image directory, passphrase change.
+  verified, paranoid images, mDNS, open links), image directory, largest image and largest
+  file (0 refuses files), passphrase change.
+- Offer dialog for images and files: the size comes first; Reject is the default button.
 
 ### 10.2 Rules
 
@@ -1089,7 +1126,9 @@ latest stable Go; CI installs Fyne's build dependencies and runs `make test-gui`
    complete a rekey** (next epoch fails on both sides), duplicate `msg_id`, ACK for unknown
    `msg_id` (ignored), invalid UTF-8, control characters, bidi overrides, zero-width
    characters, combining-mark flood, ZWJ runs, image `format` lying about magic bytes,
-   decompression-bomb dimensions, GIF with 201 frames, offer over `max_image`, 5th pending
+   decompression-bomb dimensions, GIF with 201 frames, offer over `max_image`, file offer
+   over `max_file`, file offer with an illegal extension byte, file offer to a peer that
+   did not advertise files, 5th pending
    offer, offer churn (17 in 60 s), wrong-parity stream id, reused stream id, chunk index
    out of order, wrong chunk size, wrong final hash, unknown IMG_CANCEL reason, cancel races
    (both sides cancel; cancel after DONE), 17 draining streams, a 65,537th frame in one
@@ -1203,6 +1242,10 @@ module without asking.
 - IP exposure to the peer in direct-TCP mode (use the Tor transport to hide it).
 - Encoder fingerprints inside images in `strip` mode (quantization tables, zlib settings
   can identify camera or software models); `paranoid` mode removes them.
+- **Metadata inside files that are not images** (§6.5): author and software fields in
+  documents, names and timestamps of the files inside an archive. They are sent as they
+  are. The file's own name and timestamps are never sent; its extension is.
+- What a received file does when the user opens it. Burrow never opens it.
 - Store rollback: restoring an older `invites` blob from a backup resurrects a consumed
   single-use token (endpoint compromise territory).
 - Perfect memory zeroization under Go's GC or inside library objects; secrets paged to swap
@@ -1262,7 +1305,8 @@ in §17, and a `PROTOCOL.md` complete enough for an independent implementation.
       `text.Redact()` on peer strings and invites.
 - [ ] Defaults audit: typing off, timestamps on (seconds), auto-accept off, mDNS off,
       history off, paranoid images off (strip on), open-links off, display name empty,
-      passphrase required, invite TTL 1 h single-use.
+      passphrase required, invite TTL 1 h single-use, largest image 25 MiB, largest file
+      100 MiB.
 - [ ] `strings`/`grep` the release binary for stray debug output, paths, or usernames
       (`-trimpath` set).
 - [ ] Reproducible build verified from a clean clone on two machines.
@@ -1291,6 +1335,8 @@ in §17, and a `PROTOCOL.md` complete enough for an independent implementation.
 | Encrypted flat files, one Argon2 run per process, exclusive lock, directory-swap rekey | No SQLite (CGo or a large pure-Go port); tiny surface; atomic writes trivial; unlock cost paid once; no two-writer corruption | SQLite, BoltDB, per-file salts, multi-file in-place rewrites |
 | No message history by default | Nothing to seize; users opt in knowingly | Persistent history by default |
 | Invite tokens, consumed only after key confirmation | Solves "responder must accept a stranger" without becoming enumerable; a dead handshake burns nothing | Open acceptance of any initiator; consuming at msg3 |
+| Files travel with an extension, never a name; images given as files are still stripped | The name is metadata the receiver does not need; the type is what makes the file usable. Stripping stays the default for anything that is a picture | Sending the file name; sending photos untouched through the file path |
+| Separate `max_file` in HELLO, 0 = refuse | The sender learns the limit before hashing gigabytes, and a user who wants no files is never even asked | One shared limit; rejecting only after the offer |
 | Two-pass deterministic stripping | Hash for the offer without buffering the file or touching disk | Temp files (secrets on disk), whole-file buffering |
 
 ---

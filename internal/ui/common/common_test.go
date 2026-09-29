@@ -221,11 +221,23 @@ func TestControllerCommands(t *testing.T) {
 	}
 	var id core.TransferID
 	id[0] = 7
-	a.ctl.Observe(core.ImageOffered{ID: id})
-	if a.ctl.Number(id) != 1 || !strings.Contains(exec(t, a.ctl, "/transfers"), "#1 07") {
-		t.Fatal("offer numbering")
+	a.ctl.Observe(core.ImageOffered{ID: id, Size: 5 << 30, Ext: "zip"})
+	if out := exec(t, a.ctl, "/transfers"); a.ctl.Number(id) != 1 || !strings.Contains(out, "#1 a file: 5.00 GiB, type .zip") {
+		t.Fatal("offer numbering", out)
 	}
-	a.ctl.Observe(core.TransferDone{ID: id, Path: "/x/img.png"})
+	if out := exec(t, a.ctl, "/file"); !strings.HasPrefix(out, "! usage: /file") {
+		t.Fatal(out)
+	}
+	if out := exec(t, a.ctl, "/file /nonexistent/x.zip"); !strings.HasPrefix(out, "* preparing file") {
+		t.Fatal(out)
+	}
+	// A received file that is not an image is never listed for display.
+	a.ctl.Observe(core.TransferDone{ID: id, Path: "/x/file-1.zip"})
+	if len(a.ctl.Images()) != 0 {
+		t.Fatal("a file was listed as an image")
+	}
+	a.ctl.Observe(core.ImageOffered{ID: id})
+	a.ctl.Observe(core.TransferDone{ID: id, Path: "/x/img.png", Image: true})
 	if a.ctl.Number(id) != 0 || len(a.ctl.Images()) != 1 || !strings.Contains(exec(t, a.ctl, "/images"), "/x/img.png") {
 		t.Fatal("done bookkeeping")
 	}
@@ -305,6 +317,35 @@ func TestLinesAndJSONForEveryEvent(t *testing.T) {
 	var sn core.SafetyNumber
 	if got := FormatSafety(sn); strings.Count(got, "\n") != 2 || strings.Count(got, "00000") != 12 {
 		t.Fatal(got)
+	}
+}
+
+// The size comes first in every offer, so a huge file is obvious before accepting.
+func TestOfferShowsSizeFirst(t *testing.T) {
+	for _, c := range []struct {
+		o    core.ImageOffered
+		want string
+	}{
+		{core.ImageOffered{Size: 7 << 30, Ext: "rar"}, "a file: 7.00 GiB, type .rar"},
+		{core.ImageOffered{Size: 1536 << 10, Ext: "pdf"}, "a file: 1.5 MiB, type .pdf"},
+		{core.ImageOffered{Size: 10}, "a file: 10 B, no file type given"},
+		{core.ImageOffered{Size: 2 << 20, Format: 2, Width: 640, Height: 480}, "an image: 2.0 MiB, JPEG 640×480"},
+	} {
+		if got := Offer(c.o); got != c.want {
+			t.Errorf("%q want %q", got, c.want)
+		}
+	}
+	n := newNode(t, core.Config{}).ctl.Names
+	line := n.Line(core.ImageOffered{Size: 7 << 30, Ext: "rar", Caption: "films"})
+	if !strings.Contains(line, "7.00 GiB") || !strings.Contains(line, "/accept") {
+		t.Fatal(line)
+	}
+	m := n.JSON(core.ImageOffered{Size: 7 << 30, Ext: "rar"})
+	if m["size"] != uint64(7<<30) || m["format"] != "file" || m["ext"] != "rar" {
+		t.Fatal(m)
+	}
+	if m := n.JSON(core.TransferDone{Path: "/p"}); m["image"] != false {
+		t.Fatal(m)
 	}
 }
 

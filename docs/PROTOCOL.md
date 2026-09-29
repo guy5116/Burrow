@@ -80,12 +80,12 @@ u32 payload_len  ≤ 65,528
 Padding: with `inner = 8 + payload_len`, the total is the smallest multiple of 256 ≥ inner
 when inner ≤ 4096, otherwise the smallest multiple of 4096 ≥ inner. Maximum 65,536.
 
-Streams: 0 control, 1 chat, ≥ 2 one per image transfer (initiator allocates even ids,
+Streams: 0 control, 1 chat, ≥ 2 one per transfer of an image or another file (initiator allocates even ids,
 responder odd; never reused). A type on the wrong stream class → close.
 
 | Type | Name | Stream | Payload |
 |---|---|---|---|
-| 0x01 | HELLO | 0 | `features u64`, `max_image u64`, `name_len u8`, `name` (≤ 32 bytes UTF-8) |
+| 0x01 | HELLO | 0 | `features u64` (bit0 images, bit1 TYPING, bit2 animated GIF, bit3 files), `max_image u64`, `max_file u64`, `name_len u8`, `name` (≤ 32 bytes UTF-8) |
 | 0x02 | PING | 0 | `nonce u64` |
 | 0x03 | PONG | 0 | `nonce u64` |
 | 0x04 | BYE | 0 | `reason u8` (0 quit, 1 shutdown, 2 local error, 3 replaced, 4 resource limit) |
@@ -99,14 +99,19 @@ responder odd; never reused). A type on the wrong stream class → close.
 | 0x24 | IMG_DONE | ≥2 | empty |
 | 0x25 | IMG_RESULT | ≥2 | `status u8` (0 ok, 1 hash mismatch, 2 aborted) |
 | 0x26 | IMG_CANCEL | ≥2 | `reason u8` (0 user, 1 hash divergence, 2 local I/O, 3 shutdown) |
+| 0x27 | FILE_OFFER | ≥2 | `size u64` (1 … 2^40), `blake2b256 [32]`, `ext_len u8`, `ext` (≤ 8 bytes, only `a`–`z` and `0`–`9`), `caption_len u16`, `caption` (≤ 1,024 bytes) |
 | 0x30 | REKEY_INIT | 0 | `e_pub [32]`, `kem_ek [1184]` |
 | 0x31 | REKEY_RESP | 0 | `e_pub [32]`, `kem_ct [1088]` |
 | 0x32 | REKEY_DONE | 0 | empty |
 | 0x33 | REKEY_REQUEST | 0 | empty |
 
 Every payload must decode exactly; trailing bytes, out-of-range enumerations, reserved
-HELLO feature bits (only bits 0–2 exist), `max_image` inconsistent with bit 0, and
-invalid UTF-8 all close the session. Unknown types close the session.
+HELLO feature bits (only bits 0–3 exist), `max_image` inconsistent with bit 0, `max_file`
+inconsistent with bit 3, an offer size above 2^40, an extension byte outside `a`–`z` and
+`0`–`9`, and invalid UTF-8 all close the session. Unknown types close the session.
+
+The byte layout above is protocol v1 as amended on 2026-09-29, before any release:
+`max_file` and FILE_OFFER were added for file transfer.
 
 ## 6. Session state machine
 
@@ -162,7 +167,12 @@ A receiver treats "after both HELLOs" as "after the peer's HELLO validated".
 
 Per-stream states: `Offered → Accepted → Transferring → Done | Draining → Closed`.
 
-- IMG_OFFER opens a stream. The id must have the offering side's parity (initiator even
+- IMG_OFFER or FILE_OFFER opens a stream; the receiver closes the session when its own
+  HELLO did not advertise that kind (bit 0, bit 3). A FILE_OFFER transfer then uses the
+  same IMG_ACCEPT, IMG_REJECT, IMG_CHUNK, IMG_DONE, IMG_RESULT and IMG_CANCEL frames and
+  rules. A file offer carries no name: the receiver stores `file-<hash8>.<ext>`, or `.bin`
+  when `ext` is empty, and never opens or decodes it. An offer larger than the receiver's
+  advertised limit is answered with IMG_REJECT reason 1. The id must have the offering side's parity (initiator even
   from 2, responder odd from 3), be greater than every id that side used before, and not
   be among the last 64 closed ids.
 - IMG_ACCEPT (receiver → sender) is legal once on an offered stream; `start_chunk` must be
@@ -267,13 +277,15 @@ Generated from `internal/wire` by `go test ./internal/wire -run TestProtocolDocC
 | `DeadPeerTimeout` | 1m30s |
 | `DefaultInviteTTL` | 1h0m0s |
 | `DefaultListenPort` | 47337 |
+| `DefaultMaxFile` | 104857600 |
 | `DefaultMaxImage` | 26214400 |
 | `DirInitiatorToResponder` | 0 |
 | `DirResponderToInitiator` | 1 |
 | `EpochMaxFrames` | 65536 |
 | `FeatureAnimatedGIF` | 4 |
+| `FeatureFiles` | 8 |
 | `FeatureImages` | 1 |
-| `FeatureMask` | 7 |
+| `FeatureMask` | 15 |
 | `FeatureTyping` | 2 |
 | `FormatGIF` | 4 |
 | `FormatJPEG` | 2 |
@@ -308,6 +320,7 @@ Generated from `internal/wire` by `go test ./internal/wire -run TestProtocolDocC
 | `MaxContacts` | 1024 |
 | `MaxContactsPerInvite` | 64 |
 | `MaxDrainingStreams` | 16 |
+| `MaxFileExt` | 8 |
 | `MaxGIFFrames` | 200 |
 | `MaxHelloName` | 32 |
 | `MaxImageDecodeBytes` | 268435456 |
@@ -323,6 +336,7 @@ Generated from `internal/wire` by `go test ./internal/wire -run TestProtocolDocC
 | `MaxPingsPerWindow` | 4 |
 | `MaxQueuedMessages` | 1000 |
 | `MaxTextBytes` | 16384 |
+| `MaxTransferSize` | 1099511627776 |
 | `MaxTypingPerWindow` | 32 |
 | `MinCiphertext` | 272 |
 | `MinInner` | 256 |
@@ -365,6 +379,7 @@ Generated from `internal/wire` by `go test ./internal/wire -run TestProtocolDocC
 | `TransferQueueCap` | 2 |
 | `TypeAck` | 0x11 |
 | `TypeBye` | 0x04 |
+| `TypeFileOffer` | 0x27 |
 | `TypeHello` | 0x01 |
 | `TypeImgAccept` | 0x21 |
 | `TypeImgCancel` | 0x26 |

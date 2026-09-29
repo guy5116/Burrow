@@ -25,7 +25,7 @@ const (
 	stDraining                        // we sent IMG_CANCEL; discarding until a terminal frame
 )
 
-// stream is one image transfer from this side's point of view.
+// stream is one transfer (image or file) from this side's point of view.
 type stream struct {
 	id       uint16
 	outgoing bool // we are the sender
@@ -122,7 +122,24 @@ func (s *Session) OpenStream(size uint64) (uint16, error) {
 }
 
 func chunksFor(size uint64) uint32 {
-	return uint32((size + wire.ChunkData - 1) / wire.ChunkData) // #nosec G115 -- size ≤ MaxImageDecodeBytes
+	return uint32((size + wire.ChunkData - 1) / wire.ChunkData) // #nosec G115 -- size ≤ wire.MaxTransferSize
+}
+
+// offerSize validates an incoming offer and returns the size it declares. An
+// offer of a kind our own HELLO did not advertise is a protocol violation.
+func offerSize(in wire.Inner, ours uint64) (uint64, error) {
+	if in.Type == wire.TypeFileOffer {
+		o, err := wire.DecodeFileOffer(in.Payload)
+		if err != nil || ours&wire.FeatureFiles == 0 {
+			return 0, ErrProtocol
+		}
+		return o.Size, nil
+	}
+	o, err := wire.DecodeImgOffer(in.Payload)
+	if err != nil || ours&wire.FeatureImages == 0 {
+		return 0, ErrProtocol
+	}
+	return o.Size, nil
 }
 
 // SendStream queues an IMG_* frame on its stream (strict order per stream,
@@ -144,7 +161,7 @@ func (s *Session) SendStream(ctx context.Context, id uint16, typ wire.FrameType,
 		return ErrStreamState
 	}
 	switch typ {
-	case wire.TypeImgOffer:
+	case wire.TypeImgOffer, wire.TypeFileOffer:
 		if !st.outgoing || st.state != stOffered {
 			t.mu.Unlock()
 			return ErrStreamState
@@ -270,7 +287,7 @@ func (s *Session) onStreamFrame(in wire.Inner) error {
 		if in.Type == wire.TypeImgCancel && t.wasClosed(in.Stream) {
 			return nil // late cancel on a recently closed stream: ignored
 		}
-		if in.Type != wire.TypeImgOffer {
+		if in.Type != wire.TypeImgOffer && in.Type != wire.TypeFileOffer {
 			return ErrProtocol
 		}
 		return s.onOffer(in, now)
@@ -295,7 +312,7 @@ func (s *Session) onStreamFrame(in wire.Inner) error {
 		return nil // discard everything else
 	}
 	switch in.Type {
-	case wire.TypeImgOffer:
+	case wire.TypeImgOffer, wire.TypeFileOffer:
 		return ErrProtocol // id already in use
 	case wire.TypeImgAccept:
 		if !st.outgoing || st.state != stOffered {
@@ -369,7 +386,7 @@ func (s *Session) onOffer(in wire.Inner, now time.Time) error {
 	if !t.peerParityOK(in.Stream) || t.wasClosed(in.Stream) || uint32(in.Stream) < t.peerNextMin() {
 		return ErrProtocol
 	}
-	o, err := wire.DecodeImgOffer(in.Payload)
+	size, err := offerSize(in, s.cfg.Hello.Features)
 	if err != nil {
 		return ErrProtocol
 	}
@@ -396,7 +413,7 @@ func (s *Session) onOffer(in wire.Inner, now time.Time) error {
 		}
 		return nil
 	}
-	st := &stream{id: in.Stream, outgoing: false, state: stOffered, size: o.Size, chunks: chunksFor(o.Size),
+	st := &stream{id: in.Stream, outgoing: false, state: stOffered, size: size, chunks: chunksFor(size),
 		queue: make(chan outFrame, wire.TransferQueueCap), done: make(chan struct{})}
 	t.open[in.Stream] = st
 	return s.deliverLocked(in)

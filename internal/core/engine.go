@@ -549,6 +549,9 @@ func (e *Engine) establish(conn net.Conn, kind transport.Kind, res *handshake.Re
 	if e.cfg.Typing {
 		hello.Features |= wire.FeatureTyping
 	}
+	if hello.MaxFile = e.cfg.maxFile(); hello.MaxFile > 0 {
+		hello.Features |= wire.FeatureFiles
+	}
 	s, err := session.New(session.Config{Conn: conn, Root: res.Root, Initiator: res.Initiator, Self: e.id,
 		Peer: res.Peer, Hello: hello, Logger: e.log, Inbound: e.inbound, OnClose: e.sessionClosed})
 	if err != nil {

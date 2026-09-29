@@ -176,7 +176,7 @@ func (a *app) cmdInvite(ctx context.Context, args []string, stdin io.Reader, std
 func (a *app) engineConfig() core.Config {
 	return core.Config{ListenPort: a.cfg.ListenPort, DisplayName: a.cfg.DisplayName, Typing: a.cfg.Typing,
 		NoTimestamp: !a.cfg.Timestamps, AutoReconnect: a.cfg.AutoReconnect,
-		DataDir: a.paths.Data, ImageDir: a.cfg.ImageDir, MaxImage: uint64(a.cfg.MaxImageMiB) << 20,
+		DataDir: a.paths.Data, ImageDir: a.cfg.ImageDir, MaxImage: uint64(a.cfg.MaxImageMiB) << 20, MaxFile: uint64(a.cfg.MaxFileMiB) << 20, NoFiles: a.cfg.MaxFileMiB == 0,
 		Paranoid: a.cfg.ParanoidImages, AutoAcceptFromVerified: a.cfg.AutoAcceptFromVerified,
 		MDNS: a.cfg.MDNS, History: a.cfg.History, MaxPeers: a.cfg.MaxPeers}
 }

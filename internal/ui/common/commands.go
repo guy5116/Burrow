@@ -27,7 +27,8 @@ type Controller struct {
 
 	mu      sync.Mutex
 	nextNum int
-	offers  map[int]core.TransferID // short numbers for /accept, /reject, /cancel
+	offers  map[int]core.TransferID    // short numbers for /accept, /reject, /cancel
+	about   map[core.TransferID]string // what each pending offer is, size first
 	numOf   map[core.TransferID]int
 	images  []string // saved image paths, for /view
 }
@@ -47,8 +48,12 @@ func (c *Controller) Observe(ev core.Event) {
 		c.nextNum++
 		c.offers[c.nextNum] = e.ID
 		c.numOf[e.ID] = c.nextNum
+		if c.about == nil {
+			c.about = map[core.TransferID]string{}
+		}
+		c.about[e.ID] = Offer(e) + " from " + c.Names.Nick(e.Peer)
 	case core.TransferDone:
-		if !e.Peer.Outgoing {
+		if !e.Peer.Outgoing && e.Image {
 			c.images = append(c.images, e.Path)
 		}
 		c.forget(e.ID)
@@ -58,6 +63,7 @@ func (c *Controller) Observe(ev core.Event) {
 }
 
 func (c *Controller) forget(id core.TransferID) {
+	delete(c.about, id)
 	if n, ok := c.numOf[id]; ok {
 		delete(c.offers, n)
 		delete(c.numOf, id)
@@ -137,9 +143,10 @@ const Help = `/connect <invite|contact>   connect (an invite string starts with 
 /remove <contact>           delete a contact
 /disconnect <contact>       close the session
 /image <path> [caption]     send an image (metadata is stripped first)
-/accept <n> | /reject <n>   answer an image offer by its number
+/file <path> [caption]      send any file (.zip, .pdf, …) as it is; only its type is revealed, never its name
+/accept <n> | /reject <n>   answer an offer by its number; the offer shows the size first
 /cancel <n>                 cancel a transfer
-/transfers                  list pending offers
+/transfers                  list pending offers with their sizes
 /partials                   list partial downloads that can resume
 /view <n>                   show a received image inline (Kitty/iTerm2), n from /images
 /images                     list received images
@@ -352,13 +359,20 @@ func (c *Controller) Exec(ctx context.Context, line string) (out []string, quit 
 			return fail(err)
 		}
 		return []string{"* disconnecting from " + c.Names.Label(id)}, false
-	case "image":
+	case "image", "file":
 		if c.Current == nil {
 			return fail(errors.New("no conversation selected; use /to <contact>"))
 		}
 		path, caption, _ := strings.Cut(rest, " ")
 		if path == "" {
-			return fail(errors.New("usage: /image <path> [caption]"))
+			return fail(fmt.Errorf("usage: /%s <path> [caption]", cmd))
+		}
+		if cmd == "file" {
+			id, err := c.E.SendFile(ctx, *c.Current, path, strings.TrimSpace(caption))
+			if err != nil {
+				return fail(err)
+			}
+			return []string{"* preparing file " + hexID(id)[:8] + " (images lose their metadata; other files are sent as they are)…"}, false
 		}
 		id, err := c.E.SendImage(ctx, *c.Current, path, strings.TrimSpace(caption))
 		if err != nil {
@@ -388,13 +402,17 @@ func (c *Controller) Exec(ctx context.Context, line string) (out []string, quit 
 		for n := range c.offers {
 			nums = append(nums, n)
 		}
-		c.mu.Unlock()
 		sort.Ints(nums)
-		if len(nums) == 0 {
-			return []string{"(no pending offers)"}, false
-		}
 		for _, n := range nums {
-			out = append(out, fmt.Sprintf("#%d %s", n, hexID(c.offers[n])[:8]))
+			what := c.about[c.offers[n]]
+			if what == "" {
+				what = hexID(c.offers[n])[:8]
+			}
+			out = append(out, fmt.Sprintf("#%d %s", n, what))
+		}
+		c.mu.Unlock()
+		if len(out) == 0 {
+			return []string{"(no pending offers)"}, false
 		}
 		return out, false
 	case "partials":

@@ -25,6 +25,11 @@ type pairT struct {
 
 // newPair builds two sessions sharing a random root over net.Pipe and waits
 // for the HELLO exchange.
+// testHello is what a real engine advertises: images, files and typing.
+func testHello(name string) wire.Hello {
+	return wire.Hello{Features: wire.FeatureTyping | wire.FeatureImages | wire.FeatureFiles, MaxImage: 1 << 30, MaxFile: 1 << 30, Name: []byte(name)}
+}
+
 func newPair(t *testing.T, tick time.Duration) *pairT {
 	t.Helper()
 	idI, _ := identity.Generate()
@@ -35,7 +40,7 @@ func newPair(t *testing.T, tick time.Duration) *pairT {
 	ctx, cancel := context.WithCancel(context.Background())
 	mk := func(conn net.Conn, root *secret.Buffer, init bool, self *identity.Identity, peer identity.PeerID, name string) *Session {
 		s, err := New(Config{Conn: conn, Root: root, Initiator: init, Self: self, Peer: peer,
-			Hello: wire.Hello{Features: wire.FeatureTyping, Name: []byte(name)}, Logger: slog.Default(), Tick: tick})
+			Hello: testHello(name), Logger: slog.Default(), Tick: tick})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -95,7 +100,7 @@ func TestHelloAndText(t *testing.T) {
 	if string(p.i.PeerHello().Name) != "resp" || string(p.r.PeerHello().Name) != "init" {
 		t.Fatal("peer hello")
 	}
-	if p.i.PeerHello().Features != wire.FeatureTyping {
+	if h := p.i.PeerHello(); h.Features != testHello("").Features || h.MaxFile != 1<<30 {
 		t.Fatal("features")
 	}
 	sendText(t, p.i, 1, "hello")

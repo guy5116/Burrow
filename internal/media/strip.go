@@ -27,6 +27,7 @@ type Mode uint8
 const (
 	ModeStrip Mode = iota
 	ModeParanoid
+	ModeRaw // a file sent byte for byte (PrepareFile)
 )
 
 const jpegQuality = 92
@@ -41,6 +42,66 @@ type Prepared struct {
 	Animated bool
 	Mode     Mode
 	Path     string
+	Ext      string // ModeRaw only: the extension offered to the peer
+}
+
+// FormatFile marks a transfer that is not an image: the bytes travel as they are.
+const FormatFile Format = 0
+
+// ErrEmpty means the file has no content to send.
+var ErrEmpty = errBase("media: file is empty")
+
+// FileExt returns the extension a file offer may carry: lower case, without
+// the dot, a–z and 0–9 only, at most wire.MaxFileExt bytes. Anything else
+// yields "" (the receiver then saves the file as .bin).
+func FileExt(path string) string {
+	ext := strings.ToLower(strings.TrimPrefix(filepath.Ext(path), "."))
+	if len(ext) > wire.MaxFileExt {
+		return ""
+	}
+	for i := 0; i < len(ext); i++ {
+		if c := ext[i]; (c < 'a' || c > 'z') && (c < '0' || c > '9') {
+			return ""
+		}
+	}
+	return ext
+}
+
+// PrepareFile is pass 1 for a file that is not an image: it hashes the bytes
+// as they are. Nothing inside the file is removed or changed.
+func PrepareFile(path string, maxSize uint64) (Prepared, error) {
+	st, err := os.Stat(path)
+	switch {
+	case err != nil:
+		return Prepared{}, err
+	case !st.Mode().IsRegular():
+		return Prepared{}, ErrUnsupported
+	case st.Size() == 0:
+		return Prepared{}, ErrEmpty
+	case uint64(st.Size()) > wire.MaxTransferSize, maxSize > 0 && uint64(st.Size()) > maxSize: // #nosec G115 -- a size is not negative
+		return Prepared{}, ErrTooLarge // refused before reading a byte
+	}
+	h, _ := blake2b.New256(nil)
+	cw := &countWriter{w: h}
+	if err := copyFile(cw, path); err != nil {
+		return Prepared{}, err
+	}
+	if maxSize > 0 && cw.n > maxSize { // it grew while we read
+		return Prepared{}, ErrTooLarge
+	}
+	p := Prepared{Format: FormatFile, Size: cw.n, Mode: ModeRaw, Path: path, Ext: FileExt(path)}
+	copy(p.Hash[:], h.Sum(nil))
+	return p, nil
+}
+
+func copyFile(w io.Writer, path string) error {
+	f, err := os.Open(path) // #nosec G304 -- user-chosen file
+	if err != nil {
+		return err
+	}
+	defer func() { _ = f.Close() }()
+	_, err = io.Copy(w, f)
+	return err
 }
 
 // ProbeFile sniffs and gates a file without decoding pixels.
@@ -104,13 +165,17 @@ func Prepare(path string, mode Mode, maxSize uint64) (Prepared, error) {
 // sink (the last one shorter). If the output diverges from pass 1, it returns
 // ErrDiverged after the last chunk.
 func Stream(p Prepared, sink func(index uint32, chunk []byte) error) error {
-	info, err := ProbeFile(p.Path)
-	if err != nil {
-		return err
-	}
 	h, _ := blake2b.New256(nil)
 	ck := &chunker{sink: sink}
-	format, err := process(p.Path, info, p.Mode, orientationOfFile(p.Path, info), io.MultiWriter(h, ck))
+	format, err := FormatFile, error(nil)
+	if p.Mode == ModeRaw {
+		err = copyFile(io.MultiWriter(h, ck), p.Path)
+	} else {
+		var info Info
+		if info, err = ProbeFile(p.Path); err == nil {
+			format, err = process(p.Path, info, p.Mode, orientationOfFile(p.Path, info), io.MultiWriter(h, ck))
+		}
+	}
 	if err != nil {
 		return err
 	}

@@ -22,7 +22,7 @@ import (
 
 func TestSmallMappings(t *testing.T) {
 	for err, want := range map[error]string{
-		media.ErrUnsupported: "unsupported image format", media.ErrTooLarge: "image too large",
+		media.ErrUnsupported: "unsupported image format", media.ErrTooLarge: "too large: over your size limit or the one your contact allows", media.ErrEmpty: "file is empty",
 		media.ErrAnimated: "animated WebP is not supported", media.ErrCorrupt: "image file is malformed",
 		errAnimatedUnsupported: errAnimatedUnsupported.Error(), os.ErrNotExist: "file not found",
 		errors.New("x"): "could not read image",

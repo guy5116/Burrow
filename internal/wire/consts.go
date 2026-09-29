@@ -84,6 +84,7 @@ const (
 	TypeImgDone      FrameType = 0x24
 	TypeImgResult    FrameType = 0x25
 	TypeImgCancel    FrameType = 0x26
+	TypeFileOffer    FrameType = 0x27
 	TypeRekeyInit    FrameType = 0x30
 	TypeRekeyResp    FrameType = 0x31
 	TypeRekeyDone    FrameType = 0x32
@@ -95,7 +96,8 @@ const (
 	FeatureImages      uint64 = 1 << 0
 	FeatureTyping      uint64 = 1 << 1
 	FeatureAnimatedGIF uint64 = 1 << 2
-	FeatureMask        uint64 = FeatureImages | FeatureTyping | FeatureAnimatedGIF
+	FeatureFiles       uint64 = 1 << 3
+	FeatureMask        uint64 = FeatureImages | FeatureTyping | FeatureAnimatedGIF | FeatureFiles
 	MaxHelloName              = 32
 )
 
@@ -147,6 +149,9 @@ const (
 	MaxDrainingStreams  = 16
 	ClosedStreamMemory  = 64
 	DefaultMaxImage     = 25 << 20
+	DefaultMaxFile      = 100 << 20
+	MaxTransferSize     = 1 << 40 // largest size any offer may declare (1 TiB)
+	MaxFileExt          = 8       // bytes, a–z and 0–9 only
 	MaxImagePixels      = 40_000_000
 	MaxImageSide        = 16384
 	MaxImageDecodeBytes = 256 << 20

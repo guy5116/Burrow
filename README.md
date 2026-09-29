@@ -201,6 +201,7 @@ are commands.
 | `/contacts` | Lists your contacts. `*` means online, `✓` means verified |
 | `/to Alice` | Switches the conversation to Alice |
 | `/image photo.jpg` | Offers a picture to the current contact |
+| `/file backup.zip` | Offers any file to the current contact |
 | `/accept 1` or `/reject 1` | Answers a picture someone offered you |
 | `/safety Alice` | Shows the safety number for Alice |
 | `/verify Alice` | Marks Alice as verified |
@@ -247,6 +248,39 @@ contact and exchange a new invite over a channel you trust more.
   continues where it stopped.
 
 PNG, JPEG, WebP and GIF are supported, up to 25 MiB.
+
+## Sending other files
+
+```
+/file backup.zip A caption if you like
+```
+
+Any file works: `.zip`, `.rar`, `.pdf`, documents, anything.
+
+- **The other person sees the size first.** Their chat shows something like
+  `offer #1, a file: 1.20 GiB, type .zip`, and nothing is downloaded until they type
+  `/accept 1`. `/reject 1` declines. `/transfers` lists the offers that are waiting.
+- **The file name is never sent**, only its type. The received file is saved as
+  `file-` followed by a short code and the type, for example `file-3fa91c02.zip`. Use
+  the caption to say what it is.
+- **The content is sent exactly as it is.** Burrow cleans hidden information out of
+  pictures, but it cannot do that for other files. A document may still contain its
+  author's name, and an archive contains the names of the files inside it.
+- A picture sent with `/file` is treated like `/image`, so it is still cleaned.
+- Burrow never opens a received file. Only open one yourself if you trust the sender.
+- If the connection drops halfway, send the same file again and the download continues
+  where it stopped.
+
+### Choosing how large a file you accept
+
+```
+burrow config set max_file_mib 500
+```
+
+The number is in MiB. The default is 100. Your contact's Burrow learns the limit when
+you connect and refuses to send anything larger, so you are not even asked. Set it to
+`0` to refuse all files that are not pictures. `max_image_mib` does the same for
+pictures. Restart Burrow after changing either.
 
 ## Changing the port
 
@@ -377,7 +411,9 @@ of them with `burrow config get`.
 | `mdns` | Find contacts on the same local network automatically. It reveals that some Burrow user is on the network | off |
 | `typing` | Show "is typing…" | off |
 | `paranoid_images` | Re-encode every picture so not even the camera model can be guessed | off |
-| `auto_accept_from_verified` | Skip the accept question for verified contacts | off |
+| `max_file_mib` | Largest file you accept or send, in MiB. `0` refuses files | `100` |
+| `max_image_mib` | Largest picture you accept or send, in MiB | `25` |
+| `auto_accept_from_verified` | Skip the accept question for pictures from verified contacts. Other files always ask | off |
 
 With `transport` set to `tor`, create invites from inside the chat with
 `/invite tor`.

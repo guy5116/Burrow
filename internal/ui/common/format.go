@@ -78,22 +78,22 @@ func (n Names) Line(ev core.Event) string {
 		}
 		return ""
 	case core.ImageOffered:
-		return fmt.Sprintf("* %s offers an image: %s %s %d×%d%s — /accept <n> or /reject <n> (see /transfers)", n.Nick(e.Peer), Size(e.Size), FormatName(e.Format), e.Width, e.Height, captionSuffix(e.Caption))
+		return fmt.Sprintf("* %s offers %s%s — /accept <n> or /reject <n> (see /transfers)", n.Nick(e.Peer), Offer(e), captionSuffix(e.Caption))
 	case core.TransferProgress:
 		return "" // too chatty for text mode; JSON carries it
 	case core.TransferResumed:
 		return "* resuming a partial download"
 	case core.TransferDone:
 		if e.Peer.Outgoing {
-			return fmt.Sprintf("* image delivered to %s", n.Nick(e.Peer.Peer))
+			return fmt.Sprintf("* %s delivered to %s", Kind(e.Image), n.Nick(e.Peer.Peer))
 		}
-		return fmt.Sprintf("* image from %s saved: %s", n.Nick(e.Peer.Peer), e.Path)
+		return fmt.Sprintf("* %s from %s saved: %s", Kind(e.Image), n.Nick(e.Peer.Peer), e.Path)
 	case core.TransferFailed:
 		dir := "to"
 		if !e.Peer.Outgoing {
 			dir = "from"
 		}
-		return fmt.Sprintf("! image transfer %s %s failed: %s", dir, n.Nick(e.Peer.Peer), e.Reason)
+		return fmt.Sprintf("! transfer %s %s failed: %s", dir, n.Nick(e.Peer.Peer), e.Reason)
 	case core.ErrorEvent:
 		return "! " + e.Message
 	}
@@ -110,6 +110,8 @@ func captionSuffix(c string) string {
 // Size renders bytes as a short human unit.
 func Size(n uint64) string {
 	switch {
+	case n >= 1<<30:
+		return fmt.Sprintf("%.2f GiB", float64(n)/(1<<30))
 	case n >= 1<<20:
 		return fmt.Sprintf("%.1f MiB", float64(n)/(1<<20))
 	case n >= 1<<10:
@@ -118,9 +120,31 @@ func Size(n uint64) string {
 	return fmt.Sprintf("%d B", n)
 }
 
+// Kind is "image" or "file".
+func Kind(image bool) string {
+	if image {
+		return "image"
+	}
+	return "file"
+}
+
+// Offer describes what a peer offers, size first: it is what the user
+// decides on before anything is downloaded.
+func Offer(e core.ImageOffered) string {
+	if e.Format != core.FormatFile {
+		return fmt.Sprintf("an image: %s, %s %d×%d", Size(e.Size), FormatName(e.Format), e.Width, e.Height)
+	}
+	if e.Ext == "" {
+		return fmt.Sprintf("a file: %s, no file type given", Size(e.Size))
+	}
+	return fmt.Sprintf("a file: %s, type .%s", Size(e.Size), e.Ext)
+}
+
 // FormatName names a wire image format.
 func FormatName(f uint8) string {
 	switch f {
+	case core.FormatFile:
+		return "file"
 	case 1:
 		return "PNG"
 	case 2:
@@ -181,6 +205,9 @@ func (n Names) JSON(ev core.Event) map[string]any {
 	case core.ImageOffered:
 		peer(e.Peer)
 		m["id"], m["size"], m["format"], m["width"], m["height"], m["caption"] = hexID(e.ID), e.Size, FormatName(e.Format), e.Width, e.Height, e.Caption
+		if e.Format == core.FormatFile {
+			m["ext"] = e.Ext
+		}
 	case core.TransferProgress:
 		peer(e.Peer.Peer)
 		m["id"], m["outgoing"], m["done"], m["size"] = hexID(e.ID), e.Peer.Outgoing, e.Done, e.Size
@@ -188,7 +215,7 @@ func (n Names) JSON(ev core.Event) map[string]any {
 		m["id"] = hexID(e.ID)
 	case core.TransferDone:
 		peer(e.Peer.Peer)
-		m["id"], m["outgoing"], m["path"] = hexID(e.ID), e.Peer.Outgoing, e.Path
+		m["id"], m["outgoing"], m["path"], m["image"] = hexID(e.ID), e.Peer.Outgoing, e.Path, e.Image
 	case core.TransferFailed:
 		peer(e.Peer.Peer)
 		m["id"], m["outgoing"], m["reason"] = hexID(e.ID), e.Peer.Outgoing, e.Reason

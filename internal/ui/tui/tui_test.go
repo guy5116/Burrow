@@ -139,8 +139,9 @@ func TestModelEvents(t *testing.T) {
 		core.MessageStatus{Peer: p, ID: 2, Status: core.StatusDelivered},
 		core.Typing{Peer: p, Typing: true}, core.Typing{Peer: p},
 		core.ImageOffered{Peer: p, ID: id, Size: 1 << 20, Format: 1, Width: 3, Height: 4, Caption: "cap"},
-		core.TransferDone{Peer: tp, ID: id, Path: "/tmp/x.png"},
-		core.TransferDone{Peer: core.TransferPeer{Peer: p, Outgoing: true}},
+		core.TransferDone{Peer: tp, ID: id, Path: "/tmp/x.png", Image: true}, core.TransferDone{Peer: tp, Path: "/tmp/file-1.zip"},
+		core.ImageOffered{Peer: p, Size: 3 << 30, Ext: "zip"},
+		core.TransferDone{Peer: core.TransferPeer{Peer: p, Outgoing: true}, Image: true},
 		core.TransferFailed{Peer: tp, Reason: "declined"},
 		core.NameCollision{New: p, Existing: p, Name: "n"}, core.HandshakeFailed{Stage: "msg2", Reason: "r"},
 		core.ErrorEvent{Message: "oops"},
@@ -148,7 +149,8 @@ func TestModelEvents(t *testing.T) {
 		m.Update(evMsg{ev})
 	}
 	log := strings.Join(m.logs[p], "\n")
-	for _, want := range []string{"hello there", "image offer #1", "/accept 1", "image saved: /tmp/x.png", "/view 1", "image delivered", "declined", "typing"} {
+	for _, want := range []string{"hello there", "offer #1, an image: 1.0 MiB", "/accept 1", "image saved: /tmp/x.png", "/view 1", "image delivered",
+		"file saved: /tmp/file-1.zip", "offer #2, a file: 3.00 GiB, type .zip", "declined", "typing"} {
 		if !strings.Contains(log, want) {
 			t.Errorf("conversation lacks %q:\n%s", want, log)
 		}
@@ -258,13 +260,13 @@ func TestInlineThumbnailFlow(t *testing.T) {
 	}
 	// Without Kitty: only the saved path appears.
 	t.Setenv("TERM", "xterm-256color")
-	if _, cmd := m.Update(evMsg{core.TransferDone{Peer: core.TransferPeer{Peer: p}, Path: path}}); cmd != nil {
+	if _, cmd := m.Update(evMsg{core.TransferDone{Peer: core.TransferPeer{Peer: p}, Path: path, Image: true}}); cmd != nil {
 		t.Fatal("inline command issued for a terminal without image support")
 	}
 	// With Kitty: the thumbnail is prepared off the render thread, its rows join the conversation
 	// and the upload is sent raw.
 	t.Setenv("TERM", "xterm-kitty")
-	_, cmd := m.Update(evMsg{core.TransferDone{Peer: core.TransferPeer{Peer: p}, Path: path}})
+	_, cmd := m.Update(evMsg{core.TransferDone{Peer: core.TransferPeer{Peer: p}, Path: path, Image: true}})
 	if cmd == nil {
 		t.Fatal("no inline command on Kitty")
 	}
@@ -310,7 +312,7 @@ func TestHalfBlockPreviewOnITerm(t *testing.T) {
 		t.Setenv(k, "")
 	}
 	t.Setenv("TERM_PROGRAM", "iTerm.app")
-	_, cmd := m.Update(evMsg{core.TransferDone{Peer: core.TransferPeer{Peer: p}, Path: path}})
+	_, cmd := m.Update(evMsg{core.TransferDone{Peer: core.TransferPeer{Peer: p}, Path: path, Image: true}})
 	if cmd == nil {
 		t.Fatal("no inline preview on iTerm2")
 	}

@@ -24,6 +24,7 @@ type Config struct {
 	OpenLinks              bool   `toml:"open_links"`
 	ImageDir               string `toml:"image_dir"`
 	MaxImageMiB            uint32 `toml:"max_image_mib"`
+	MaxFileMiB             uint32 `toml:"max_file_mib"` // 0 refuses files that are not images
 	InviteHost             string `toml:"invite_host"`
 	Transport              string `toml:"transport"` // tcp | tor | both
 	TorExe                 string `toml:"tor_exe"`
@@ -31,9 +32,12 @@ type Config struct {
 	MaxPeers               int    `toml:"max_peers"`
 }
 
+// MaxFileMiBLimit is the largest max_file_mib: 1 TiB, the protocol's own cap.
+const MaxFileMiBLimit = 1 << 20
+
 // DefaultConfig returns the shipped defaults.
 func DefaultConfig() Config {
-	return Config{ListenPort: 47337, Timestamps: true, AutoReconnect: true, MaxImageMiB: 25, Transport: "tcp", MaxPeers: 32}
+	return Config{ListenPort: 47337, Timestamps: true, AutoReconnect: true, MaxImageMiB: 25, MaxFileMiB: 100, Transport: "tcp", MaxPeers: 32}
 }
 
 // ConfigFile is the file name under the config directory.
@@ -96,6 +100,8 @@ func (c *Config) Get(key string) (string, error) {
 		return c.ImageDir, nil
 	case "max_image_mib":
 		return strconv.Itoa(int(c.MaxImageMiB)), nil
+	case "max_file_mib":
+		return strconv.Itoa(int(c.MaxFileMiB)), nil
 	case "invite_host":
 		return c.InviteHost, nil
 	case "transport":
@@ -154,6 +160,12 @@ func (c *Config) Set(key, value string) error {
 			return errors.New("store: max_image_mib must be ≥ 1")
 		}
 		c.MaxImageMiB = uint32(n)
+	case "max_file_mib":
+		n, err := strconv.ParseUint(value, 10, 32)
+		if err != nil || n > MaxFileMiBLimit {
+			return errors.New("store: max_file_mib must be 0 (refuse files) to 1048576")
+		}
+		c.MaxFileMiB = uint32(n)
 	case "invite_host":
 		c.InviteHost = value
 	case "transport":
@@ -180,6 +192,6 @@ func (c *Config) Set(key, value string) error {
 // Keys lists the config keys in display order.
 func ConfigKeys() []string {
 	return []string{"listen_port", "display_name", "typing", "timestamps", "auto_reconnect",
-		"auto_accept_from_verified", "paranoid_images", "mdns", "open_links", "image_dir", "max_image_mib", "invite_host",
+		"auto_accept_from_verified", "paranoid_images", "mdns", "open_links", "image_dir", "max_image_mib", "max_file_mib", "invite_host",
 		"transport", "tor_exe", "history", "max_peers"}
 }
