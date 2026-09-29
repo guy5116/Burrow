@@ -33,10 +33,12 @@ type peer struct {
 	order     []MsgID // ring of the last MsgIDDedupSet received ids
 	stop      chan struct{}
 	transfers map[uint16]*transfer // by stream id
+	sendCh    chan *queued         // ordered outbound TEXTs for this session's sender goroutine
 }
 
 func newPeer(e *Engine, s *session.Session, kind transport.Kind) *peer {
-	return &peer{e: e, s: s, kind: kind, since: e.now(), seen: map[MsgID]struct{}{}, stop: make(chan struct{}), transfers: map[uint16]*transfer{}}
+	return &peer{e: e, s: s, kind: kind, since: e.now(), seen: map[MsgID]struct{}{}, stop: make(chan struct{}), transfers: map[uint16]*transfer{},
+		sendCh: make(chan *queued, wire.MaxQueuedMessages)}
 }
 
 // run pumps inbound frames until the session ends, then handles teardown,
@@ -44,6 +46,21 @@ func newPeer(e *Engine, s *session.Session, kind transport.Kind) *peer {
 func (p *peer) run() {
 	defer p.e.wg.Done()
 	p.flushQueue()
+	// One sender per session keeps TEXT frames in the order SendText was called.
+	p.e.wg.Add(1)
+	go func() {
+		defer p.e.wg.Done()
+		for {
+			select {
+			case q := <-p.sendCh:
+				if err := p.send(q); err != nil {
+					return
+				}
+			case <-p.s.Done():
+				return
+			}
+		}
+	}()
 	for {
 		select {
 		case in := <-p.s.Inbound():
@@ -125,7 +142,7 @@ func (p *peer) handle(in session.Inbound) {
 	}
 }
 
-// flushQueue sends every pending message in order (after the HELLO exchange).
+// flushQueue hands every pending message to the sender in order (after the HELLO exchange).
 func (p *peer) flushQueue() {
 	p.e.mu.Lock()
 	var items []*queued
@@ -136,7 +153,9 @@ func (p *peer) flushQueue() {
 	}
 	p.e.mu.Unlock()
 	for _, q := range items {
-		if err := p.send(q); err != nil {
+		select {
+		case p.sendCh <- q:
+		default:
 			return
 		}
 	}

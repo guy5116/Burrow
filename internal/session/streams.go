@@ -277,6 +277,19 @@ func (s *Session) onStreamFrame(in wire.Inner) error {
 	if st.state == stDraining {
 		if in.Type == wire.TypeImgReject || in.Type == wire.TypeImgResult || in.Type == wire.TypeImgCancel {
 			t.close(st)
+			// Our own CANCEL may still be queued (both sides cancelled at once): it must
+			// still go out so the peer leaves draining. Anything else queued is dropped.
+			for len(st.queue) > 0 {
+				if f := <-st.queue; f.typ == wire.TypeImgCancel {
+					q := make(chan outFrame, 1)
+					q <- f
+					s.closedQueues[st.id] = q
+					select {
+					case s.transferWake <- struct{}{}:
+					default:
+					}
+				}
+			}
 		}
 		return nil // discard everything else
 	}

@@ -30,6 +30,7 @@ jobs:
       - run: make tools
       - run: make lint
       - run: make docs-check
+      - run: ./scripts/cover.sh
   fuzz-nightly:
     if: github.event_name == 'schedule'
     runs-on: ubuntu-latest

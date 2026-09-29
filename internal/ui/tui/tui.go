@@ -56,6 +56,10 @@ type model struct {
 
 // Run starts the TUI and blocks until it exits.
 func Run(ctx context.Context, ctl *common.Controller, target core.Target, addrs []net.Addr) int {
+	return run(ctx, ctl, target, addrs)
+}
+
+func run(ctx context.Context, ctl *common.Controller, target core.Target, addrs []net.Addr, opts ...tea.ProgramOption) int {
 	var as []string
 	for _, a := range addrs {
 		as = append(as, a.String())
@@ -66,7 +70,7 @@ func Run(ctx context.Context, ctl *common.Controller, target core.Target, addrs 
 	m := &model{ctx: ctx, ctl: ctl, target: target, addrs: strings.Join(as, " "), logs: map[core.PeerID][]string{},
 		vp: viewport.New(), in: in}
 	m.refreshContacts()
-	p := tea.NewProgram(m)
+	p := tea.NewProgram(m, opts...)
 	m.prog = p
 	go func() {
 		for {

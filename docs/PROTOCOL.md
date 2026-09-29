@@ -125,9 +125,84 @@ ck_i2r || ck_r2i = HKDF-Expand(sha256, root_{n+1}, "burrow/1 chains" || uint32(n
 ```
 
 with `dh_es = X25519(e_i', s_r)` and `dh_se = X25519(s_i, e_r')` computed by the respective
-holders. Control-frame legality is the table in CLAUDE.md §3.5; any violation closes.
+holders (the responder computes `X25519(s_r, e_i'.pub)` and `X25519(e_r', s_i.pub)`). Any
+X25519 error (all-zero output) closes the session. A frame's epoch is the sender's SEND
+chain at the instant the frame is written; non-rekey frames may be sent at any point
+during a rekey.
 
-Per-stream: `Offered → Accepted → Transferring → Done | Draining → Closed`.
+### 6.1 Control-frame legality (anything else closes the session, without BYE)
+
+| Frame | Sender | Legal when |
+|---|---|---|
+| HELLO | either | exactly once, as that side's first frame |
+| PING | either | after the peer's HELLO; more than 4 PINGs in 10 s → close |
+| PONG | either | `nonce` equals the nonce of the one outstanding PING and differs from the last accepted PONG |
+| REKEY_INIT | initiator | the responder is not already awaiting REKEY_DONE |
+| REKEY_RESP | responder | the initiator has a rekey in flight whose ephemerals are unused |
+| REKEY_DONE | initiator | the responder is awaiting it |
+| REKEY_REQUEST | responder | any time after both HELLOs; ignored by the initiator while a rekey is in flight |
+| BYE | either | any time after both HELLOs |
+
+A receiver treats "after both HELLOs" as "after the peer's HELLO validated".
+
+### 6.2 Schedule and fail-safes
+
+- Initiator starts a rekey when either chain counter reaches 1024 or 15 minutes after its
+  SEND chain last switched.
+- Responder sends REKEY_REQUEST at 2048 frames or 20 minutes; if no REKEY_INIT follows
+  within 10 s it closes.
+- Either side closes when 25 minutes pass since a chain last switched, when a rekey has
+  been in flight for more than 30 s, or when the responder has awaited REKEY_DONE for
+  more than 30 s.
+- PING after 30 s of send-side silence, never while one is outstanding. No frame of any
+  kind for 90 s → the connection is dead. Write deadline 30 s per frame. Handshake 10 s
+  in total, msg1 within 5 s of accept.
+
+### 6.3 Streams
+
+Per-stream states: `Offered → Accepted → Transferring → Done | Draining → Closed`.
+
+- IMG_OFFER opens a stream. The id must have the offering side's parity (initiator even
+  from 2, responder odd from 3), be greater than every id that side used before, and not
+  be among the last 64 closed ids.
+- IMG_ACCEPT (receiver → sender) is legal once on an offered stream; `start_chunk` must be
+  below `chunks = ceil(size / 65524)`.
+- IMG_CHUNK `i` must carry index `i` exactly, in order, and 65,524 bytes of data except the
+  last, which carries `size − (chunks−1)·65524`. IMG_DONE is legal only after the last chunk.
+- IMG_RESULT (receiver → sender) is legal only after IMG_DONE. IMG_REJECT is legal only
+  before IMG_ACCEPT. Both close the stream on send and on receipt.
+- IMG_CANCEL: the receiver of a CANCEL on an open stream replies with exactly one
+  IMG_CANCEL and closes. The first sender of a CANCEL enters draining and discards every
+  frame on the stream until a terminal frame arrives. A CANCEL on one of the last 64
+  closed ids is ignored; any other frame on a closed or unknown id closes the session.
+- Limits per peer and direction: 4 pending offers, 2 active transfers (a further offer is
+  answered with IMG_REJECT reason 3 and no user-visible event), 32 busy rejects in 10
+  minutes → close, 16 offers in 60 s → close, 16 draining streams, 32 TYPING frames in
+  60 s (further ones are dropped).
+- Writer priority: control > chat > transfer; concurrent transfers are round-robined and
+  every control or chat frame is flushed immediately.
+
+### 6.4 Text handling
+
+Peer strings must be valid UTF-8 (else close). Before display they are sanitized:
+C0/C1 controls except `\n` and `\t`, U+202A–202E, U+2066–2069, U+2028, U+2029, U+200B,
+U+200E, U+200F, U+2060–2064, U+FEFF, U+061C, U+180E and U+E0000–E007F become U+FFFD;
+runs of U+200C/U+200D are capped at 2 (removed from display names); runs of combining
+marks (Mn/Me) are capped at 4; in single-line fields `\n` and `\t` become a space.
+Name-collision checks compare NFKC → case-fold → remove Cf, Other_Default_Ignorable and
+variation selectors → collapse whitespace → trim.
+
+### 6.5 Session replacement
+
+A newly authenticated session for a peer that already has one replaces it (the old one
+is closed with BYE reason 3). If the old session is younger than 5 s, both sides keep
+the session whose initiator has the lexicographically smaller public key.
+
+### 6.6 Delivery
+
+TEXT `msg_id`s are random 64-bit values. The receiver remembers the last 4096 ids per
+peer, drops duplicates, and ACKs every copy. A sender re-sends every unacknowledged TEXT
+with its original id, in order, after the next HELLO exchange.
 
 ## 7. Invites
 

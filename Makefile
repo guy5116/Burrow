@@ -1,7 +1,7 @@
 GO      ?= go
 FUZZTIME ?= 60s
 PKGS     = $(shell $(GO) list ./... | grep -v /internal/ui/gui)
-FUZZPKGS = internal/wire internal/invite internal/text internal/store internal/media internal/handshake
+FUZZPKGS = internal/wire internal/invite internal/text internal/store internal/media internal/handshake internal/transport/mdns
 BIN      = $(shell $(GO) env GOPATH)/bin
 
 .PHONY: tools build build-gui cross test test-short test-gui lint fuzz bench release docs-check

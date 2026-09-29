@@ -1,9 +1,28 @@
 # Security notes
 
-## Reporting
+## Reporting a vulnerability
 
-Phase 5 will publish a disclosure process. Until then, open a private security advisory
-on the GitHub repository.
+Please report privately; do not open a public issue for anything that could put users at risk.
+
+1. Open a **private security advisory** on the GitHub repository (Security → Advisories →
+   "Report a vulnerability"). That channel is encrypted in transit and visible only to
+   maintainers.
+2. Include the affected version or commit, the platform, what an attacker needs (network
+   position, a contact's key, local access), and a reproduction or proof of concept if you
+   have one. Never include real keys, invites, or message content.
+3. You will get an acknowledgement within 7 days and a status update at least every 14
+   days. We aim to ship a fix within 90 days and will agree a disclosure date with you;
+   critical issues in the handshake, ratchet, frame parsing or store are handled first.
+4. After the fix is released the advisory is published with credit to the reporter unless
+   you ask otherwise.
+
+In scope: anything that breaks a property listed in `docs/THREAT_MODEL.md` (confidentiality,
+authentication, forward or post-compromise secrecy, enumeration resistance, metadata
+stripping, at-rest protection, memory-safety or panic on untrusted input, log leakage).
+Out of scope: the limits that document lists under "We do not protect against".
+
+Protocol changes that fix a vulnerability bump the protocol major version; there is no
+negotiation and therefore no downgrade path.
 
 ## Memory hygiene
 

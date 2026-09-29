@@ -2,9 +2,13 @@ package mdns
 
 import (
 	"context"
+	"encoding/hex"
 	"net"
+	"strings"
 	"testing"
 	"time"
+
+	"golang.org/x/net/dns/dnsmessage"
 )
 
 func TestPacketRoundTrip(t *testing.T) {
@@ -65,4 +69,82 @@ func FuzzParse(f *testing.F) {
 	pkt, _ := a.Packet()
 	f.Add(pkt)
 	f.Fuzz(func(t *testing.T, b []byte) { Parse(b, nil) })
+}
+
+func TestParseIgnoresForeignAndMalformedRecords(t *testing.T) {
+	build := func(fn func(b *dnsmessage.Builder)) []byte {
+		b := dnsmessage.NewBuilder(nil, dnsmessage.Header{Response: true})
+		_ = b.StartQuestions()
+		_ = b.Question(dnsmessage.Question{Name: dnsmessage.MustNewName("x.local."), Type: dnsmessage.TypeA, Class: dnsmessage.ClassINET})
+		_ = b.StartAnswers()
+		fn(&b)
+		p, err := b.Finish()
+		if err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+	inst := dnsmessage.MustNewName("abc._burrow._tcp.local.")
+	host := dnsmessage.MustNewName("abc.local.")
+	hdr := func(n dnsmessage.Name, typ dnsmessage.Type) dnsmessage.ResourceHeader {
+		return dnsmessage.ResourceHeader{Name: n, Type: typ, Class: dnsmessage.ClassINET, TTL: 60}
+	}
+	nonce, tag := "n="+hex32(1), "t="+hex32(2)
+	good := build(func(b *dnsmessage.Builder) {
+		_ = b.AResource(hdr(host, dnsmessage.TypeA), dnsmessage.AResource{A: [4]byte{10, 0, 0, 1}}) // foreign name: skipped
+		_ = b.AResource(hdr(inst, dnsmessage.TypeA), dnsmessage.AResource{A: [4]byte{10, 0, 0, 2}}) // our name, other type: skipped
+		_ = b.SRVResource(hdr(inst, dnsmessage.TypeSRV), dnsmessage.SRVResource{Port: 9, Target: host})
+		_ = b.TXTResource(hdr(inst, dnsmessage.TypeTXT), dnsmessage.TXTResource{TXT: []string{"junk", nonce, tag}})
+	})
+	an, ok := Parse(good, net.IPv4(1, 2, 3, 4))
+	if !ok || an.Port != 9 || an.Name != "abc" || an.Nonce[0] != 1 || an.Tag[0] != 2 {
+		t.Fatalf("%+v %v", an, ok)
+	}
+	for name, pkt := range map[string][]byte{
+		"no txt": build(func(b *dnsmessage.Builder) {
+			_ = b.SRVResource(hdr(inst, dnsmessage.TypeSRV), dnsmessage.SRVResource{Port: 9, Target: host})
+		}),
+		"no srv": build(func(b *dnsmessage.Builder) {
+			_ = b.TXTResource(hdr(inst, dnsmessage.TypeTXT), dnsmessage.TXTResource{TXT: []string{nonce, tag}})
+		}),
+		"port zero": build(func(b *dnsmessage.Builder) {
+			_ = b.SRVResource(hdr(inst, dnsmessage.TypeSRV), dnsmessage.SRVResource{Port: 0, Target: host})
+			_ = b.TXTResource(hdr(inst, dnsmessage.TypeTXT), dnsmessage.TXTResource{TXT: []string{nonce, tag}})
+		}),
+		"bad hex": build(func(b *dnsmessage.Builder) {
+			_ = b.SRVResource(hdr(inst, dnsmessage.TypeSRV), dnsmessage.SRVResource{Port: 9, Target: host})
+			_ = b.TXTResource(hdr(inst, dnsmessage.TypeTXT), dnsmessage.TXTResource{TXT: []string{"n=" + strings.Repeat("z", 32), tag}})
+		}),
+		"missing tag": build(func(b *dnsmessage.Builder) {
+			_ = b.SRVResource(hdr(inst, dnsmessage.TypeSRV), dnsmessage.SRVResource{Port: 9, Target: host})
+			_ = b.TXTResource(hdr(inst, dnsmessage.TypeTXT), dnsmessage.TXTResource{TXT: []string{nonce}})
+		}),
+	} {
+		if _, ok := Parse(pkt, nil); ok {
+			t.Errorf("%s accepted", name)
+		}
+	}
+	if _, ok := Parse(good[:len(good)-5], nil); ok {
+		t.Fatal("truncated record accepted")
+	}
+}
+
+func hex32(b byte) string { return hex.EncodeToString(append([]byte{b}, make([]byte, 15)...)) }
+
+func TestRunAndBrowseStopOnCancel(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	var n, tg [16]byte
+	a, _ := NewAnnouncer(1, n, tg)
+	done := make(chan error, 2)
+	go func() { done <- a.Run(ctx) }()
+	go func() { done <- Browse(ctx, func(Announcement) {}) }()
+	time.Sleep(50 * time.Millisecond)
+	cancel()
+	for i := 0; i < 2; i++ {
+		select {
+		case <-done: // nil, or a bind error where multicast is unavailable: both mean "stopped"
+		case <-time.After(3 * time.Second):
+			t.Fatal("did not stop on cancel")
+		}
+	}
 }

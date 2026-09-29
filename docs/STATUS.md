@@ -1,22 +1,24 @@
 # STATUS — read this first
 
 ## Current phase
-Phase 5 — Hardening and release (CLAUDE.md §16). Phase 4 is complete: see
-docs/phases/PHASE-4.md.
+Phase 5 — Hardening and release: implementation complete, release gate partially open.
+See docs/phases/PHASE-5.md and docs/RELEASE_CHECKLIST.md.
 
 ## Done
-- Phases 0–4 in full.
+- Phases 0–4 in full; Phase 5 hardening, coverage floors, log audit, reproducible-build
+  check on one machine, disclosure process, protocol document, release checklist.
 
 ## Mid-flight
 - (nothing)
 
 ## Next step
-- Extended fuzz corpora (run every fuzzer ≥ 1 h, commit crashers), memguard option (ask
-  first), reproducible release builds verified from a clean clone, `docs/SECURITY.md`
-  disclosure process, the §17 checklist, and a `PROTOCOL.md` complete enough for an
-  independent implementation.
+- Close the open items in docs/RELEASE_CHECKLIST.md: ≥ 1 h fuzzing per target, a green CI
+  run on all three OSes, reproducibility on a second machine, Tor conformance with tor
+  installed, the manual GUI plan, and the memguard decision.
 
 ## Open questions for the user
-- Phase 4 choices are in docs/phases/PHASE-4.md. Tor conformance has not been run here
-  (no tor binary); run `BURROW_TOR_TEST=1 go test ./internal/transport/tor` with tor installed.
+- memguard (mlock for the identity key, behind a build tag): add it? CLAUDE.md §3.6 says
+  to ask first.
 - GitHub repo rename to lowercase still needs doing in the repository settings.
+- Earlier unconfirmed choices: §0.3 placeholders (module path, port 47337, Bubble Tea v2),
+  engine mutex instead of a single goroutine, reconnect policy, `/view` for inline images.

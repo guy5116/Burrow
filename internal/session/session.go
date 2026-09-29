@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net"
 	"runtime/debug"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -225,12 +226,34 @@ func (s *Session) spawn(name string, fn func()) {
 		defer s.wg.Done()
 		defer func() {
 			if r := recover(); r != nil {
-				s.log.Error("session goroutine panic", "goroutine", name, "stack", string(debug.Stack()))
+				s.log.Error("session goroutine panic", "goroutine", name, "stack", redactStack(debug.Stack()))
 				s.fail(fmt.Errorf("session: panic in %s", name))
 			}
 		}()
 		fn()
 	}()
+}
+
+// redactStack keeps function names and file:line pairs and drops argument
+// words and offsets, so a logged stack can never carry memory contents.
+func redactStack(b []byte) string {
+	var sb strings.Builder
+	for _, line := range strings.Split(string(b), "\n") {
+		switch {
+		case strings.HasPrefix(line, "\t"): // "\t/path/file.go:123 +0x1f"
+			if i := strings.LastIndex(line, " +0x"); i > 0 {
+				line = line[:i]
+			}
+		case strings.HasPrefix(line, "goroutine "), line == "":
+		default: // "pkg.Func(0xc000..., 0x1)" → "pkg.Func(...)"
+			if i := strings.LastIndex(line, "("); i > 0 {
+				line = line[:i] + "(...)"
+			}
+		}
+		sb.WriteString(line)
+		sb.WriteByte('\n')
+	}
+	return sb.String()
 }
 
 // fail records the first error and starts teardown. Protocol violations never send BYE.

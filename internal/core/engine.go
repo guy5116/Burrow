@@ -249,7 +249,7 @@ func (e *Engine) serve(tr transport.Transport, conn net.Conn, key string, lim *h
 		return
 	}
 	if err := e.establish(conn, tr.Kind(), res, token, ""); err != nil {
-		e.log.Debug("inbound session failed", "err", err.Error())
+		e.log.Debug("inbound session failed", "reason", disconnectReason(err)) // category only: no addresses
 	}
 }
 

@@ -264,7 +264,7 @@ func TestImageResume(t *testing.T) {
 		t.Fatalf("partial not kept: %v %v", parts, metas)
 	}
 	m, err := b.e.readMeta(metas[0])
-	if err != nil || m.Complete < 16 || m.Complete > 25 {
+	if err != nil || m.Complete < 16 || uint64(m.Complete)*65524 >= m.Size {
 		t.Fatalf("meta %+v %v", m, err)
 	}
 	// Corrupt the tail beyond the checkpoint: truncation must discard it.

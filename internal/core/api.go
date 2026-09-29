@@ -262,7 +262,10 @@ func (e *Engine) SendText(id PeerID, msg string) (MsgID, error) {
 	e.recordHistory(id, q.id, true, clean, e.now())
 	e.emit(MessageStatus{Peer: id, ID: q.id, Status: StatusPending})
 	if p != nil {
-		go func() { _ = p.send(q) }()
+		select {
+		case p.sendCh <- q:
+		default: // cannot happen: the channel is as large as the queue bound
+		}
 	}
 	return q.id, nil
 }
