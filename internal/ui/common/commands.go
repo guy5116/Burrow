@@ -463,3 +463,20 @@ func (c *Controller) Status() string {
 	}
 	return s + fmt.Sprintf(" · talking to %s (%s, %s, %s)", ct.Nickname, ct.ID.Short(), ver, on)
 }
+
+// ConnectInvite connects with an invite held in bytes (from a no-echo prompt
+// or a pipe). The bytes are wiped by the engine.
+func (c *Controller) ConnectInvite(ctx context.Context, inv []byte) []string {
+	var out []string
+	if info, err := core.DescribeInviteBytes(inv); err == nil && info.Hostname {
+		out = append(out, "note: this invite uses the hostname "+info.Host+"; looking it up tells your DNS resolver which host you are contacting")
+	}
+	cctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	id, err := c.E.Connect(cctx, core.Target{InviteBytes: inv})
+	if err != nil {
+		return append(out, "! "+err.Error())
+	}
+	c.Current = &id
+	return append(out, "* connected to "+c.Names.Label(id)+"; now talking to them")
+}

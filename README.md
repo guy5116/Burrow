@@ -25,7 +25,7 @@ to can read it.
 
 - A computer running Linux, macOS or Windows.
 - A terminal (on Windows: PowerShell or Windows Terminal).
-- [Go](https://go.dev/dl/) 1.24 or newer, to build the program.
+- [Go](https://go.dev/dl/) 1.26 or newer, to build the program.
 - A friend who also has Burrow.
 - **One of you must be reachable by the other.** The easiest cases:
   - you are both on the same home or office network, or

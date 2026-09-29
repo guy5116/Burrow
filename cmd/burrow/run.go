@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"flag"
@@ -35,13 +36,13 @@ func (a *app) cmdRun(ctx context.Context, cmd string, args []string, stdin io.Re
 			if err != nil {
 				return exitErr(stderr, err)
 			}
-			target = targetOf(string(s))
+			target = targetOfBytes(s)
 		case fs.Arg(0) == "-":
 			s, err := readSecret("", stdin, stderr, true)
 			if err != nil {
 				return exitErr(stderr, err)
 			}
-			target = targetOf(string(s))
+			target = targetOfBytes(s)
 		default:
 			arg := fs.Arg(0)
 			if strings.HasPrefix(arg, "burrow1:") {
@@ -109,6 +110,18 @@ func (a *app) cmdRun(ctx context.Context, cmd string, args []string, stdin io.Re
 	cancel()
 	<-errc
 	return code
+}
+
+// targetOfBytes is targetOf for input read from a prompt or a pipe: an invite
+// stays in bytes (wiped by the engine); a contact name becomes a string.
+func targetOfBytes(b []byte) core.Target {
+	t := bytes.TrimSpace(b)
+	if bytes.HasPrefix(t, []byte("burrow1:")) {
+		return core.Target{InviteBytes: b}
+	}
+	name := string(t)
+	clear(b)
+	return core.Target{Name: name}
 }
 
 // targetOf turns an argument into a Target; contact names are resolved later

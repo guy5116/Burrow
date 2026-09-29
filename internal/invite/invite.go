@@ -4,6 +4,7 @@
 package invite
 
 import (
+	"bytes"
 	"crypto/subtle"
 	"encoding/base32"
 	"encoding/binary"
@@ -79,26 +80,54 @@ func (i *Invite) Encode() (string, error) {
 	return Prefix + strings.ToLower(b32.EncodeToString(b)), nil
 }
 
-// Parse strictly parses an invite string. Surrounding whitespace is trimmed;
-// nothing else is tolerated. Expiry is not checked here (see Expired).
-func Parse(s string) (*Invite, error) {
-	s = strings.TrimSpace(s)
-	if !strings.HasPrefix(s, Prefix) {
+// Parse strictly parses an invite string. Prefer ParseBytes for input that
+// came from a prompt, so the credential never becomes an immutable string.
+func Parse(s string) (*Invite, error) { return ParseBytes([]byte(s)) }
+
+// ParseBytes strictly parses an invite held in a byte slice. Surrounding
+// whitespace is trimmed; nothing else is tolerated. Expiry is not checked here
+// (see Expired). The decoded working copy is wiped before returning; wiping
+// the input is the caller's job.
+func ParseBytes(in []byte) (*Invite, error) {
+	in = bytes.TrimSpace(in)
+	if !bytes.HasPrefix(in, []byte(Prefix)) {
 		return nil, ErrInvalid
 	}
-	body := s[len(Prefix):]
-	if len(body) < 8 || len(body) > (fixedLen+maxAddrLen)*8/5+1 || body != strings.ToLower(body) {
+	body := in[len(Prefix):]
+	if len(body) < 8 || len(body) > (fixedLen+maxAddrLen)*8/5+1 {
 		return nil, ErrInvalid
 	}
-	b, err := b32.DecodeString(strings.ToUpper(body))
-	if err != nil || strings.ToLower(b32.EncodeToString(b)) != body {
+	upper := make([]byte, len(body))
+	defer clear(upper)
+	for i, c := range body {
+		switch {
+		case c >= 'a' && c <= 'z':
+			upper[i] = c - 'a' + 'A'
+		case c >= '2' && c <= '7':
+			upper[i] = c
+		default: // uppercase input, padding and anything else are rejected
+			return nil, ErrInvalid
+		}
+	}
+	b := make([]byte, b32.DecodedLen(len(upper)))
+	defer clear(b)
+	n, err := b32.Decode(b, upper)
+	if err != nil {
+		return nil, ErrInvalid
+	}
+	b = b[:n]
+	// Canonical form only: re-encoding must give the same text (no stray trailing bits).
+	again := make([]byte, b32.EncodedLen(n))
+	defer clear(again)
+	b32.Encode(again, b)
+	if subtle.ConstantTimeCompare(again, upper) != 1 {
 		return nil, ErrInvalid
 	}
 	if len(b) < fixedLen || b[0] != version {
 		return nil, ErrInvalid
 	}
-	n := int(b[2])
-	if n > maxAddrLen || len(b) != fixedLen+n {
+	alen := int(b[2])
+	if alen > maxAddrLen || len(b) != fixedLen+alen {
 		return nil, ErrInvalid
 	}
 	payload, sum := b[:len(b)-checkLen], b[len(b)-checkLen:]
@@ -106,8 +135,8 @@ func Parse(s string) (*Invite, error) {
 	if subtle.ConstantTimeCompare(sum, want[:]) != 1 {
 		return nil, ErrInvalid
 	}
-	inv := &Invite{Kind: b[1], Addr: string(b[3 : 3+n])}
-	p := b[3+n:]
+	inv := &Invite{Kind: b[1], Addr: string(b[3 : 3+alen])}
+	p := b[3+alen:]
 	inv.Port = binary.BigEndian.Uint16(p)
 	copy(inv.PubKey[:], p[2:34])
 	copy(inv.Token[:], p[34:50])

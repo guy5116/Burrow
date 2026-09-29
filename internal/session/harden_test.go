@@ -112,6 +112,7 @@ func TestControllerLoopSendsPingAndEnforcesFailSafe(t *testing.T) {
 
 func TestSupervisorRecoversPanic(t *testing.T) {
 	p := newPair(t, time.Hour)
+	p.i.cfg.RecoverInTests = true // the production behaviour; without it a panic fails the test
 	p.i.spawn("boom", func() { panic("bug") })
 	select {
 	case <-p.i.Done():
@@ -427,5 +428,34 @@ func TestStreamIDsExhaust(t *testing.T) {
 	}
 	if _, err := p.i.OpenStream(1); !errors.Is(err, ErrStreamsExhaust) {
 		t.Fatal(err)
+	}
+}
+
+// Under `go test` a panic in a session goroutine is re-raised so that it fails
+// the test instead of being swallowed by the supervisor.
+func TestPanicsFailTests(t *testing.T) {
+	p := newPair(t, time.Hour)
+	got := make(chan any, 1)
+	p.i.wg.Add(1)
+	go func() {
+		defer func() { got <- recover() }()
+		// The supervisor's deferred handler, run directly so the re-raised panic can be observed.
+		func() {
+			defer p.i.wg.Done()
+			defer func() {
+				if r := recover(); r != nil {
+					if testing.Testing() && !p.i.cfg.RecoverInTests {
+						panic(r)
+					}
+				}
+			}()
+			panic("bug")
+		}()
+	}()
+	if r := <-got; r != "bug" {
+		t.Fatalf("panic was swallowed: %v", r)
+	}
+	if p.i.Err() != nil {
+		t.Fatal("session torn down instead of failing loudly")
 	}
 }

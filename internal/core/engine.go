@@ -313,9 +313,18 @@ func (e *Engine) Connect(ctx context.Context, target Target) (PeerID, error) {
 	var peerID PeerID
 	var token *[16]byte
 	var inviteID string
+	if target.InviteBytes != nil {
+		defer clear(target.InviteBytes)
+	}
 	switch {
-	case target.Invite != "":
-		inv, err := invite.Parse(target.Invite)
+	case target.InviteBytes != nil, target.Invite != "":
+		var inv *invite.Invite
+		var err error
+		if target.InviteBytes != nil {
+			inv, err = invite.ParseBytes(target.InviteBytes)
+		} else {
+			inv, err = invite.Parse(target.Invite)
+		}
 		if err != nil {
 			return PeerID{}, err
 		}
@@ -331,6 +340,12 @@ func (e *Engine) Connect(ctx context.Context, target Target) (PeerID, error) {
 			return peerID, ErrBlocked
 		}
 		if !known {
+			e.mu.Lock()
+			full := len(e.contacts) >= wire.MaxContacts
+			e.mu.Unlock()
+			if full {
+				return peerID, ErrContactLimit
+			}
 			t := inv.Token
 			token = &t
 			inviteID = "peer"
@@ -476,6 +491,11 @@ func (e *Engine) establish(conn net.Conn, kind transport.Kind, res *handshake.Re
 			// one records none ("peer" above only marks "create the contact").
 			if res.Initiator {
 				inviteID = ""
+			}
+			if len(e.contacts) >= wire.MaxContacts {
+				e.mu.Unlock()
+				s.Close(wire.ByeResourceLimit)
+				return ErrContactLimit
 			}
 			newContact, collision = e.addContactLocked(res.Peer, name, inviteID)
 		}

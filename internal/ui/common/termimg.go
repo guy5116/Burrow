@@ -140,3 +140,40 @@ func KittyInline(img image.Image, id uint8, cols int) (InlineImage, error) {
 	}
 	return out, nil
 }
+
+// HalfBlocks renders img as rows of upper-half-block characters with 24-bit
+// colours: each cell shows two pixels, one above the other. It needs no image
+// protocol, works in any true-colour terminal and scrolls with the text.
+func HalfBlocks(img image.Image, cols int) []string {
+	b := img.Bounds()
+	if cols < 1 || b.Dx() < 1 || b.Dy() < 1 {
+		return nil
+	}
+	cols = min(cols, b.Dx())
+	rows := max(1, min(MaxInlineRows, (b.Dy()*cols/b.Dx()+1)/2))
+	px := func(cx, cy int) (r, g, bl uint32) { // average of the source pixels behind one target pixel
+		x0, x1 := b.Min.X+cx*b.Dx()/cols, b.Min.X+(cx+1)*b.Dx()/cols
+		y0, y1 := b.Min.Y+cy*b.Dy()/(rows*2), b.Min.Y+(cy+1)*b.Dy()/(rows*2)
+		x1, y1 = max(x1, x0+1), max(y1, y0+1)
+		var n uint32
+		for y := y0; y < y1; y++ {
+			for x := x0; x < x1; x++ {
+				pr, pg, pb, _ := img.At(x, y).RGBA()
+				r, g, bl, n = r+pr>>8, g+pg>>8, bl+pb>>8, n+1
+			}
+		}
+		return r / n, g / n, bl / n
+	}
+	out := make([]string, 0, rows)
+	for y := 0; y < rows; y++ {
+		var sb strings.Builder
+		for x := 0; x < cols; x++ {
+			tr, tg, tb := px(x, 2*y)
+			br, bg, bb := px(x, 2*y+1)
+			fmt.Fprintf(&sb, "\x1b[38;2;%d;%d;%dm\x1b[48;2;%d;%d;%dm\u2580", tr, tg, tb, br, bg, bb)
+		}
+		sb.WriteString("\x1b[0m")
+		out = append(out, sb.String())
+	}
+	return out
+}

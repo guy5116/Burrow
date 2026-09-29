@@ -184,3 +184,22 @@ func TestUnlockAndWizardValidation(t *testing.T) {
 	_ = container.NewVBox
 	_ = time.Second
 }
+
+func TestThumbnailIsClickable(t *testing.T) {
+	a := newApp(t)
+	clicked := 0
+	tp := newTappable(widget.NewLabel("thumb"), func() { clicked++ })
+	test.Tap(tp)
+	if clicked != 1 {
+		t.Fatal("tap not delivered")
+	}
+	// An image row renders a tappable thumbnail plus the saved path.
+	r := &row{kind: rowImage, path: filepath.Join(t.TempDir(), "missing.png")}
+	box := a.rowWidget(r).(*fyne.Container)
+	if _, ok := box.Objects[0].(*tappable); !ok {
+		t.Fatalf("thumbnail is %T, not clickable", box.Objects[0])
+	}
+	if l, ok := box.Objects[1].(*widget.Label); !ok || !strings.Contains(l.Text, "missing.png") {
+		t.Fatal("path label")
+	}
+}

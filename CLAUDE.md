@@ -119,7 +119,8 @@ linters never see "build constraints exclude all Go files".
 - When you finish a phase (§16), write a short `docs/phases/PHASE-N.md` summarizing what
   was built, what was deferred, every unspecified choice you made, and known issues, and
   reset `docs/STATUS.md` to the next phase.
-- `go.mod`: `go 1.24` minimum (for `crypto/mlkem`, `crypto/hkdf`) plus a `toolchain`
+- `go.mod`: `go 1.26` minimum (`crypto/mlkem` and `crypto/hkdf` need 1.24; the UI
+  dependencies need 1.26 — decided by the user on 2026-09-29) plus a `toolchain`
   directive pinning the current stable release.
 
 ### 1.3 Never

@@ -282,16 +282,46 @@ func TestInlineThumbnailFlow(t *testing.T) {
 		t.Fatal("placeholder cells missing")
 	}
 	// A missing file fails silently (the path line is already there).
-	if got := m.inline(p, filepath.Join(t.TempDir(), "gone.png"))(); got != nil {
+	if got := m.inline(p, filepath.Join(t.TempDir(), "gone.png"), common.TermKitty)(); got != nil {
 		t.Fatalf("%v", got)
 	}
 	// Ids cycle through 1–255 and never use 0.
 	m.nextImage = 255
-	_ = m.inline(p, path)
+	_ = m.inline(p, path, common.TermKitty)
 	if m.nextImage != 1 {
 		t.Fatal(m.nextImage)
 	}
 	if !strings.Contains(m.View().Content, "me ") {
 		t.Fatal("status bar")
+	}
+}
+
+func TestHalfBlockPreviewOnITerm(t *testing.T) {
+	m := newModel(t)
+	m.Update(tea.WindowSizeMsg{Width: 120, Height: 40})
+	var p core.PeerID
+	p[0] = 3
+	m.ctl.Current = &p
+	path := filepath.Join(t.TempDir(), "img-ffff.png")
+	f, _ := os.Create(path)
+	_ = png.Encode(f, image.NewNRGBA(image.Rect(0, 0, 64, 64)))
+	_ = f.Close()
+	for _, k := range []string{"KITTY_WINDOW_ID", "TERM"} {
+		t.Setenv(k, "")
+	}
+	t.Setenv("TERM_PROGRAM", "iTerm.app")
+	_, cmd := m.Update(evMsg{core.TransferDone{Peer: core.TransferPeer{Peer: p}, Path: path}})
+	if cmd == nil {
+		t.Fatal("no inline preview on iTerm2")
+	}
+	in, ok := cmd().(inlineMsg)
+	if !ok || in.img.Transmit != "" || len(in.img.Lines) == 0 {
+		t.Fatalf("%+v", in)
+	}
+	if _, raw := m.Update(in); raw != nil {
+		t.Fatal("half-block preview must not send raw escapes")
+	}
+	if !strings.Contains(m.logs[p][len(m.logs[p])-1], "\u2580") {
+		t.Fatal("preview rows missing")
 	}
 }

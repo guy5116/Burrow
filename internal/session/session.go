@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"testing"
 	"time"
 
 	"github.com/guy5116/burrow/internal/identity"
@@ -29,6 +30,9 @@ type Config struct {
 	// Now and Tick are test hooks; zero values mean time.Now and 1 s.
 	Now  func() time.Time
 	Tick time.Duration
+	// RecoverInTests lets the one test of the supervisor's recovery path opt in;
+	// everywhere else a panic under `go test` is re-raised and fails the test.
+	RecoverInTests bool
 }
 
 // Inbound is an application frame delivered to the owner. Payload is a copy.
@@ -226,6 +230,9 @@ func (s *Session) spawn(name string, fn func()) {
 		defer s.wg.Done()
 		defer func() {
 			if r := recover(); r != nil {
+				if testing.Testing() && !s.cfg.RecoverInTests {
+					panic(r) // a panic is always a bug: in tests it must fail the test (§12)
+				}
 				s.log.Error("session goroutine panic", "goroutine", name, "stack", redactStack(debug.Stack()))
 				s.fail(fmt.Errorf("session: panic in %s", name))
 			}

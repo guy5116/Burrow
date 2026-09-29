@@ -292,8 +292,30 @@ func (a *App) imageBubble(r *row) fyne.CanvasObject {
 			img.Refresh()
 		})
 	}()
-	open := widget.NewButton("View", func() { a.showViewer(path) })
-	return container.NewVBox(img, container.NewHBox(open, widget.NewLabel(path)))
+	return container.NewVBox(newTappable(img, func() { a.showViewer(path) }), widget.NewLabel(path))
+}
+
+// tappable makes any canvas object clickable (used for image thumbnails).
+type tappable struct {
+	widget.BaseWidget
+	content fyne.CanvasObject
+	onTap   func()
+}
+
+func newTappable(content fyne.CanvasObject, onTap func()) *tappable {
+	t := &tappable{content: content, onTap: onTap}
+	t.ExtendBaseWidget(t)
+	return t
+}
+
+// CreateRenderer shows the wrapped object.
+func (t *tappable) CreateRenderer() fyne.WidgetRenderer { return widget.NewSimpleRenderer(t.content) }
+
+// Tapped opens the viewer.
+func (t *tappable) Tapped(*fyne.PointEvent) {
+	if t.onTap != nil {
+		t.onTap()
+	}
 }
 
 // showViewer opens a window with the full image and a fit / 1:1 toggle.

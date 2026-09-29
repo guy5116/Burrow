@@ -521,3 +521,33 @@ func FuzzHandshakePayloads(f *testing.F) {
 		}
 	})
 }
+
+// The spec asks for one fuzz target per frame payload; these three share
+// decoders with other frames but are named for their own type.
+
+func FuzzPongDecode(f *testing.F) {
+	f.Add(AppendPong(nil, 1))
+	f.Fuzz(func(t *testing.T, b []byte) {
+		if n, err := DecodePong(b); err == nil && !bytes.Equal(AppendPong(nil, n), b) {
+			t.Fatal("re-encode")
+		}
+	})
+}
+
+func FuzzRekeyDoneDecode(f *testing.F) {
+	f.Add([]byte{})
+	f.Fuzz(func(t *testing.T, b []byte) {
+		if err := DecodeEmpty(b); (err == nil) != (len(b) == 0) {
+			t.Fatal("REKEY_DONE must be empty")
+		}
+	})
+}
+
+func FuzzRekeyRequestDecode(f *testing.F) {
+	f.Add([]byte{})
+	f.Fuzz(func(t *testing.T, b []byte) {
+		if err := DecodeEmpty(b); (err == nil) != (len(b) == 0) {
+			t.Fatal("REKEY_REQUEST must be empty")
+		}
+	})
+}

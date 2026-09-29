@@ -35,6 +35,23 @@ jobs:
       - run: make lint
       - run: make docs-check
       - run: ./scripts/cover.sh
+  bench:
+    # The 15 % rule (CLAUDE.md §11) compares like with like: the base branch and the
+    # pull request are measured on the same runner in the same job.
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - uses: actions/setup-go@v5
+        with: { go-version: stable }
+      - name: baseline from the base branch
+        run: |
+          git checkout --quiet ${{ github.event.pull_request.base.sha }}
+          go run ./bench/cmp -baseline /tmp/baseline.json -update -- go test -run '^$' -bench . -benchmem ./internal/session ./internal/media ./internal/handshake
+          git checkout --quiet ${{ github.event.pull_request.head.sha }}
+      - name: compare the pull request
+        run: go run ./bench/cmp -baseline /tmp/baseline.json -- go test -run '^$' -bench . -benchmem ./internal/session ./internal/media ./internal/handshake
   fuzz-nightly:
     if: github.event_name == 'schedule'
     runs-on: ubuntu-latest

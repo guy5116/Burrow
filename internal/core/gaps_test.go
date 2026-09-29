@@ -253,3 +253,94 @@ func TestImageThroughput(t *testing.T) {
 		t.Fatalf("throughput %.0f MB/s is below the 90 MB/s budget", mbps)
 	}
 }
+
+// The sender's `format` field is untrusted: a peer that announces JPEG but
+// sends PNG bytes gets its file saved by what the bytes really are.
+func TestReceiverIgnoresDeclaredFormat(t *testing.T) {
+	a := imgNode(t, Config{})
+	self, _ := identity.Generate()
+	parsed, _ := invite.Parse(a.invite(t, false).String)
+	p, _ := rawDial(t, a, self, &parsed.Token)
+	if err := p.Hello(wire.Hello{Features: wire.FeatureImages, MaxImage: 1 << 20}); err != nil {
+		t.Fatal(err)
+	}
+	if in, err := p.Recv(3 * time.Second); err != nil || in.Type != wire.TypeHello {
+		t.Fatal(err)
+	}
+	path, want := pngFixture(t, 16, 16, false)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hash := mediaHash(data)
+	offer, _ := wire.AppendImgOffer(nil, wire.ImgOffer{Size: uint64(len(data)), Format: wire.FormatJPEG, Width: 16, Height: 16, Hash: hash})
+	if err := p.SendFrame(wire.TypeImgOffer, 2, offer); err != nil {
+		t.Fatal(err)
+	}
+	off := a.wait(t, "ImageOffered", isType[ImageOffered]).(ImageOffered)
+	if off.Format != wire.FormatJPEG {
+		t.Fatal("the offer should show what the peer claimed")
+	}
+	if err := a.e.AcceptImage(off.ID, ""); err != nil {
+		t.Fatal(err)
+	}
+	if in, err := p.Recv(3 * time.Second); err != nil || in.Type != wire.TypeImgAccept {
+		t.Fatal(err)
+	}
+	chunk, _ := wire.AppendImgChunk(nil, wire.ImgChunk{Index: 0, Data: data})
+	_ = p.SendFrame(wire.TypeImgChunk, 2, chunk)
+	_ = p.SendFrame(wire.TypeImgDone, 2, nil)
+	done := a.wait(t, "TransferDone", isType[TransferDone]).(TransferDone)
+	if !strings.HasSuffix(done.Path, ".png") {
+		t.Fatalf("saved as %s: the declared format was trusted", done.Path)
+	}
+	got, err := DecodeImage(done.Path, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	samePix(t, want, got)
+	// Bytes that are no image at all are refused at save time.
+	junk := []byte("this is not an image, whatever the offer says")
+	offer2, _ := wire.AppendImgOffer(nil, wire.ImgOffer{Size: uint64(len(junk)), Format: wire.FormatPNG, Width: 4, Height: 4, Hash: mediaHash(junk)})
+	_ = p.SendFrame(wire.TypeImgOffer, 4, offer2)
+	off2 := a.wait(t, "second offer", func(ev Event) bool { o, ok := ev.(ImageOffered); return ok && o.ID != off.ID }).(ImageOffered)
+	_ = a.e.AcceptImage(off2.ID, "")
+	chunk2, _ := wire.AppendImgChunk(nil, wire.ImgChunk{Index: 0, Data: junk})
+	_ = p.SendFrame(wire.TypeImgChunk, 4, chunk2)
+	_ = p.SendFrame(wire.TypeImgDone, 4, nil)
+	a.wait(t, "cannot save", func(ev Event) bool { f, ok := ev.(TransferFailed); return ok && f.Reason == "cannot save image" })
+}
+
+// The 1,024-contact cap applies to the side that dials as well.
+func TestContactCapWhenDialing(t *testing.T) {
+	a := newNode(t, Config{})
+	b := newNode(t, Config{})
+	b.e.mu.Lock()
+	for i := 0; i < wire.MaxContacts; i++ {
+		var id PeerID
+		id[0], id[1], id[2] = 0xEE, byte(i>>8), byte(i)
+		b.e.contacts[id] = &Contact{ID: id, Nickname: "filler"}
+	}
+	b.e.mu.Unlock()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if _, err := b.e.Connect(ctx, Target{Invite: a.invite(t, false).String}); !errors.Is(err, ErrContactLimit) {
+		t.Fatal(err)
+	}
+	if len(a.e.Contacts()) != 0 || len(a.e.Invites()) != 1 {
+		t.Fatal("a refused dial reached the responder or burned the invite")
+	}
+	// Invites from a prompt arrive as bytes and are wiped by Connect.
+	b.e.mu.Lock()
+	b.e.contacts = map[PeerID]*Contact{}
+	b.e.mu.Unlock()
+	raw := []byte(a.invite(t, false).String)
+	if _, err := b.e.Connect(ctx, Target{InviteBytes: raw}); err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range raw {
+		if c != 0 {
+			t.Fatal("invite bytes not wiped after Connect")
+		}
+	}
+}

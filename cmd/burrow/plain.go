@@ -66,7 +66,15 @@ func runPlain(ctx context.Context, ctl *common.Controller, target core.Target, a
 		}
 		return quit
 	}
-	if target.Invite != "" {
+	if target.InviteBytes != nil {
+		for _, l := range ctl.ConnectInvite(ctx, target.InviteBytes) {
+			m := map[string]any{"event": "Output", "text": l}
+			if strings.HasPrefix(l, "! ") {
+				m["event"] = "Error"
+			}
+			emit(m, l)
+		}
+	} else if target.Invite != "" {
 		exec("/connect " + target.Invite)
 	} else if target.Name != "" {
 		exec("/connect " + target.Name)

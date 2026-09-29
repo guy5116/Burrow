@@ -328,8 +328,11 @@ type InviteInfo struct {
 }
 
 // DescribeInvite parses an invite without any network action.
-func DescribeInvite(s string) (InviteInfo, error) {
-	inv, err := invite.Parse(s)
+func DescribeInvite(s string) (InviteInfo, error) { return DescribeInviteBytes([]byte(s)) }
+
+// DescribeInviteBytes is DescribeInvite for an invite held in bytes (not modified).
+func DescribeInviteBytes(b []byte) (InviteInfo, error) {
+	inv, err := invite.ParseBytes(b)
 	if err != nil {
 		return InviteInfo{}, err
 	}

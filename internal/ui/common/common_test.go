@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"image"
+	"image/color"
 	"net"
 	"strings"
 	"testing"
@@ -503,5 +504,40 @@ func TestLabelsAndInviteWording(t *testing.T) {
 	}
 	if c, _ := b.e.Contact(a.e.Identity().ID); c.InviteID != "" {
 		t.Fatalf("the invite user stored an invite id: %q", c.InviteID)
+	}
+}
+
+func TestHalfBlocks(t *testing.T) {
+	img := image.NewNRGBA(image.Rect(0, 0, 40, 20))
+	for y := 0; y < 20; y++ {
+		for x := 0; x < 40; x++ {
+			c := color.NRGBA{R: 255, A: 255} // top half red
+			if y >= 10 {
+				c = color.NRGBA{B: 255, A: 255} // bottom half blue
+			}
+			img.SetNRGBA(x, y, c)
+		}
+	}
+	lines := HalfBlocks(img, 20)
+	if len(lines) != 5 {
+		t.Fatal(len(lines))
+	}
+	if !strings.HasPrefix(lines[0], "\x1b[38;2;255;0;0m\x1b[48;2;255;0;0m\u2580") || !strings.HasSuffix(lines[0], "\x1b[0m") {
+		t.Fatalf("%q", lines[0][:60])
+	}
+	if !strings.HasPrefix(lines[4], "\x1b[38;2;0;0;255m\x1b[48;2;0;0;255m") {
+		t.Fatalf("%q", lines[4][:60])
+	}
+	if strings.Count(lines[0], "\u2580") != 20 {
+		t.Fatal("columns")
+	}
+	if got := HalfBlocks(image.NewNRGBA(image.Rect(0, 0, 10, 4000)), 32); len(got) != MaxInlineRows {
+		t.Fatal(len(got))
+	}
+	if got := HalfBlocks(image.NewNRGBA(image.Rect(0, 0, 3, 3)), 32); len(got) == 0 || strings.Count(got[0], "\u2580") != 3 {
+		t.Fatal("small images are not upscaled")
+	}
+	if HalfBlocks(image.NewNRGBA(image.Rect(0, 0, 0, 0)), 10) != nil || HalfBlocks(img, 0) != nil {
+		t.Fatal("degenerate input")
 	}
 }

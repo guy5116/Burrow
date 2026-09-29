@@ -92,7 +92,11 @@ func run(ctx context.Context, ctl *common.Controller, target core.Target, addrs 
 
 func (m *model) Init() tea.Cmd {
 	cmds := []tea.Cmd{textinput.Blink}
-	if m.target.Invite != "" {
+	if m.target.InviteBytes != nil {
+		inv := m.target.InviteBytes
+		m.target.InviteBytes = nil
+		cmds = append(cmds, func() tea.Msg { return outMsg{lines: m.ctl.ConnectInvite(m.ctx, inv)} })
+	} else if m.target.Invite != "" {
 		cmds = append(cmds, m.exec("/connect "+m.target.Invite))
 	} else if m.target.Name != "" {
 		cmds = append(cmds, m.exec("/connect "+m.target.Name))
@@ -190,14 +194,17 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case evMsg:
 		m.ctl.Observe(msg.ev)
 		m.onEvent(msg.ev)
-		if d, ok := msg.ev.(core.TransferDone); ok && !d.Peer.Outgoing && common.DetectTerminal() == common.TermKitty {
+		if d, ok := msg.ev.(core.TransferDone); ok && !d.Peer.Outgoing && common.DetectTerminal() != common.TermNone {
 			m.render()
-			return m, m.inline(d.Peer.Peer, d.Path)
+			return m, m.inline(d.Peer.Peer, d.Path, common.DetectTerminal())
 		}
 	case inlineMsg:
 		// The placeholder rows scroll with the conversation; the upload goes out raw, once.
 		m.logs[msg.peer] = append(m.logs[msg.peer], msg.img.Lines...)
 		m.render()
+		if msg.img.Transmit == "" {
+			return m, nil // half-block preview: nothing to upload
+		}
 		return m, tea.Raw(msg.img.Transmit)
 	default:
 		var cmd tea.Cmd
@@ -349,9 +356,10 @@ type inlineMsg struct {
 }
 
 // inline decodes a thumbnail off the render thread and prepares it for inline
-// display (Kitty Unicode placeholders). Failures are silent: the saved path is
-// already in the conversation.
-func (m *model) inline(peer core.PeerID, path string) tea.Cmd {
+// display: Kitty Unicode placeholders where available, otherwise a half-block
+// preview (iTerm2 and other true-colour terminals; /view shows full quality).
+// Failures are silent: the saved path is already in the conversation.
+func (m *model) inline(peer core.PeerID, path string, kind common.TermImage) tea.Cmd {
 	m.nextImage++
 	if m.nextImage == 0 {
 		m.nextImage = 1
@@ -362,11 +370,16 @@ func (m *model) inline(peer core.PeerID, path string) tea.Cmd {
 		if err != nil {
 			return nil
 		}
-		in, err := common.KittyInline(img, id, 32)
-		if err != nil {
+		if kind == common.TermKitty {
+			if in, err := common.KittyInline(img, id, 32); err == nil {
+				return inlineMsg{peer: peer, img: in}
+			}
 			return nil
 		}
-		return inlineMsg{peer: peer, img: in}
+		if lines := common.HalfBlocks(img, 32); len(lines) > 0 {
+			return inlineMsg{peer: peer, img: common.InlineImage{Lines: lines}}
+		}
+		return nil
 	}
 }
 

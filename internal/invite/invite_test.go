@@ -156,3 +156,20 @@ func FuzzInviteParse(f *testing.F) {
 		}
 	})
 }
+
+func TestParseBytes(t *testing.T) {
+	s, _ := sample().Encode()
+	in := []byte("  " + s + "\n")
+	got, err := ParseBytes(in)
+	if err != nil || *got != *sample() {
+		t.Fatal(got, err)
+	}
+	if string(in) != "  "+s+"\n" {
+		t.Fatal("ParseBytes must not modify its input")
+	}
+	for _, bad := range [][]byte{nil, []byte("burrow1:"), []byte(strings.ToUpper(s)), []byte(s + "="), []byte(s[:len(s)-1] + "1"), []byte(s[:len(s)-1] + "!")} {
+		if _, err := ParseBytes(bad); !errors.Is(err, ErrInvalid) {
+			t.Errorf("accepted %q", bad)
+		}
+	}
+}

@@ -91,9 +91,12 @@ type Invite struct {
 // Target is what Connect dials: either an invite string or a saved contact.
 // Name is a UI-level contact name resolved by the UI before Connect.
 type Target struct {
-	Invite  string
-	Contact *PeerID
-	Name    string
+	// InviteBytes is an invite read from a prompt or a pipe. Connect wipes it.
+	// Prefer it over Invite, which exists for text typed into a UI widget.
+	InviteBytes []byte
+	Invite      string
+	Contact     *PeerID
+	Name        string
 }
 
 // Message status values.
