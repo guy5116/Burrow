@@ -1,4 +1,5 @@
 GO      ?= go
+TAGS    ?=
 FUZZTIME ?= 60s
 FUZZPKGS = internal/wire internal/invite internal/text internal/store internal/media internal/transport/mdns
 BIN      = $(shell $(GO) env GOPATH)/bin
@@ -32,13 +33,14 @@ test-short:
 test-gui:
 	$(GO) test -race -tags gui ./internal/ui/gui/...
 
+# `make lint TAGS=gui` checks the GUI too (it needs Fyne's C libraries).
 lint:
 	@test -z "$$(gofmt -l . | tee /dev/stderr)"
-	$(GO) vet ./...
-	$(BIN)/staticcheck ./...
-	$(BIN)/gosec -quiet -exclude=G304 -exclude-dir=testdata ./...  # G304: file paths are our own validated store paths (§7)
-	$(BIN)/govulncheck ./...
-	$(BIN)/golangci-lint run ./...
+	$(GO) vet -tags "$(TAGS)" ./...
+	$(BIN)/staticcheck -tags "$(TAGS)" ./...
+	$(BIN)/gosec -quiet -tags "$(TAGS)" -exclude=G304 -exclude-dir=testdata ./...  # G304: file paths are our own validated store paths (§7)
+	$(BIN)/govulncheck -tags "$(TAGS)" ./...
+	$(BIN)/golangci-lint run --build-tags "$(TAGS)" ./...
 
 fuzz:
 	@for pkg in $(FUZZPKGS); do \
@@ -50,7 +52,7 @@ fuzz:
 	done
 
 bench:
-	$(GO) run ./bench/cmp -baseline bench/baseline.json -- $(GO) test -run '^$$' -bench . -benchmem ./internal/session ./internal/media ./internal/handshake
+	$(GO) run ./bench/cmp -baseline bench/baseline.json -- $(GO) test -run '^$$' -bench . -benchmem -count=5 ./internal/session ./internal/media ./internal/handshake
 
 release:
 	mkdir -p dist
@@ -60,4 +62,4 @@ release:
 	cd dist && sha256sum burrow-* > SHA256SUMS
 
 docs-check:
-	$(GO) test -count=1 -run '^TestProtocolDocConstants$$' ./internal/wire/
+	$(GO) test -count=1 -run '^(TestProtocolDocConstants|TestConstantsMatchTheSpec)$$' ./internal/wire/

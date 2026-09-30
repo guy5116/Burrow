@@ -22,6 +22,7 @@ linters:
           list-mode: lax
           files:
             - "**/internal/**"
+            - "**/cmd/**"
             - "!**/internal/identity/**"
             - "!**/internal/invite/**"
             - "!**/internal/handshake/**"
@@ -33,6 +34,8 @@ linters:
             - pkg: "golang.org/x/crypto"
               desc: "x/crypto only in identity, invite, handshake, session, store, media (CLAUDE.md §2.2)"
         ui:
+          # The UIs use the engine (core), their shared config and paths
+          # (store) and, in cmd, secret for wiping prompts: nothing else.
           list-mode: lax
           files: ["**/internal/ui/**", "**/cmd/**"]
           deny:
@@ -44,6 +47,45 @@ linters:
               desc: "UIs import only internal/core (§2.2)"
             - pkg: "github.com/guy5116/burrow/internal/wire"
               desc: "UIs import only internal/core (§2.2)"
+            - pkg: "github.com/guy5116/burrow/internal/identity"
+              desc: "UIs import only internal/core (§2.2)"
+            - pkg: "github.com/guy5116/burrow/internal/invite"
+              desc: "UIs import only internal/core (§2.2)"
+            - pkg: "github.com/guy5116/burrow/internal/media"
+              desc: "UIs import only internal/core (§2.2)"
+            - pkg: "github.com/guy5116/burrow/internal/text"
+              desc: "UIs import only internal/core (§2.2); core sanitizes"
+            - pkg: "github.com/guy5116/burrow/internal/buf"
+              desc: "UIs import only internal/core (§2.2)"
+            - pkg: "github.com/guy5116/burrow/internal/testpeer"
+              desc: "test tool for the protocol layers"
+        protocol:
+          # session and handshake know nothing about images, contacts,
+          # transports or UIs (§2.2).
+          list-mode: lax
+          files: ["**/internal/session/**", "**/internal/handshake/**"]
+          deny:
+            - pkg: "github.com/guy5116/burrow/internal/core"
+              desc: "§2.2"
+            - pkg: "github.com/guy5116/burrow/internal/media"
+              desc: "§2.2"
+            - pkg: "github.com/guy5116/burrow/internal/store"
+              desc: "§2.2"
+            - pkg: "github.com/guy5116/burrow/internal/invite"
+              desc: "§2.2"
+            - pkg: "github.com/guy5116/burrow/internal/transport"
+              desc: "§2.2: they see only net.Conn"
+            - pkg: "github.com/guy5116/burrow/internal/ui"
+              desc: "§2.2"
+        xsys:
+          list-mode: lax
+          files:
+            - "**/internal/**"
+            - "!**/internal/store/**"
+            - "!**/internal/transport/**"
+          deny:
+            - pkg: "golang.org/x/sys"
+              desc: "x/sys only in store, transport and cmd (CLAUDE.md §14)"
         allowlist:
           list-mode: strict
           files: ["$all"]

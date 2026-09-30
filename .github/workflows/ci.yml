@@ -31,8 +31,11 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with: { go-version: stable }
+      - run: sudo apt-get update && sudo apt-get install -y gcc libgl1-mesa-dev xorg-dev
       - run: make tools
       - run: make lint
+      - name: lint the GUI, which renders peer strings (build tag gui)
+        run: make lint TAGS=gui
       - run: make docs-check
       - run: ./scripts/cover.sh
   bench:
@@ -48,15 +51,28 @@ jobs:
       - name: baseline from the base branch
         run: |
           git checkout --quiet ${{ github.event.pull_request.base.sha }}
-          go run ./bench/cmp -baseline /tmp/baseline.json -update -- go test -run '^$' -bench . -benchmem ./internal/session ./internal/media ./internal/handshake
+          go run ./bench/cmp -baseline /tmp/baseline.json -update -- go test -run '^$' -bench . -benchmem -count=5 ./internal/session ./internal/media ./internal/handshake
           git checkout --quiet ${{ github.event.pull_request.head.sha }}
       - name: compare the pull request
-        run: go run ./bench/cmp -baseline /tmp/baseline.json -- go test -run '^$' -bench . -benchmem ./internal/session ./internal/media ./internal/handshake
+        run: go run ./bench/cmp -baseline /tmp/baseline.json -- go test -run '^$' -bench . -benchmem -count=5 ./internal/session ./internal/media ./internal/handshake
   fuzz-nightly:
+    # One job per package, so that a crash in one leaves the others running
+    # and no job nears the runner's time limit.
     if: github.event_name == 'schedule'
+    strategy:
+      fail-fast: false
+      matrix:
+        pkg: [internal/wire, internal/invite, internal/text, internal/store, internal/media, internal/transport/mdns]
     runs-on: ubuntu-latest
+    timeout-minutes: 300 # wire has 22 targets of 10 minutes each
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with: { go-version: stable }
-      - run: make fuzz FUZZTIME=10m
+      - run: make fuzz FUZZTIME=10m FUZZPKGS=${{ matrix.pkg }}
+      - name: keep the input that crashed
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-crashers-${{ strategy.job-index }}
+          path: ${{ matrix.pkg }}/testdata/fuzz/
