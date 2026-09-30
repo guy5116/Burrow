@@ -1,6 +1,8 @@
 package main
 
 import (
+	"github.com/guy5116/burrow/internal/core"
+
 	"bufio"
 	"bytes"
 	"context"
@@ -486,6 +488,9 @@ func TestStrayArguments(t *testing.T) {
 		{"connect", "Alice", "--listen", "127.0.0.1:0"},
 		{"invite", "--host", "127.0.0.1", "extra"},
 		{"id", "extra"},
+		{"init", "extra"},
+		{"passphrase", "foo"},
+		{"burn", "now", "please"},
 	} {
 		full := append([]string{"--plain", "--config", home, "--data", home}, args...)
 		cmd := exec.CommandContext(context.Background(), binPath, full...)
@@ -494,5 +499,49 @@ func TestStrayArguments(t *testing.T) {
 		if !errors.As(err, &exit) || exit.ExitCode() != 2 || !strings.Contains(string(out), "unexpected argument") {
 			t.Errorf("%v: %v\n%s", args, err, out)
 		}
+	}
+}
+
+// Failures say what went wrong, and a script sees them in the exit status.
+func TestFailuresAreReported(t *testing.T) {
+	home := t.TempDir()
+	burrow := func(stdin string, args ...string) (string, int) {
+		t.Helper()
+		cmd := exec.CommandContext(context.Background(), binPath, append([]string{"--plain", "--config", home, "--data", home}, args...)...)
+		cmd.Stdin = strings.NewReader(stdin)
+		out, err := cmd.CombinedOutput()
+		var exit *exec.ExitError
+		if errors.As(err, &exit) {
+			return string(out), exit.ExitCode()
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		return string(out), 0
+	}
+	if out, code := burrow("", "init", "--insecure-no-passphrase"); code != 0 {
+		t.Fatal(out)
+	}
+	if out, code := burrow("", "connect", "-"); code != 1 || !strings.Contains(out, "no invite on standard input") {
+		t.Errorf("empty stdin: %d %s", code, out)
+	}
+	if out, code := burrow("", "connect", "--listen", "127.0.0.1:0", "nobody"); code != 1 {
+		t.Errorf("a failed connect exited %d: %s", code, out)
+	}
+	// An onion invite is made offline, from the key; only with Tor turned on.
+	if out, code := burrow("", "invite", "--tor"); code != 1 || !strings.Contains(out, "tor is off") {
+		t.Errorf("onion invite with Tor off: %d %s", code, out)
+	}
+	if out, code := burrow("", "config", "set", "transport", "both"); code != 0 {
+		t.Fatal(out)
+	}
+	cmd := exec.CommandContext(context.Background(), binPath, "--config", home, "--data", home, "invite", "--tor")
+	out, err := cmd.Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	info, err := core.DescribeInvite(strings.TrimSpace(string(out)))
+	if err != nil || info.Kind != "tor" || len(info.Host) != 62 || !strings.HasSuffix(info.Host, ".onion") {
+		t.Fatalf("%+v %v", info, err)
 	}
 }

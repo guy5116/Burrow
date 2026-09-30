@@ -15,8 +15,8 @@ import (
 const (
 	historyDir     = "history"
 	historyIndex   = "history/index"
-	historySegment = 256 // records per segment blob
-	historyQueue   = 256 // records waiting for the history writer
+	historySegment = 256  // records per segment blob
+	historyQueue   = 1024 // records waiting for the history writer
 )
 
 // HistoryEntry is one stored message.
@@ -57,8 +57,9 @@ func (e *Engine) loadHistIndex() histIndex {
 func segName(n int) string { return historyDir + "/seg-" + strconv.Itoa(n) }
 
 // recordHistoryL queues one message for the history writer when history is
-// on. Disk work never happens on the engine goroutine; if the disk falls a
-// whole queue behind, the engine waits for it rather than lose a record.
+// on. The engine goroutine never waits for the disk: when the writer is a
+// whole queue behind (a contact sending faster than the disk writes), the
+// message is shown but not stored, and the user is told once.
 func (e *Engine) recordHistoryL(peer PeerID, id MsgID, mine bool, text string, at time.Time) {
 	if e.histCh == nil {
 		return
@@ -66,7 +67,11 @@ func (e *Engine) recordHistoryL(peer PeerID, id MsgID, mine bool, text string, a
 	rec := histRec{Peer: hex.EncodeToString(peer[:]), ID: uint64(id), Mine: mine, Text: text, At: at.Unix()}
 	select {
 	case e.histCh <- rec:
-	case <-e.sessCtx.Done(): // shutting down: the writer has stopped
+	default:
+		if !e.histBehind {
+			e.histBehind = true
+			e.queueL(ErrorEvent{Message: "history could not keep up with incoming messages; some were not stored"})
+		}
 	}
 }
 
@@ -92,7 +97,8 @@ func (e *Engine) historyWriter() {
 }
 
 // writeHistory appends first and whatever else is already queued, one
-// segment write per segment touched.
+// segment write per segment touched. Flush requests in the batch are answered
+// when it returns, whether the writes succeeded or not.
 func (e *Engine) writeHistory(first histRec) {
 	batch := []histRec{first}
 	for len(batch) < historySegment {
@@ -103,6 +109,11 @@ func (e *Engine) writeHistory(first histRec) {
 		default:
 		}
 		break
+	}
+	for _, rec := range batch {
+		if rec.flushed != nil {
+			defer close(rec.flushed)
+		}
 	}
 	e.histMu.Lock()
 	defer e.histMu.Unlock()
@@ -131,7 +142,6 @@ func (e *Engine) writeHistory(first histRec) {
 	dirty := false
 	for _, rec := range batch {
 		if rec.flushed != nil {
-			defer close(rec.flushed) // after the writes below
 			continue
 		}
 		recs, dirty = append(recs, rec), true

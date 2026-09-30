@@ -4,7 +4,9 @@ package tui
 import (
 	"context"
 	"fmt"
+	"io"
 	"net"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -25,10 +27,13 @@ const Keys = `keys: enter send · tab/shift+tab next/previous contact · pgup/pg
 
 type evMsg struct{ ev core.Event }
 
-// outMsg is the result of a queued command.
+// outMsg is the result of a queued command. A message that was sent comes
+// back as mine, for the conversation it went to.
 type outMsg struct {
 	lines []string
 	quit  bool
+	to    core.PeerID
+	mine  string
 }
 
 // noteMsg is a line for the system notes from anything that is not a command.
@@ -36,18 +41,84 @@ type noteMsg string
 
 const (
 	sidebarWidth = 26
-	// maxLines bounds what is kept per conversation and of the system notes.
-	// A contact can send without end; the oldest lines go first.
-	maxLines = 5000
+	// A contact can send without end: each log keeps its newest lines, up to
+	// maxLines and maxLogBytes, and drops the oldest.
+	maxLines    = 5000
+	maxLogBytes = 1 << 20
 )
 
-// keep appends to a log and drops its oldest lines beyond maxLines.
-func keep(log []string, lines ...string) []string {
-	log = append(log, lines...)
-	if over := len(log) - maxLines; over > 0 {
-		log = append(log[:0], log[over:]...)
+// entry is one line of a log. seq orders the lines of every log, so that
+// the notes show among the conversation's lines in the order they happened.
+type entry struct {
+	seq   uint64
+	text  string
+	style func(...string) string // nil: plain
+	image bool                   // placeholder or pixel rows: never wrapped
+	rows  string                 // text fitted to width, kept until the width changes
+	width int
+}
+
+// fit returns the entry fitted to width columns.
+func (e *entry) fit(width int) string {
+	if e.width != width || e.rows == "" {
+		e.rows, e.width = e.text, width
+		if !e.image {
+			e.rows = wrap(e.text, width)
+		}
+		if e.style != nil {
+			e.rows = e.style(e.rows)
+		}
 	}
-	return log
+	return e.rows
+}
+
+// chatLog is one conversation, or the notes.
+type chatLog struct {
+	lines []entry
+	bytes int
+}
+
+// add appends a line and drops the oldest ones beyond the limits. The newest
+// line always stays.
+func (l *chatLog) add(e entry) {
+	l.lines = append(l.lines, e)
+	l.bytes += len(e.text)
+	drop := 0
+	for len(l.lines)-drop > maxLines || l.bytes > maxLogBytes && drop < len(l.lines)-1 {
+		l.bytes -= len(l.lines[drop].text)
+		drop++
+	}
+	if drop > 0 {
+		l.lines = append(l.lines[:0], l.lines[drop:]...)
+	}
+}
+
+// wrap fits a line into width columns. Every row after the first starts with
+// the gutter that a message's own line breaks get, so a contact cannot pad
+// text until its end wraps into what looks like a line of its own. A row
+// without spaces, such as an invite, is cut without a gutter so that it can
+// be copied (/connect drops the line breaks); a QR code is left for the
+// viewport to cut, since wrapping would scramble it.
+func wrap(line string, width int) string {
+	if lipgloss.Width(line) <= width {
+		return line
+	}
+	rows := strings.Split(line, "\n")
+	for i, row := range rows {
+		switch {
+		case lipgloss.Width(row) <= width || isPicture(row):
+		case !strings.Contains(row, " "):
+			rows[i] = lipgloss.Wrap(row, width, "")
+		default:
+			rows[i] = strings.ReplaceAll(lipgloss.Wrap(row, width-lipgloss.Width(common.Gutter), ""), "\n", "\n"+common.Gutter)
+		}
+	}
+	return strings.Join(rows, "\n")
+}
+
+// isPicture reports whether a row is drawn with block characters only.
+func isPicture(row string) bool {
+	return strings.Trim(row, " █▀▄") == ""
 }
 
 var (
@@ -63,8 +134,13 @@ type model struct {
 	target    core.Target
 	addrs     string
 	contacts  []core.Contact
-	logs      map[core.PeerID][]string
-	system    []string
+	logs      map[core.PeerID]*chatLog
+	system    chatLog
+	seq       uint64                 // of the last line added to any log
+	unread    map[core.PeerID]string // sidebar marker: "!" an offer waits, "•" a message
+	alert     string                 // shown in the status bar until the next Enter
+	dirty     bool                   // the viewport must be filled again
+	shown     *core.PeerID           // the conversation the viewport shows
 	vp        viewport.Model
 	in        textinput.Model
 	w, h      int
@@ -73,6 +149,35 @@ type model struct {
 	typingTo  *core.PeerID // the contact who was last told that we are typing
 	nextImage uint8        // Kitty image ids 1–255, reused in a cycle
 }
+
+// add appends entries to a conversation, or to the notes when peer is nil.
+func (m *model) add(peer *core.PeerID, es ...entry) {
+	l := &m.system
+	if peer != nil {
+		if l = m.logs[*peer]; l == nil {
+			l = &chatLog{}
+			m.logs[*peer] = l
+		}
+	}
+	for _, e := range es {
+		m.seq++
+		e.seq = m.seq
+		l.add(e)
+	}
+	if current, ok := m.ctl.Selected(); peer == nil || ok && current == *peer {
+		m.dirty = true
+	}
+}
+
+// log adds lines of text, drawn with style (nil: plain).
+func (m *model) log(peer *core.PeerID, style func(...string) string, lines ...string) {
+	for _, l := range lines {
+		m.add(peer, entry{text: l, style: style})
+	}
+}
+
+// note adds lines to the notes.
+func (m *model) note(lines ...string) { m.log(nil, nil, lines...) }
 
 // inOrder runs functions on their own goroutines, one at a time, in the order
 // their tickets were drawn. Bubble Tea runs every command on a goroutine of
@@ -113,11 +218,11 @@ func (o *inOrder) run(n uint64, fn func()) {
 }
 
 // Run starts the TUI and blocks until it exits.
-func Run(ctx context.Context, ctl *common.Controller, target core.Target, addrs []net.Addr) int {
-	return run(ctx, ctl, target, addrs)
+func Run(ctx context.Context, ctl *common.Controller, target core.Target, addrs []net.Addr, stderr io.Writer) int {
+	return run(ctx, ctl, target, addrs, stderr)
 }
 
-func run(ctx context.Context, ctl *common.Controller, target core.Target, addrs []net.Addr, opts ...tea.ProgramOption) int {
+func run(ctx context.Context, ctl *common.Controller, target core.Target, addrs []net.Addr, stderr io.Writer, opts ...tea.ProgramOption) int {
 	var as []string
 	for _, a := range addrs {
 		as = append(as, a.String())
@@ -125,8 +230,8 @@ func run(ctx context.Context, ctl *common.Controller, target core.Target, addrs 
 	in := textinput.New()
 	in.Placeholder = "message or /command"
 	in.Focus()
-	m := &model{ctx: ctx, ctl: ctl, target: target, addrs: strings.Join(as, " "), logs: map[core.PeerID][]string{},
-		vp: viewport.New(), in: in}
+	m := &model{ctx: ctx, ctl: ctl, target: target, addrs: strings.Join(as, " "), logs: map[core.PeerID]*chatLog{},
+		unread: map[core.PeerID]string{}, vp: viewport.New(), in: in}
 	m.refreshContacts()
 	p := tea.NewProgram(m, opts...)
 	go func() {
@@ -141,6 +246,7 @@ func run(ctx context.Context, ctl *common.Controller, target core.Target, addrs 
 		}
 	}()
 	if _, err := p.Run(); err != nil {
+		fmt.Fprintln(stderr, "burrow: the full-screen chat needs a terminal ("+err.Error()+"); --plain works without one")
 		return 1
 	}
 	return 0
@@ -157,8 +263,8 @@ func (m *model) Init() tea.Cmd {
 	} else if m.target.Name != "" {
 		cmds = append(cmds, m.exec("/connect "+m.target.Name))
 	}
-	m.system = append(m.system, "listening on "+m.addrs+" — your fingerprint "+m.ctl.E.Identity().Display, Keys, "type /help for commands")
-	m.system = append(m.system, m.ctl.StartupNotes(false)...)
+	m.note("listening on "+m.addrs+" — your fingerprint "+m.ctl.E.Identity().Display, Keys, "type /help for commands")
+	m.note(m.ctl.StartupNotes(false)...)
 	return tea.Batch(cmds...)
 }
 
@@ -238,6 +344,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			line := m.in.Value()
 			m.in.Reset()
 			m.typing(false)
+			m.setAlert("")
 			if strings.TrimSpace(line) == "" {
 				return m, nil
 			}
@@ -247,10 +354,16 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if strings.HasPrefix(line, "/view") {
 				return m, m.view(strings.TrimSpace(strings.TrimPrefix(line, "/view")))
 			}
-			if current, ok := m.ctl.Selected(); ok && !strings.HasPrefix(line, "/") {
-				m.logs[current] = keep(m.logs[current], "<me> "+common.Body(line)) // what was said, not only that it was queued
-			}
-			return m, m.exec(line)
+			// The line is for the conversation on screen now, even if
+			// another is selected by the time it runs.
+			current, selected := m.ctl.Selected()
+			return m, m.queue(func() outMsg {
+				out, quit := m.ctl.ExecFor(m.ctx, line, current, selected)
+				if selected && !strings.HasPrefix(line, "/") && len(out) == 1 && !strings.HasPrefix(out[0], "! ") {
+					return outMsg{to: current, mine: line} // sent: show what was said, not that it was queued
+				}
+				return outMsg{lines: out, quit: quit}
+			})
 		default:
 			var cmd tea.Cmd
 			m.in, cmd = m.in.Update(msg)
@@ -258,27 +371,28 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, cmd
 		}
 	case noteMsg:
-		m.system = keep(m.system, string(msg))
+		m.note(string(msg))
 	case outMsg:
 		m.busy--
 		if msg.quit {
 			return m, tea.Quit
 		}
-		m.system = keep(m.system, msg.lines...)
+		if msg.mine != "" {
+			m.log(&msg.to, nil, common.Mine(msg.mine))
+		}
+		m.note(msg.lines...)
 		m.refreshContacts()
 	case evMsg:
 		m.ctl.Observe(msg.ev)
 		m.onEvent(msg.ev)
 		if d, ok := msg.ev.(core.TransferDone); ok && d.Image && !d.Peer.Outgoing && common.DetectTerminal() != common.TermNone {
 			m.render()
-			return m, m.inline(&d.Peer.Peer, d.Path, common.DetectTerminal(), thumbCols)
+			return m, m.inline(&d.Peer.Peer, d.Path, common.DetectTerminal(), min(thumbCols, m.vp.Width()))
 		}
 	case inlineMsg:
 		// The placeholder rows scroll with the conversation; the upload goes out raw, once.
-		if msg.peer == nil {
-			m.system = keep(m.system, msg.img.Lines...)
-		} else {
-			m.logs[*msg.peer] = keep(m.logs[*msg.peer], msg.img.Lines...)
+		for _, l := range msg.img.Lines {
+			m.add(msg.peer, entry{text: l, image: true})
 		}
 		m.render()
 		if msg.img.Transmit == "" {
@@ -296,42 +410,66 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 func (m *model) onEvent(ev core.Event) {
 	line := m.ctl.Names.Line(ev)
+	current, selected := m.ctl.Selected()
+	unread := func(p core.PeerID, mark string) {
+		if (!selected || p != current) && m.unread[p] != "!" {
+			m.unread[p] = mark
+		}
+	}
 	switch e := ev.(type) {
 	case core.MessageReceived:
-		m.logs[e.Peer] = keep(m.logs[e.Peer], line)
+		m.log(&e.Peer, nil, line)
+		unread(e.Peer, "•")
 	case core.MessageStatus:
 		if e.Status == core.StatusPending || e.Status == core.StatusFailed {
-			m.logs[e.Peer] = keep(m.logs[e.Peer], dim.Render(line))
+			m.log(&e.Peer, dim.Render, line)
 		}
 	case core.Typing:
 		if line != "" {
-			m.logs[e.Peer] = keep(m.logs[e.Peer], dim.Render(line))
+			m.log(&e.Peer, dim.Render, line)
 		}
 	case core.ImageOffered:
-		m.logs[e.Peer] = keep(m.logs[e.Peer], bold.Render(fmt.Sprintf("* offer #%d, %s%s — /accept %d or /reject %d",
-			m.ctl.Number(e.ID), common.Offer(e), captionOf(e.Caption), m.ctl.Number(e.ID), m.ctl.Number(e.ID))))
+		n := m.ctl.Number(e.ID)
+		m.log(&e.Peer, bold.Render, fmt.Sprintf("* offer #%d, %s%s — /accept %d or /reject %d", n, common.Offer(e), captionOf(e.Caption), n, n))
+		unread(e.Peer, "!")
 	case core.TransferDone:
+		p := &e.Peer.Peer
 		switch {
 		case e.Peer.Outgoing:
-			m.logs[e.Peer.Peer] = keep(m.logs[e.Peer.Peer], dim.Render("* "+common.Kind(e.Image)+" delivered"))
+			m.log(p, dim.Render, "* "+common.Kind(e.Image)+" delivered")
 		case !e.Image:
-			m.logs[e.Peer.Peer] = keep(m.logs[e.Peer.Peer], "* file saved: "+e.Path)
+			m.log(p, nil, "* file saved: "+e.Path)
 		default:
-			n := len(m.ctl.Images())
-			m.logs[e.Peer.Peer] = keep(m.logs[e.Peer.Peer], fmt.Sprintf("* image saved: %s  (/view %d)", e.Path, n))
+			m.log(p, nil, fmt.Sprintf("* image saved: %s  (/view %d)", e.Path, len(m.ctl.Images())))
 		}
 	case core.TransferFailed:
-		m.logs[e.Peer.Peer] = keep(m.logs[e.Peer.Peer], alert.Render(line))
-	case core.NameCollision, core.HandshakeFailed:
-		m.system = keep(m.system, alert.Render(line))
+		m.log(&e.Peer.Peer, alert.Render, line)
+	case core.NameCollision:
+		m.log(nil, alert.Render, line)
+		m.setAlert("NAME COLLISION: two contacts use the same name; see the notes")
+	case core.HandshakeFailed:
+		if e.Retry { // one of many while a contact is away
+			m.log(nil, dim.Render, line)
+		} else {
+			m.log(nil, alert.Render, line)
+		}
 	default:
 		if line != "" {
-			m.system = keep(m.system, line)
+			m.note(line)
 		}
 	}
 	m.refreshContacts()
-	if _, selected := m.ctl.Selected(); !selected && len(m.contacts) == 1 {
+	if !selected && len(m.contacts) == 1 {
 		m.ctl.Select(m.contacts[0].ID)
+	}
+}
+
+// setAlert shows text in a row above the status bar until the next Enter;
+// "" removes the row.
+func (m *model) setAlert(text string) {
+	if text != m.alert {
+		m.alert = text
+		m.layout()
 	}
 }
 
@@ -341,25 +479,53 @@ func (m *model) layout() {
 		w = 20
 	}
 	h := m.h - 3
+	if m.alert != "" {
+		h-- // the alert takes a row of its own
+	}
 	if h < 3 {
 		h = 3
 	}
 	m.vp.SetWidth(w)
 	m.vp.SetHeight(h)
 	m.in.SetWidth(m.w - 4)
+	m.dirty = true
 	m.render()
 }
 
+// render fills the viewport with the notes and the selected conversation,
+// merged in the order their lines were added. It does nothing when neither
+// changed: a busy conversation that is not on screen costs no rendering.
 func (m *model) render() {
-	var lines []string
-	if current, ok := m.ctl.Selected(); ok {
-		lines = m.logs[current]
+	current, selected := m.ctl.Selected()
+	var conv []entry
+	if selected {
+		delete(m.unread, current)
+		if l := m.logs[current]; l != nil {
+			conv = l.lines
+		}
+		if m.shown == nil || *m.shown != current {
+			m.shown, m.dirty = &current, true
+		}
+	} else if m.shown != nil {
+		m.shown, m.dirty = nil, true
 	}
-	all := append(append([]string{}, m.system...), lines...)
-	if len(m.system) > 0 && len(lines) > 0 {
-		all = append(append([]string{}, m.system...), append([]string{dim.Render("────")}, lines...)...)
+	if !m.dirty {
+		return
 	}
-	m.vp.SetContent(strings.Join(all, "\n"))
+	m.dirty = false
+	w := m.vp.Width()
+	rows := make([]string, 0, len(m.system.lines)+len(conv))
+	notes := m.system.lines
+	for len(notes) > 0 || len(conv) > 0 {
+		if len(conv) == 0 || len(notes) > 0 && notes[0].seq < conv[0].seq {
+			rows = append(rows, notes[0].fit(w))
+			notes = notes[1:]
+		} else {
+			rows = append(rows, conv[0].fit(w))
+			conv = conv[1:]
+		}
+	}
+	m.vp.SetContent(strings.Join(rows, "\n"))
 	m.vp.GotoBottom()
 }
 
@@ -367,16 +533,19 @@ func (m *model) View() tea.View {
 	side := []string{bold.Render("contacts")}
 	current, selected := m.ctl.Selected()
 	for _, c := range m.contacts {
-		// Presence and verification stand in two columns of their own, before
-		// the name: whatever a contact called itself cannot reach them.
-		mark, v := " ", "?"
+		// Presence, verification and news stand in columns of their own,
+		// before the name: whatever a contact called itself cannot reach them.
+		mark, v, news := " ", "?", " "
 		if c.Online {
 			mark = "*"
 		}
 		if c.Verified {
 			v = "✓"
 		}
-		label := truncate(mark+v+" "+c.Nickname, sidebarWidth-1)
+		if u := m.unread[c.ID]; u != "" {
+			news = u
+		}
+		label := truncate(mark+v+news+" "+c.Nickname, sidebarWidth-1)
 		if selected && c.ID == current {
 			label = status.Render(label)
 		}
@@ -388,7 +557,11 @@ func (m *model) View() tea.View {
 	if m.busy > 0 {
 		st += " · working…"
 	}
-	v := tea.NewView(strings.Join([]string{body, status.Render(padRight(st, m.w)), "> " + m.in.View()}, "\n"))
+	rows := []string{body, status.Render(padRight(st, m.w)), "> " + m.in.View()}
+	if m.alert != "" {
+		rows = slices.Insert(rows, 1, alert.Render("! "+m.alert))
+	}
+	v := tea.NewView(strings.Join(rows, "\n"))
 	v.AltScreen = true
 	return v
 }
@@ -418,7 +591,7 @@ func (m *model) view(arg string) tea.Cmd {
 			return noteMsg("! this terminal cannot show images inline; the file is at " + imgs[n-1])
 		}
 	}
-	return m.inline(nil, imgs[n-1], kind, viewCols)
+	return m.inline(nil, imgs[n-1], kind, min(viewCols, m.vp.Width()))
 }
 
 type inlineMsg struct {

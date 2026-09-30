@@ -33,13 +33,15 @@ type Controller struct {
 	offers   map[int]core.TransferID    // short numbers for /accept, /reject, /cancel
 	about    map[core.TransferID]string // what each numbered transfer is, size first
 	numOf    map[core.TransferID]int
-	images   []string // saved image paths, for /view
+	ended    map[core.TransferID]bool // transfers that ended before they were numbered
+	images   []string                 // saved image paths, for /view
 }
 
 // NewController wires a controller to an engine.
 func NewController(e *core.Engine, inviteHost string) *Controller {
 	return &Controller{E: e, Names: Names{E: e}, InviteHost: inviteHost, typing: e.TypingEnabled(),
-		offers: map[int]core.TransferID{}, about: map[core.TransferID]string{}, numOf: map[core.TransferID]int{}}
+		offers: map[int]core.TransferID{}, about: map[core.TransferID]string{}, numOf: map[core.TransferID]int{},
+		ended: map[core.TransferID]bool{}}
 }
 
 // Selected returns the contact whose conversation is selected.
@@ -95,9 +97,14 @@ func (c *Controller) TypingOn() bool {
 	return c.typing
 }
 
-// track gives a transfer a short number for /accept, /reject and /cancel.
+// track gives a transfer a short number for /accept, /reject and /cancel,
+// unless it has ended already (a send can fail before SendFile returns).
 // Caller holds mu.
 func (c *Controller) track(id core.TransferID, what string) int {
+	if c.ended[id] {
+		delete(c.ended, id)
+		return 0
+	}
 	c.nextNum++
 	c.offers[c.nextNum], c.numOf[id], c.about[id] = id, c.nextNum, what
 	return c.nextNum
@@ -121,12 +128,20 @@ func (c *Controller) Observe(ev core.Event) {
 	}
 }
 
+// forget drops an ended transfer. One without a number yet is remembered for
+// a while: a send can fail before SendFile has returned its id. Caller holds mu.
 func (c *Controller) forget(id core.TransferID) {
 	delete(c.about, id)
-	if n, ok := c.numOf[id]; ok {
-		delete(c.offers, n)
-		delete(c.numOf, id)
+	n, ok := c.numOf[id]
+	if !ok {
+		if len(c.ended) >= 256 {
+			clear(c.ended)
+		}
+		c.ended[id] = true
+		return
 	}
+	delete(c.offers, n)
+	delete(c.numOf, id)
 }
 
 // Number returns the short number for an offered transfer (0 if unknown).
@@ -184,14 +199,16 @@ func (c *Controller) Resolve(name string) (core.PeerID, error) {
 
 // firstArg splits off the first argument of a command: a quoted string, or
 // the first word. Quotes are how a path or a name with spaces is given.
-func firstArg(rest string) (arg, remainder string) {
+func firstArg(rest string) (arg, remainder string, err error) {
 	if strings.HasPrefix(rest, `"`) {
-		if end := strings.Index(rest[1:], `"`); end >= 0 {
-			return rest[1 : 1+end], strings.TrimSpace(rest[end+2:])
+		end := strings.Index(rest[1:], `"`)
+		if end < 0 {
+			return "", "", errors.New(`a quote is not closed: write "a name or path with spaces" between two quotes`)
 		}
+		return rest[1 : 1+end], strings.TrimSpace(rest[end+2:]), nil
 	}
 	arg, remainder, _ = strings.Cut(rest, " ")
-	return arg, strings.TrimSpace(remainder)
+	return arg, strings.TrimSpace(remainder), nil
 }
 
 // resolveFirst finds the contact at the start of rest and returns what
@@ -200,7 +217,10 @@ func firstArg(rest string) (arg, remainder string) {
 // Smith" both exist), the command is refused rather than sent to a guess.
 func (c *Controller) resolveFirst(rest string) (core.PeerID, string, error) {
 	if strings.HasPrefix(rest, `"`) {
-		name, remainder := firstArg(rest)
+		name, remainder, err := firstArg(rest)
+		if err != nil {
+			return core.PeerID{}, "", err
+		}
 		id, err := c.Resolve(name)
 		return id, remainder, err
 	}
@@ -214,7 +234,14 @@ func (c *Controller) resolveFirst(rest string) (core.PeerID, string, error) {
 		}
 		found, err := c.Resolve(rest[:i])
 		switch {
+		case err == nil && len(names) > 0 && found == id:
+			// The same contact again: a fingerprint pasted in its groups of
+			// four resolves at every group. The longest reading is the one.
+			remainder = strings.TrimSpace(rest[i:])
 		case err == nil:
+			if len(names) > 0 {
+				return core.PeerID{}, "", fmt.Errorf("%s and %q are different contacts; put the name in quotes, or use a fingerprint", strings.Join(names, " and "), rest[:i])
+			}
 			id, remainder = found, strings.TrimSpace(rest[i:])
 			names = append(names, strconv.Quote(rest[:i]))
 		case !errors.Is(err, core.ErrUnknownContact) && firstErr == nil:
@@ -222,10 +249,8 @@ func (c *Controller) resolveFirst(rest string) (core.PeerID, string, error) {
 		}
 	}
 	switch {
-	case len(names) == 1:
+	case len(names) > 0:
 		return id, remainder, nil
-	case len(names) > 1:
-		return core.PeerID{}, "", fmt.Errorf("%s are all contacts; put the name in quotes, or use a fingerprint", strings.Join(names, " and "))
 	case firstErr != nil:
 		return core.PeerID{}, "", firstErr
 	}
@@ -236,7 +261,7 @@ func (c *Controller) resolveFirst(rest string) (core.PeerID, string, error) {
 const Help = `/connect <invite|contact>   connect (an invite string starts with burrow1:)
 /to <contact>               select the conversation for plain text lines
 /msg <contact> <text>       send to a specific contact ("a name with spaces" goes in quotes)
-/contacts                   list contacts (✓ verified, * online)
+/contacts                   list contacts (* online; each line ends in verified or unverified)
 /invite [multi] [tor] [qr] [host] create an invite (single-use, 1 h; tor = onion, qr = also as QR code)
 /safety <contact>           show the safety number to compare out of band
 /verify <contact>           mark verified after comparing safety numbers
@@ -245,31 +270,46 @@ const Help = `/connect <invite|contact>   connect (an invite string starts with 
 /remove <contact>           delete a contact
 /disconnect <contact>       close the session
 /image <path> [caption]     send an image (metadata is stripped first; "a path with spaces" goes in quotes)
-/file <path> [caption]      send any file (.zip, .pdf, …) as it is; only its type is revealed, never its name
+/file <path> [caption]      send any file (.zip, .pdf, …) as it is; only its type is revealed, never its name.
+                            Pictures lose their metadata. /file --as-is sends a photo or video format
+                            Burrow cannot clean (HEIC, RAW, MP4…) with its location and camera data
 /accept <n> | /reject <n>   answer an offer by its number; the offer shows the size first
 /cancel <n>                 cancel a transfer you are sending or receiving
 /transfers                  list offers and running transfers, with their sizes
 /partials                   list partial downloads that can resume
-/view <n>                   show a received image inline (Kitty/iTerm2), n from /images
+/view <n>                   show a received image larger, in the chat (terminals with true colour), n from /images
 /images                     list received images
 /history [n]                show the last n stored messages (needs history = true)
 /typing on|off              send typing indicators (needs typing = true in the settings)
 /id                         show your fingerprint
 /quit                       exit`
 
-// Exec runs one input line. Lines without a leading slash are messages to the
-// current contact. It returns output lines and whether the UI should quit.
+// Exec runs one input line against the conversation selected now. Lines
+// without a leading slash are messages to that contact. It returns output
+// lines and whether the UI should quit.
 func (c *Controller) Exec(ctx context.Context, line string) (out []string, quit bool) {
+	current, selected := c.Selected()
+	return c.ExecFor(ctx, line, current, selected)
+}
+
+// ExecFor is Exec against the conversation that was selected when the user
+// entered the line, which may not be the selected one by the time the line
+// runs: a message goes to the contact the user was looking at.
+func (c *Controller) ExecFor(ctx context.Context, line string, current core.PeerID, selected bool) (out []string, quit bool) {
 	line = strings.TrimSpace(line)
 	if line == "" {
 		return nil, false
 	}
-	current, selected := c.Selected()
 	errNone := errors.New("no conversation selected; use /to <contact>")
 	fail := func(err error) ([]string, bool) { return []string{"! " + err.Error()}, false }
 	if !strings.HasPrefix(line, "/") {
-		if !selected {
+		switch {
+		case !selected:
 			return fail(errNone)
+		case strings.HasPrefix(line, "burrow1:"):
+			// An invite is a password: pasted into the chat by mistake it
+			// would reach whoever the conversation is with.
+			return fail(errors.New("that is an invite and it was not sent; /connect <invite> uses it"))
 		}
 		return c.send(current, line), false
 	}
@@ -297,11 +337,11 @@ func (c *Controller) Exec(ctx context.Context, line string) (out []string, quit 
 			return fail(err)
 		}
 		for _, h := range hist {
-			who := c.Names.Nick(h.Peer)
+			line := fmt.Sprintf("<%s> %s", c.Names.Named(h.Peer), Body(h.Text))
 			if h.Mine {
-				who = "me"
+				line = Mine(h.Text)
 			}
-			out = append(out, fmt.Sprintf("%s <%s> %s", h.At.Local().Format("2006-01-02 15:04"), who, Body(h.Text)))
+			out = append(out, h.At.Local().Format("2006-01-02 15:04 ")+line)
 		}
 		if len(out) == 0 {
 			out = []string{"(no stored messages)"}
@@ -313,12 +353,14 @@ func (c *Controller) Exec(ctx context.Context, line string) (out []string, quit 
 		}
 		var target core.Target
 		if strings.HasPrefix(rest, "burrow1:") {
-			target.Invite = rest
-			if info, err := core.DescribeInvite(rest); err == nil && info.Hostname {
+			// Copied from a screen where it wrapped, an invite arrives with
+			// spaces where its rows broke. It never contains one itself.
+			target.Invite = strings.Join(strings.Fields(rest), "")
+			if info, err := core.DescribeInvite(target.Invite); err == nil && info.Hostname {
 				out = append(out, dnsNote(info.Host))
 			}
 		} else {
-			id, err := c.Resolve(rest)
+			id, err := c.Resolve(strings.Trim(rest, `"`))
 			if err != nil {
 				return fail(err)
 			}
@@ -373,11 +415,17 @@ func (c *Controller) Exec(ctx context.Context, line string) (out []string, quit 
 			default:
 				// A host is an IP address or a name with a dot in it; anything
 				// else is a mistyped option, not where contacts should dial.
+				if _, _, err := net.SplitHostPort(f); err == nil && net.ParseIP(f) == nil {
+					return fail(fmt.Errorf("give the address without a port (%q): the port is your listen_port", f))
+				}
 				if net.ParseIP(f) == nil && !strings.Contains(f, ".") {
 					return fail(fmt.Errorf("unknown /invite option %q (multi, tor, qr, or the address others can reach you at)", f))
 				}
 				opts.Host = f
 			}
+		}
+		if strings.HasSuffix(opts.Host, ".onion") {
+			opts.Kind = "tor" // an onion address is only reachable through Tor
 		}
 		inv, err := c.E.CreateInvite(opts)
 		if err != nil {
@@ -460,21 +508,37 @@ func (c *Controller) Exec(ctx context.Context, line string) (out []string, quit 
 		if !selected {
 			return fail(errNone)
 		}
-		path, caption := firstArg(rest)
+		asIs := false
+		if after, ok := strings.CutPrefix(rest, "--as-is "); ok && cmd == "file" {
+			asIs, rest = true, strings.TrimSpace(after)
+		}
+		path, caption, err := firstArg(rest)
+		if err != nil {
+			return fail(err)
+		}
 		if path == "" {
 			return fail(fmt.Errorf(`usage: /%s <path> [caption]   (a path with spaces: /%s "my file.zip")`, cmd, cmd))
 		}
-		send, note := c.E.SendImage, "metadata is stripped first"
+		var id core.TransferID
+		note := "metadata is stripped first"
 		if cmd == "file" {
-			send, note = c.E.SendFile, "images lose their metadata; other files are sent as they are"
+			note = "pictures lose their metadata; other files are sent as they are"
+			id, err = c.E.SendFile(ctx, current, path, caption, asIs)
+		} else {
+			id, err = c.E.SendImage(ctx, current, path, caption)
 		}
-		id, err := send(ctx, current, path, caption)
+		if errors.Is(err, core.ErrKeepsMetadata) {
+			return fail(fmt.Errorf("%w; convert it to JPEG or PNG first, or send it as it is with /file --as-is <path>", err))
+		}
 		if err != nil {
 			return fail(err)
 		}
 		c.mu.Lock()
 		n := c.track(id, cmd+" "+filepath.Base(path)+" to "+c.Names.Nick(current))
 		c.mu.Unlock()
+		if n == 0 {
+			return nil, false // it has ended already; the event says how
+		}
 		return []string{fmt.Sprintf("* preparing %s #%d (%s); /cancel %d stops it", cmd, n, note, n)}, false
 	case "accept", "reject", "cancel":
 		id, err := c.transferByNum(rest)
@@ -542,6 +606,18 @@ func (c *Controller) send(id core.PeerID, text string) []string {
 		return []string{"! " + err.Error()}
 	}
 	return []string{fmt.Sprintf("* queued %016x to %s", uint64(mid), c.Names.Nick(id))}
+}
+
+// Line renders an event like Names.Line, with the short number of an offer
+// filled in, so that the line says exactly what to type.
+func (c *Controller) Line(ev core.Event) string {
+	line := c.Names.Line(ev)
+	if o, ok := ev.(core.ImageOffered); ok {
+		if n := c.Number(o.ID); n > 0 {
+			line = strings.Replace(line, "/accept <n> or /reject <n>", fmt.Sprintf("/accept %d or /reject %d", n, n), 1)
+		}
+	}
+	return line
 }
 
 // StartupNotes lists partial downloads that can resume. With always set it

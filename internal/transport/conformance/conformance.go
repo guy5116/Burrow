@@ -98,15 +98,13 @@ func Run(t *testing.T, tr transport.Transport, addrFor func(net.Addr) transport.
 		}
 	})
 
+	// Last, because it closes the listener: a transport need not listen
+	// twice (Tor publishes one onion service per key).
 	t.Run("close unblocks accept", func(t *testing.T) {
-		ln2, err := tr.Listen(ctx)
-		if err != nil {
-			t.Fatal(err)
-		}
 		done := make(chan error, 1)
-		go func() { _, err := ln2.Accept(); done <- err }()
+		go func() { _, err := ln.Accept(); done <- err }()
 		time.Sleep(20 * time.Millisecond)
-		_ = ln2.Close()
+		_ = ln.Close()
 		select {
 		case err := <-done:
 			if err == nil || errors.Is(err, context.Canceled) {

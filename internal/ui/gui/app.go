@@ -12,6 +12,7 @@ import (
 	"log/slog"
 	"regexp"
 	"strconv"
+	"sync"
 
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/app"
@@ -39,21 +40,29 @@ type App struct {
 	done   chan struct{}
 
 	// UI model: touched only on the Fyne thread.
-	contacts []core.Contact
-	sel      *core.PeerID
-	msgs     map[core.PeerID][]*row
-	byMsg    map[core.MsgID]*row
-	list     *widget.List
-	conv     *fyne.Container
-	scroll   *container.Scroll
-	status   *widget.Label
-	composer *widget.Entry
-	offers   map[core.TransferID]dialog.Dialog
-	typingTo *core.PeerID // the contact who was last told that we are typing
+	contacts  []core.Contact
+	sel       *core.PeerID
+	unread    map[core.PeerID]bool // a message arrived while another conversation was open
+	msgs      map[core.PeerID][]*row
+	byMsg     map[core.MsgID]*row
+	transfers map[core.TransferID]*row // rows with a Cancel button
+	list      *widget.List
+	header    *widget.Label // names the open conversation
+	conv      *fyne.Container
+	scroll    *container.Scroll
+	status    *widget.Label
+	composer  *widget.Entry
+	offers    map[core.TransferID]dialog.Dialog
+	typingTo  *core.PeerID   // the contact who was last told that we are typing
+	inFlight  sync.WaitGroup // async work; tests wait for it (Fyne's test driver runs fyne.Do at once)
 }
 
-// maxRows bounds what is kept per conversation; the oldest rows go first.
-const maxRows = 5000
+// A contact can send without end: each conversation keeps its newest rows,
+// up to maxRows and maxRowBytes of text, and drops the oldest.
+const (
+	maxRows     = 5000
+	maxRowBytes = 1 << 20
+)
 
 // dialog is the interface the offers map holds (kept for tests).
 type dialogT = dialog.Dialog
@@ -65,7 +74,8 @@ func Run(paths store.Paths, cfg store.Config, logger *slog.Logger) int {
 		logger = slog.New(slog.DiscardHandler)
 	}
 	a := &App{fa: app.NewWithID("io.github.guy5116.burrow"), paths: paths, cfg: cfg, log: logger,
-		msgs: map[core.PeerID][]*row{}, byMsg: map[core.MsgID]*row{}, offers: map[core.TransferID]dialog.Dialog{}}
+		unread: map[core.PeerID]bool{}, msgs: map[core.PeerID][]*row{}, byMsg: map[core.MsgID]*row{},
+		transfers: map[core.TransferID]*row{}, offers: map[core.TransferID]dialog.Dialog{}}
 	a.win = a.fa.NewWindow("Burrow")
 	a.win.Resize(fyne.NewSize(900, 600))
 	a.win.SetMaster()
@@ -80,7 +90,9 @@ func Run(paths store.Paths, cfg store.Config, logger *slog.Logger) int {
 // wait for the disk, the network or Argon2 goes through here: the window
 // stays responsive meanwhile.
 func (a *App) async(work func() error, then func(error)) {
+	a.inFlight.Add(1)
 	go func() {
+		defer a.inFlight.Done()
 		err := work()
 		fyne.Do(func() { then(err) })
 	}()
@@ -144,13 +156,15 @@ func (a *App) startEngine(st *store.Store) {
 		errc <- err
 		close(a.done)
 	}()
-	// Drain events on a dedicated goroutine; marshal to the UI thread.
+	// Drain events on a dedicated goroutine and wait for the UI thread to
+	// apply each: a window that falls behind slows the engine down (§2.3)
+	// instead of queueing events without bound.
 	go func() {
 		for {
 			select {
 			case ev := <-e.Events():
 				a.ctl.Observe(ev)
-				fyne.Do(func() { a.apply(ev) })
+				fyne.DoAndWait(func() { a.apply(ev) })
 			case <-e.Done():
 				return
 			}
@@ -166,13 +180,16 @@ func (a *App) startEngine(st *store.Store) {
 
 // row is one line in a conversation.
 type row struct {
-	kind   rowKind
-	text   string
-	mine   bool
-	id     core.MsgID // of a message we sent
-	status core.Status
-	path   string // image file
-	widget fyne.CanvasObject
+	kind     rowKind
+	text     string
+	mine     bool
+	id       core.MsgID // of a message we sent
+	status   core.Status
+	path     string           // image file
+	transfer *core.TransferID // a transfer this row can cancel while it runs
+	widget   fyne.CanvasObject
+	mark     *widget.Label  // the delivery state of a message we sent
+	cancel   *widget.Button // stops the transfer; hidden once it ended
 }
 
 type rowKind uint8
@@ -195,11 +212,32 @@ func (a *App) selected() (core.PeerID, bool) {
 	return *a.sel, true
 }
 
-// choose makes id the selected conversation in the window and the controller.
+// choose makes id the selected conversation in the window and the
+// controller. Only the sidebar calls it; everything else calls openChat.
 func (a *App) choose(id core.PeerID) {
 	a.setTyping(false)
 	a.sel = &id
 	a.ctl.Select(id)
+	delete(a.unread, id)
+}
+
+// openChat selects a contact's conversation through the sidebar, so that the
+// highlighted row and the recipient never differ.
+func (a *App) openChat(id core.PeerID) {
+	a.refreshContacts()
+	if i := a.indexOf(id); i >= 0 {
+		a.list.Select(i)
+	}
+}
+
+// indexOf returns the sidebar row of a contact, or -1.
+func (a *App) indexOf(id core.PeerID) int {
+	for i, c := range a.contacts {
+		if c.ID == id {
+			return i
+		}
+	}
+	return -1
 }
 
 // setTyping tells the selected contact that we started or stopped typing,

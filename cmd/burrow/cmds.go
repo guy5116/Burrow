@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"flag"
@@ -21,11 +22,11 @@ import (
 
 const insecureWarning = "WARNING: creating a store WITHOUT a passphrase. Anyone who can read your data directory can read your identity, contacts and invites. Use `burrow passphrase` later to add one."
 
-func (a *app) cmdInit(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
+func (a *app) cmdInit(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("init", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	insecure := fs.Bool("insecure-no-passphrase", false, "store the master key unencrypted on disk")
-	if err := fs.Parse(args); err != nil {
+	if err := fs.Parse(args); err != nil || tooMany(fs, 0, stderr) {
 		return 2
 	}
 	var pw []byte
@@ -33,18 +34,18 @@ func (a *app) cmdInit(args []string, stdin io.Reader, stdout, stderr io.Writer) 
 		fmt.Fprintln(stderr, insecureWarning)
 	} else {
 		var err error
-		if pw, err = readSecret("Choose a passphrase: ", stdin, stderr, false); err != nil {
+		if pw, err = readSecret(ctx, "Choose a passphrase: ", stdin, stderr, false); err != nil {
 			return exitErr(stderr, err)
 		}
 		if len(pw) == 0 {
 			return exitErr(stderr, errors.New("passphrase must not be empty"))
 		}
-		again, err := readSecret("Repeat the passphrase: ", stdin, stderr, false)
+		again, err := readSecret(ctx, "Repeat the passphrase: ", stdin, stderr, false)
 		if err != nil {
 			secret.Wipe(pw)
 			return exitErr(stderr, err)
 		}
-		same := string(pw) == string(again)
+		same := bytes.Equal(pw, again)
 		secret.Wipe(again)
 		if !same {
 			secret.Wipe(pw)
@@ -72,14 +73,14 @@ func (a *app) cmdInit(args []string, stdin io.Reader, stdout, stderr io.Writer) 
 	return 0
 }
 
-func (a *app) cmdID(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
+func (a *app) cmdID(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("id", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	qr := fs.Bool("qr", false, "also print a QR code")
 	if err := fs.Parse(args); err != nil || tooMany(fs, 0, stderr) {
 		return 2
 	}
-	st, err := a.unlock(stdin, stderr)
+	st, err := a.unlock(ctx, stdin, stderr)
 	if err != nil {
 		return exitErr(stderr, err)
 	}
@@ -132,39 +133,54 @@ func (a *app) inviteHost(flagHost string) (string, error) {
 	return "", errors.New("cannot guess your address; pass --host <ip-or-hostname> or set `burrow config set invite_host <addr>`")
 }
 
-func (a *app) cmdInvite(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
+func (a *app) cmdInvite(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("invite", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	ttl := fs.Duration("ttl", time.Hour, "validity")
 	multi := fs.Bool("multi-use", false, "allow up to 64 peers")
 	qr := fs.Bool("qr", false, "also print a QR code")
 	host := fs.String("host", "", "address peers should dial (IP literal, hostname, .onion)")
-	torFlag := fs.Bool("tor", false, "onion invite (only from inside a running `burrow listen` with transport=tor: use /invite there)")
+	onion := fs.Bool("tor", false, "an invite to your onion address (needs transport tor or both)")
 	if err := fs.Parse(args); err != nil || tooMany(fs, 0, stderr) {
 		return 2
 	}
-	if *torFlag {
-		return exitErr(stderr, errors.New("an onion address exists only while tor runs: start `burrow listen` and type /invite"))
+	opts := core.InviteOptions{TTL: *ttl, MultiUse: *multi}
+	switch {
+	case *onion && *host != "":
+		return exitErr(stderr, errors.New("--tor and --host exclude each other"))
+	case *onion && a.cfg.Transport == "tcp":
+		return exitErr(stderr, errors.New("tor is off; `burrow config set transport tor` (or both) first"))
+	case !*onion:
+		h, err := a.inviteHost(*host)
+		if err != nil {
+			return exitErr(stderr, err)
+		}
+		opts.Host = h
 	}
-	h, err := a.inviteHost(*host)
-	if err != nil {
-		return exitErr(stderr, err)
-	}
-	st, err := a.unlock(stdin, stderr)
+	st, err := a.unlock(ctx, stdin, stderr)
 	if err != nil {
 		return exitErr(stderr, err)
 	}
 	defer st.Close()
+	if *onion {
+		// The address follows from the key: no need to start tor for it.
+		key, err := st.LoadOnionKey()
+		if err != nil {
+			return exitErr(stderr, err)
+		}
+		opts.Host, opts.Kind = core.OnionAddressOf(key), "tor"
+		clear(key)
+	}
 	e, err := core.New(a.engineConfig(), st, nil, a.log)
 	if err != nil {
 		return exitErr(stderr, err)
 	}
 	defer e.Close()
-	inv, err := e.CreateInvite(core.InviteOptions{Host: h, TTL: *ttl, MultiUse: *multi})
+	inv, err := e.CreateInvite(opts)
 	if err != nil {
 		return exitErr(stderr, err)
 	}
-	if net.ParseIP(h) == nil && !strings.HasSuffix(h, ".onion") {
+	if net.ParseIP(opts.Host) == nil && opts.Kind != "tor" {
 		fmt.Fprintln(stderr, "note: a hostname makes your peer's DNS resolver learn it; an IP literal is more private")
 	}
 	fmt.Fprintf(stderr, "invite id %s, expires %s; share it over a channel you trust and treat it like a password\n", inv.ID, inv.Expiry.Local().Format(time.RFC822))
@@ -183,11 +199,11 @@ func (a *app) engineConfig() core.Config {
 		MDNS: a.cfg.MDNS, History: a.cfg.History, MaxPeers: a.cfg.MaxPeers}
 }
 
-func (a *app) cmdContacts(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
+func (a *app) cmdContacts(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	if len(args) == 0 {
 		args = []string{"list"}
 	}
-	st, err := a.unlock(stdin, stderr)
+	st, err := a.unlock(ctx, stdin, stderr)
 	if err != nil {
 		return exitErr(stderr, err)
 	}
@@ -258,14 +274,14 @@ func (a *app) cmdConfig(args []string, stdout, stderr io.Writer) int {
 	return exitErr(stderr, errors.New("usage: burrow config get [key] | set <key> <value>"))
 }
 
-func (a *app) cmdPassphrase(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
+func (a *app) cmdPassphrase(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("passphrase", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	insecure := fs.Bool("insecure-no-passphrase", false, "switch to an unencrypted master key")
-	if err := fs.Parse(args); err != nil {
+	if err := fs.Parse(args); err != nil || tooMany(fs, 0, stderr) {
 		return 2
 	}
-	st, err := a.unlock(stdin, stderr)
+	st, err := a.unlock(ctx, stdin, stderr)
 	if err != nil {
 		return exitErr(stderr, err)
 	}
@@ -274,15 +290,15 @@ func (a *app) cmdPassphrase(args []string, stdin io.Reader, stdout, stderr io.Wr
 	if *insecure {
 		fmt.Fprintln(stderr, insecureWarning)
 	} else {
-		if pw, err = readSecret("New passphrase: ", stdin, stderr, false); err != nil {
+		if pw, err = readSecret(ctx, "New passphrase: ", stdin, stderr, false); err != nil {
 			return exitErr(stderr, err)
 		}
-		again, err := readSecret("Repeat the new passphrase: ", stdin, stderr, false)
+		again, err := readSecret(ctx, "Repeat the new passphrase: ", stdin, stderr, false)
 		if err != nil {
 			secret.Wipe(pw)
 			return exitErr(stderr, err)
 		}
-		same := string(pw) == string(again)
+		same := bytes.Equal(pw, again)
 		secret.Wipe(again)
 		if !same || len(pw) == 0 {
 			secret.Wipe(pw)
@@ -300,8 +316,12 @@ func (a *app) cmdPassphrase(args []string, stdin io.Reader, stdout, stderr io.Wr
 	return 0
 }
 
-func (a *app) cmdBurn(stdin io.Reader, stdout, stderr io.Writer) int {
-	st, err := a.unlock(stdin, stderr)
+func (a *app) cmdBurn(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.Writer) int {
+	if len(args) > 0 {
+		fmt.Fprintf(stderr, "burrow burn: unexpected argument %q\n", args[0])
+		return 2
+	}
+	st, err := a.unlock(ctx, stdin, stderr)
 	if err != nil {
 		return exitErr(stderr, err)
 	}

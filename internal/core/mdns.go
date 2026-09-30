@@ -41,8 +41,15 @@ func (e *Engine) runMDNS(port uint16) {
 // onAnnouncement matches the tag against every contact and dials once.
 func (e *Engine) onAnnouncement(an mdns.Announcement) {
 	if id, ok := e.matchAnnouncement(an.Nonce, an.Tag); ok {
-		addr := transport.Address{Kind: transport.KindTCP, Host: an.IP.String(), Port: an.Port}
-		e.spawn(nil, func() { _ = e.dial(e.ctx, addr, id, nil, "") }) // dial records the address on success
+		host := an.IP.String()
+		if an.Zone != "" { // a link-local IPv6 address is only reachable through its interface
+			host += "%" + an.Zone
+		}
+		addr := transport.Address{Kind: transport.KindTCP, Host: host, Port: an.Port}
+		// The address is used, not saved: anyone on the LAN can send an
+		// announcement, and a saved address is where reconnects go. Failures
+		// are not shown either: nobody asked for this dial.
+		e.spawn(nil, func() { _ = e.dial(e.ctx, addr, id, dialOpts{quiet: true, unsaved: true}) })
 	}
 }
 

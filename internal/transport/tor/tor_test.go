@@ -5,6 +5,8 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
+	"encoding/hex"
+	"errors"
 	"net"
 	"os"
 	"testing"
@@ -89,5 +91,53 @@ func TestTorOutlivesItsStart(t *testing.T) {
 	defer cancel()
 	if _, _, err := launch(start, nil); err == nil || life.Err() == nil {
 		t.Fatal("a start that ran out of time left tor running", err)
+	}
+}
+
+// The address is computed from the key alone, as tor computes it. The vector
+// is tor's own (test_hs_common.c, test_build_address).
+func TestAddress(t *testing.T) {
+	pub, _ := hex.DecodeString("d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a")
+	key := ed25519.NewKeyFromSeed(make([]byte, 32))
+	copy(key[32:], pub) // Address reads only the public half
+	if got := Address(key); got != "25njqamcweflpvkl73j4szahhihoc4xt3ktcgjnpaingr5yhkenl5sid.onion" {
+		t.Fatal(got)
+	}
+}
+
+// Readers never wait for a tor that is still starting, and Close stops it.
+func TestStartDoesNotBlockReaders(t *testing.T) {
+	defer func() { startTor = tor.Start }()
+	started := make(chan struct{})
+	startTor = func(ctx context.Context, _ *tor.StartConf) (*tor.Tor, error) {
+		close(started)
+		<-ctx.Done() // bootstrapping for ever
+		return nil, ctx.Err()
+	}
+	_, key, _ := ed25519.GenerateKey(rand.Reader)
+	tr := New(key, 1, os.Args[0], t.TempDir()) // any file that exists will do as the binary
+	errc := make(chan error, 1)
+	go func() { _, err := tr.Listen(context.Background()); errc <- err }()
+	<-started
+	done := make(chan struct{})
+	go func() { _ = tr.OnionAddress(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("OnionAddress waited for the start")
+	}
+	if err := tr.Close(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-errc:
+		if err == nil {
+			t.Fatal("Listen succeeded after Close")
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("Close did not stop the start")
+	}
+	if _, err := tr.Dial(context.Background(), transport.Address{Kind: transport.KindTor, Host: "x.onion", Port: 1}); !errors.Is(err, errClosed) {
+		t.Fatal("a closed transport started again", err)
 	}
 }

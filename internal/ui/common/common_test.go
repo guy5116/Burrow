@@ -6,6 +6,8 @@ import (
 	"image"
 	"image/color"
 	"net"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -232,7 +234,7 @@ func TestControllerCommands(t *testing.T) {
 	if out := exec(t, a.ctl, "/file"); !strings.HasPrefix(out, "! usage: /file") {
 		t.Fatal(out)
 	}
-	if out := exec(t, a.ctl, "/file /nonexistent/x.zip"); !strings.HasPrefix(out, "* preparing file") {
+	if out := exec(t, a.ctl, "/file /nonexistent/x.zip"); !strings.HasPrefix(out, "! open") { // the file is read before anything is offered
 		t.Fatal(out)
 	}
 	// A received file that is not an image is never listed for display.
@@ -682,16 +684,71 @@ func TestQuotedArguments(t *testing.T) {
 		`"my file.zip" a caption`: {"my file.zip", "a caption"},
 		`plain.zip a caption`:     {"plain.zip", "a caption"},
 		`"only"`:                  {"only", ""},
-		`"never closed`:           {`"never`, "closed"},
 		``:                        {"", ""},
 	} {
-		if arg, rest := firstArg(in); arg != want[0] || rest != want[1] {
-			t.Errorf("%q: %q, %q", in, arg, rest)
+		if arg, rest, err := firstArg(in); err != nil || arg != want[0] || rest != want[1] {
+			t.Errorf("%q: %q, %q, %v", in, arg, rest, err)
 		}
 	}
+	if _, _, err := firstArg(`"never closed`); err == nil {
+		t.Fatal("an unclosed quote was taken as a word")
+	}
 	a := newNode(t, core.Config{})
-	if out := exec(t, a.ctl, "/invite mutli"); !strings.HasPrefix(out, "! unknown /invite option") {
+	for line, want := range map[string]string{
+		"/invite mutli":            "! unknown /invite option",
+		"/invite 192.0.2.1:47337":  "! give the address without a port",
+		"/invite host.example:443": "! give the address without a port",
+		`/file "my file.zip`:       "! a quote is not closed",
+	} {
+		a.ctl.Select(core.PeerID{1})
+		if out := exec(t, a.ctl, line); !strings.HasPrefix(out, want) {
+			t.Errorf("%s: %s", line, out)
+		}
+	}
+	// An onion address is only reachable through Tor: the invite says so.
+	out := strings.Split(exec(t, a.ctl, "/invite "+strings.Repeat("a", 56)+".onion"), "\n")
+	if len(out) < 2 {
 		t.Fatal(out)
+	}
+	if info, err := core.DescribeInvite(out[1]); err != nil || info.Kind != "tor" {
+		t.Fatal(info.Kind, err)
+	}
+}
+
+// A line is sent to the conversation that was selected when it was entered,
+// an invite pasted into the chat is not sent at all, and an invite that
+// wrapped on screen still connects.
+func TestLinesGoWhereTheyWereTyped(t *testing.T) {
+	a := newNode(t, core.Config{})
+	b := newNode(t, core.Config{DisplayName: "Bob"})
+	c := newNode(t, core.Config{DisplayName: "Carol"})
+	for _, n := range []*node{b, c} {
+		inv := strings.Split(exec(t, a.ctl, "/invite 127.0.0.1"), "\n")[1]
+		broken := inv[:30] + " " + inv[30:60] + "  " + inv[60:] // as copied from wrapped rows
+		if out := exec(t, n.ctl, "/connect "+broken); !strings.Contains(out, "connected") {
+			t.Fatal(out)
+		}
+	}
+	bob, carol := b.e.Identity().ID, c.e.Identity().ID
+	a.ctl.Select(carol) // the user moved on before the line ran
+	out, _ := a.ctl.ExecFor(context.Background(), "for Bob only", bob, true)
+	if len(out) != 1 || !strings.Contains(out[0], "to Bob") {
+		t.Fatal(out)
+	}
+	b.wait(t, func(ev core.Event) bool { m, ok := ev.(core.MessageReceived); return ok && m.Text == "for Bob only" })
+	out, _ = a.ctl.ExecFor(context.Background(), strings.Split(exec(t, a.ctl, "/invite 127.0.0.1"), "\n")[1], bob, true)
+	if len(out) != 1 || !strings.Contains(out[0], "that is an invite") {
+		t.Fatal(out)
+	}
+	// A fingerprint pasted in its groups of four names one contact.
+	fp := b.e.Identity().Display
+	if out := exec(t, a.ctl, "/msg "+fp+" grouped"); !strings.Contains(out, "to Bob") {
+		t.Fatal(fp, out)
+	}
+	b.wait(t, func(ev core.Event) bool { m, ok := ev.(core.MessageReceived); return ok && m.Text == "grouped" })
+	// Our own lines carry a mark that no received line can start with.
+	if got := Mine("hi\nthere"); got != "» hi\n"+Gutter+"there" {
+		t.Fatalf("%q", got)
 	}
 }
 
@@ -711,5 +768,23 @@ func TestSlowConnectKeepsSelection(t *testing.T) {
 	}
 	if !a.ctl.selectAfter(a.ctl.selections(), second) {
 		t.Fatal("an undisturbed connect must select its contact")
+	}
+}
+
+// A photo format Burrow cannot clean is refused with the way round it, and
+// --as-is sends it anyway.
+func TestFileAsIs(t *testing.T) {
+	a := newNode(t, core.Config{})
+	path := filepath.Join(t.TempDir(), "photo.heic")
+	if err := os.WriteFile(path, []byte("\x00\x00\x00\x18ftypheic\x00\x00\x00\x00"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	a.ctl.Select(core.PeerID{1})
+	if out := exec(t, a.ctl, "/file "+path); !strings.Contains(out, "HEIC") || !strings.Contains(out, "/file --as-is") {
+		t.Fatal(out)
+	}
+	// Past the metadata check, it fails only because nobody is connected.
+	if out := exec(t, a.ctl, "/file --as-is "+path); strings.Contains(out, "HEIC") || !strings.HasPrefix(out, "! ") {
+		t.Fatal(out)
 	}
 }

@@ -157,6 +157,7 @@ type HandshakeFailed struct {
 	Peer   PeerID // zero for an invite whose responder is unknown
 	Stage  string
 	Reason string
+	Retry  bool // an automatic reconnect attempt failed; another will follow
 }
 
 // NewPeerViaInvite: a contact was created from an invite (either side).

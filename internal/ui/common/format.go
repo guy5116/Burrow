@@ -45,13 +45,19 @@ func Verification(verified bool) string {
 	return "unverified"
 }
 
-// continuation starts every line of a message after the first. A message may
+// Gutter starts every line of a message after the first. A message may
 // contain line breaks; without the gutter its second line could pass for a
 // line of its own: a system notice, or a message from someone else.
-const continuation = "\n    │ "
+const Gutter = "    │ "
+
+const continuation = "\n" + Gutter
 
 // Body prepares message text for display under a sender's name.
 func Body(text string) string { return strings.ReplaceAll(text, "\n", continuation) }
+
+// Mine renders a message the user wrote. A received message always starts
+// with a time or "<", so no contact can produce a line that starts like this.
+func Mine(text string) string { return "» " + Body(text) }
 
 // Nick returns just the nickname (or short fingerprint).
 func (n Names) Nick(id core.PeerID) string {
@@ -93,7 +99,9 @@ func (n Names) Line(ev core.Event) string {
 		if !e.SentAt.IsZero() {
 			ts = e.SentAt.Local().Format("15:04 ")
 		}
-		return fmt.Sprintf("%s<%s> %s", ts, n.Nick(e.Peer), Body(e.Text))
+		// The sender is named with the start of its fingerprint: a name alone
+		// is whatever the contact chose, "me" and another contact's name included.
+		return fmt.Sprintf("%s<%s> %s", ts, n.Named(e.Peer), Body(e.Text))
 	case core.MessageStatus:
 		return fmt.Sprintf("* message %016x to %s: %s", uint64(e.ID), n.Nick(e.Peer), e.Status)
 	case core.Typing:
@@ -167,8 +175,11 @@ func Offer(e core.ImageOffered) string {
 	if e.Format != core.FormatFile {
 		return fmt.Sprintf("an image: %s, %s %d×%d", Size(e.Size), FormatName(e.Format), e.Width, e.Height)
 	}
-	if e.Ext == "" {
+	switch saved := core.SavedExt(e.Ext); {
+	case e.Ext == "":
 		return fmt.Sprintf("a file: %s, no file type given", Size(e.Size))
+	case saved != e.Ext:
+		return fmt.Sprintf("a file: %s, type .%s, a type that can run by itself (saved as .%s)", Size(e.Size), e.Ext, saved)
 	}
 	return fmt.Sprintf("a file: %s, type .%s", Size(e.Size), e.Ext)
 }
@@ -213,7 +224,7 @@ func (n Names) JSON(ev core.Event) map[string]any {
 		if e.Peer != (core.PeerID{}) {
 			peer(e.Peer)
 		}
-		m["stage"], m["reason"] = e.Stage, e.Reason
+		m["stage"], m["reason"], m["retry"] = e.Stage, e.Reason, e.Retry
 	case core.NewPeerViaInvite:
 		peer(e.Peer)
 		m["invite_id"], m["own_invite"] = e.InviteID, e.InviteID != ""

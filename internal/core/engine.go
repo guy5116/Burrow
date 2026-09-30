@@ -93,8 +93,10 @@ type Engine struct {
 	listeners    []transport.Listener
 	orphanQueues map[PeerID][]*queued // a contact's message queue while no session is live
 	reconnects   map[PeerID]*reconnect
-	dialing      map[PeerID]int  // our dials in progress, per contact
-	heldBack     map[PeerID]bool // a disconnect not reported yet: a dial that may replace the session is running
+	dials        int             // our dials in progress
+	connecting   map[PeerID]int  // handshakes in progress with a known key, both ways, per contact
+	heldBack     map[PeerID]bool // a disconnect not reported yet: a handshake that may replace the session is running
+	histBehind   bool            // history dropped a message because its writer fell behind (reported once)
 	transfers    map[TransferID]*transfer
 	dedup        map[PeerID]*dedup // received TEXT ids per contact; outlives the sessions
 	mdnsSeen     map[[16]byte]bool // announcement nonces already examined
@@ -117,7 +119,7 @@ func New(cfg Config, st *store.Store, trs []transport.Transport, logger *slog.Lo
 		limiters: map[transport.Kind]*handshake.FailureLimiter{}, reserved: map[[16]byte]PeerID{}, peers: map[PeerID]*peer{},
 		bySession: map[*session.Session]*peer{}, orphanQueues: map[PeerID][]*queued{}, reconnects: map[PeerID]*reconnect{},
 		transfers: map[TransferID]*transfer{}, dedup: map[PeerID]*dedup{}, mdnsSeen: map[[16]byte]bool{},
-		dialing: map[PeerID]int{}, heldBack: map[PeerID]bool{},
+		connecting: map[PeerID]int{}, heldBack: map[PeerID]bool{},
 		cmds: make(chan func()), inbound: make(chan session.Inbound, wire.ChatQueueCap), closedS: make(chan *session.Session),
 		emitCh: make(chan Event), stop: make(chan struct{}), loopDone: make(chan struct{})}
 	e.ctx, e.cancel = context.WithCancel(context.Background())
@@ -276,6 +278,8 @@ func (e *Engine) Identity() Identity {
 // Start opens listeners and runs until ctx ends, then shuts down gracefully:
 // BYE to established peers (best effort), listeners closed, secrets cleared.
 func (e *Engine) Start(ctx context.Context) error {
+	// Ending ctx ends everything the engine does, a Tor bootstrap included.
+	defer context.AfterFunc(ctx, e.cancel)()
 	var listeners []transport.Listener
 	for kind, tr := range e.trs {
 		ln, err := tr.Listen(e.ctx)
@@ -294,7 +298,8 @@ func (e *Engine) Start(ctx context.Context) error {
 		e.listeners = listeners
 		close(e.ready)
 	})
-	if e.cfg.MDNS {
+	// mDNS announces a LAN address: never when this instance runs over Tor only.
+	if _, tcp := e.trs[transport.KindTCP]; e.cfg.MDNS && tcp {
 		e.runMDNS(e.listenPortOf())
 	}
 	select {
@@ -340,6 +345,17 @@ func (e *Engine) Close() {
 	e.wg.Wait()
 	e.stopOnce.Do(func() { close(e.stop) })
 	<-e.loopDone
+	// The loop may have stopped before it heard of every closed session:
+	// nothing of a transfer may outlive the engine (the accept prompt's timer
+	// would otherwise fire ten minutes later).
+	e.do(func() {
+		for _, t := range e.transfers {
+			if t.timer != nil {
+				t.timer.Stop()
+			}
+			t.cancel()
+		}
+	})
 	e.doneOnce.Do(func() {
 		for _, tr := range e.trs {
 			if c, ok := tr.(interface{ Close() error }); ok {
@@ -380,8 +396,11 @@ func (e *Engine) acceptLoop(tr transport.Transport, ln transport.Listener) {
 		lim := e.limiters[tr.Kind()]
 		limited := lim.Limited(key, e.now())
 		admit := false
+		// Handshakes that have not shown a key count against their own limit
+		// only: holding connections open without a key must not take the
+		// places of peers, nor stop this side from dialing.
 		e.do(func() {
-			busy := e.pending >= wire.MaxPendingHandshakes || len(e.peers)+e.pending >= e.cfg.maxPeers()
+			busy := e.pending >= wire.MaxPendingHandshakes || len(e.peers) >= e.cfg.maxPeers()
 			if tr.Kind() == transport.KindTor && limited {
 				limited = e.pending >= wire.TorLimitedSlots
 			}
@@ -414,6 +433,9 @@ func (e *Engine) serve(tr transport.Transport, conn net.Conn, key string, lim *h
 		}
 		return d
 	}, e.replay)
+	if res != nil && res.Token != nil {
+		defer clear(res.Token[:])
+	}
 	if err != nil {
 		_ = conn.Close()
 		e.releaseToken(peer, token)
@@ -421,7 +443,11 @@ func (e *Engine) serve(tr transport.Transport, conn net.Conn, key string, lim *h
 		e.log.Debug("inbound handshake failed", "stage", stageOf(err))
 		return
 	}
-	if err := e.establish(conn, tr.Kind(), res, token, ""); err != nil {
+	e.do(func() { e.connecting[res.Peer]++ })
+	defer e.do(func() { e.connectEndedL(res.Peer) })
+	err = e.establish(conn, tr.Kind(), res, token, "")
+	if err != nil && !errors.Is(err, errLostGlare) {
+		lim.Fail(key, e.now())                                                 // a key that never says HELLO holds a place like a key-less probe
 		e.log.Debug("inbound session failed", "reason", disconnectReason(err)) // category only: no addresses
 	}
 }
@@ -485,7 +511,8 @@ func (e *Engine) releaseTokenL(p PeerID, tok *[16]byte) {
 }
 
 // Connect dials an invite or a saved contact and returns once the session is
-// established (both HELLOs) or fails.
+// established (both HELLOs) or fails. A contact is tried at every address it
+// is known at, most recent first.
 func (e *Engine) Connect(ctx context.Context, target Target) (PeerID, error) {
 	if target.InviteBytes != nil {
 		defer clear(target.InviteBytes)
@@ -501,6 +528,7 @@ func (e *Engine) Connect(ctx context.Context, target Target) (PeerID, error) {
 		if err != nil {
 			return PeerID{}, err
 		}
+		defer clear(inv.Token[:])
 		if inv.Expired(e.now()) {
 			return PeerID{}, errors.New("core: invite has expired")
 		}
@@ -508,10 +536,9 @@ func (e *Engine) Connect(ctx context.Context, target Target) (PeerID, error) {
 	if inv == nil && target.Contact == nil {
 		return PeerID{}, errors.New("core: empty target")
 	}
-	var addr transport.Address
+	var addrs []transport.Address
 	var peerID PeerID
-	var token *[16]byte
-	var inviteID string
+	var opts dialOpts
 	var err error
 	e.do(func() {
 		if !e.started {
@@ -519,7 +546,7 @@ func (e *Engine) Connect(ctx context.Context, target Target) (PeerID, error) {
 			return
 		}
 		if inv != nil {
-			addr = transport.Address{Kind: kindOf(inv.Kind), Host: inv.Addr, Port: inv.Port}
+			addrs = []transport.Address{{Kind: kindOf(inv.Kind), Host: inv.Addr, Port: inv.Port}}
 			peerID = inv.PubKey
 			c, known := e.contacts[peerID]
 			switch {
@@ -528,29 +555,44 @@ func (e *Engine) Connect(ctx context.Context, target Target) (PeerID, error) {
 			case !known && len(e.contacts) >= wire.MaxContacts:
 				err = ErrContactLimit
 			case !known:
-				t := inv.Token
-				token = &t
-				inviteID = "peer"
+				opts.token, opts.inviteID = &inv.Token, "peer"
 			}
-			return
+		} else {
+			peerID = *target.Contact
+			c, ok := e.contacts[peerID]
+			switch {
+			case !ok:
+				err = ErrUnknownContact
+			case c.Blocked:
+				err = ErrBlocked
+			case len(c.Addrs) == 0:
+				err = ErrNoAddress
+			default:
+				addrs = append(addrs, c.Addrs...)
+			}
 		}
-		peerID = *target.Contact
-		c, ok := e.contacts[peerID]
-		switch {
-		case !ok:
-			err = ErrUnknownContact
-		case c.Blocked:
-			err = ErrBlocked
-		case len(c.Addrs) == 0:
-			err = ErrNoAddress
-		default:
-			addr = c.Addrs[0]
+		if err == nil {
+			e.wg.Add(1) // shutdown waits for this dial; e.started means it has not begun yet
 		}
 	})
 	if err != nil {
 		return peerID, err
 	}
-	return peerID, e.dial(ctx, addr, peerID, token, inviteID)
+	defer e.wg.Done()
+	return peerID, e.dialAny(ctx, addrs, peerID, opts)
+}
+
+// dialAny dials addrs in turn until one connects. Only the last failure is
+// reported as an event.
+func (e *Engine) dialAny(ctx context.Context, addrs []transport.Address, peerID PeerID, opts dialOpts) (err error) {
+	quiet := opts.quiet
+	for i, addr := range addrs {
+		opts.quiet = quiet || i < len(addrs)-1
+		if err = e.dial(ctx, addr, peerID, opts); err == nil || ctx.Err() != nil {
+			return err
+		}
+	}
+	return err
 }
 
 func kindOf(k uint8) transport.Kind {
@@ -560,56 +602,80 @@ func kindOf(k uint8) transport.Kind {
 	return transport.KindTCP
 }
 
-// dial runs the initiator side once. inviteID is non-empty when the peer is
-// new to us and a contact must be created after both HELLOs.
-func (e *Engine) dial(ctx context.Context, addr transport.Address, peerID PeerID, token *[16]byte, inviteID string) (err error) {
+// dialOpts are the particulars of one dial.
+type dialOpts struct {
+	token    *[16]byte // presented to a responder that does not know us yet
+	inviteID string    // non-empty: create the contact after both HELLOs
+	quiet    bool      // report no HandshakeFailed event
+	retry    bool      // an automatic reconnect attempt: HandshakeFailed says so
+	unsaved  bool      // do not remember the address (it came from the LAN, not from the user)
+}
+
+// dial runs the initiator side once.
+func (e *Engine) dial(ctx context.Context, addr transport.Address, peerID PeerID, o dialOpts) error {
 	tr, ok := e.trs[addr.Kind]
 	if !ok {
 		return ErrNoTransport
 	}
+	failed := func(stage, reason string) {
+		if !o.quiet {
+			e.emit(HandshakeFailed{Peer: peerID, Stage: stage, Reason: reason, Retry: o.retry})
+		}
+	}
 	full := false
 	e.do(func() {
-		if full = len(e.peers)+e.pending >= e.cfg.maxPeers(); !full {
-			e.pending++
-			e.dialing[peerID]++
+		if full = len(e.peers) >= e.cfg.maxPeers() || e.dials >= wire.MaxPendingHandshakes; !full {
+			e.dials++
+			e.connecting[peerID]++
 		}
 	})
 	if full {
 		return ErrTooManyPeers
 	}
-	defer e.do(func() { e.dialEndedL(peerID) })
+	defer e.do(func() {
+		e.dials--
+		e.connectEndedL(peerID)
+	})
 	conn, err := tr.Dial(ctx, addr)
 	if err != nil {
-		e.emit(HandshakeFailed{Peer: peerID, Stage: "dial", Reason: "could not connect"})
+		failed("dial", reasonUnreachable)
 		return err
 	}
-	res, err := handshake.Initiate(ctx, conn, e.id, peerID, token)
+	res, err := handshake.Initiate(ctx, conn, e.id, peerID, o.token)
 	if err != nil {
 		_ = conn.Close()
-		e.emit(HandshakeFailed{Peer: peerID, Stage: stageOf(err), Reason: "handshake failed"})
+		failed(stageOf(err), reasonNoSession)
 		return err
 	}
-	err = e.establish(conn, addr.Kind, res, nil, inviteID)
+	err = e.establish(conn, addr.Kind, res, nil, o.inviteID)
 	if errors.Is(err, errLostGlare) {
 		return nil // both sides dialed at once and the other session was kept: connected all the same
 	}
 	if err != nil {
-		e.emit(HandshakeFailed{Peer: peerID, Stage: "hello", Reason: reasonOf(err)})
+		failed("hello", reasonOf(err))
 		return err
 	}
-	e.do(func() { e.rememberAddrL(peerID, addr) })
+	if !o.unsaved {
+		e.do(func() { e.rememberAddrL(peerID, addr) })
+	}
 	return nil
 }
 
-// dialEndedL closes the books on one dial. If the contact's session was
-// replaced by its peer while we were dialing, and no session came of the
-// dial, the disconnect that was held back is reported now.
-func (e *Engine) dialEndedL(id PeerID) {
-	e.pending--
-	if e.dialing[id]--; e.dialing[id] > 0 {
+// Reasons of HandshakeFailed, worded for the user (§3.3). A key that no
+// longer matches looks exactly like a peer that is offline or has blocked us.
+const (
+	reasonUnreachable = "could not reach them: they may be offline, or no longer at this address"
+	reasonNoSession   = "they may be offline, may have blocked you, or their key may have changed (a fresh invite would be needed)"
+)
+
+// connectEndedL closes the books on one handshake with a known key. If the
+// contact's session was replaced by its peer meanwhile, and no session came
+// of this one, the disconnect that was held back is reported now.
+func (e *Engine) connectEndedL(id PeerID) {
+	if e.connecting[id]--; e.connecting[id] > 0 {
 		return
 	}
-	delete(e.dialing, id)
+	delete(e.connecting, id)
 	if !e.heldBack[id] {
 		return
 	}
@@ -627,7 +693,7 @@ func reasonOf(err error) string {
 	if errors.Is(err, session.ErrProtocol) {
 		return "protocol violation"
 	}
-	return "they may be offline, may have blocked you, or their key may have changed (a fresh invite would be needed)"
+	return reasonNoSession
 }
 
 // establish wraps an authenticated conn in a session, runs the HELLO exchange
@@ -688,6 +754,12 @@ func (e *Engine) registerL(s *session.Session, kind transport.Kind, res *handsha
 	case <-s.Done(): // died after its HELLO; its OnClose has fired or will find nothing
 		return nil, s.Err()
 	default:
+	}
+	switch {
+	case e.stopping: // shutdown has collected the sessions it closes: this one would be missed
+		return nil, ErrNotRunning
+	case e.peers[res.Peer] == nil && len(e.peers) >= e.cfg.maxPeers():
+		return nil, ErrTooManyPeers // §12: beyond the limit, new sessions are closed silently
 	}
 	// Token consumption and contact creation (§4.6), both HELLOs validated.
 	var newContact *Contact
@@ -814,8 +886,8 @@ func (e *Engine) addContactL(id PeerID, helloName, inviteID string) (*Contact, *
 
 func (e *Engine) rememberAddrL(id PeerID, addr transport.Address) {
 	c, ok := e.contacts[id]
-	if !ok {
-		return
+	if !ok || len(c.Addrs) > 0 && c.Addrs[0] == addr {
+		return // nothing changes: no write to disk from the engine goroutine
 	}
 	for i, a := range c.Addrs {
 		if a == addr {
@@ -830,8 +902,6 @@ func (e *Engine) rememberAddrL(id PeerID, addr transport.Address) {
 	}
 	_ = e.saveContacts()
 }
-
-func hexOf(b []byte) string { return fmt.Sprintf("%x", b) }
 
 func randomFill(b []byte) (int, error) { return rand.Read(b) }
 

@@ -37,13 +37,13 @@ func (a *app) cmdRun(ctx context.Context, cmd string, args []string, stdin io.Re
 	if cmd == "connect" {
 		switch {
 		case fs.NArg() == 0:
-			s, err := readSecret("Invite (or contact name): ", stdin, stderr, false)
+			s, err := readSecret(ctx, "Invite (or contact name): ", stdin, stderr, false)
 			if err != nil {
 				return exitErr(stderr, err)
 			}
 			target = targetOfBytes(s)
 		case fs.Arg(0) == "-":
-			s, err := readSecret("", stdin, stderr, true)
+			s, err := readSecret(ctx, "", stdin, stderr, true)
 			if err != nil {
 				return exitErr(stderr, err)
 			}
@@ -56,7 +56,7 @@ func (a *app) cmdRun(ctx context.Context, cmd string, args []string, stdin io.Re
 			target = targetOf(arg)
 		}
 	}
-	st, err := a.unlock(stdin, stderr)
+	st, err := a.unlock(ctx, stdin, stderr)
 	if err != nil {
 		return exitErr(stderr, err)
 	}
@@ -86,7 +86,10 @@ func (a *app) cmdRun(ctx context.Context, cmd string, args []string, stdin io.Re
 	select {
 	case <-e.Ready(): // the listeners are up (with Tor this can take minutes)
 	case err := <-errc:
-		if err == nil {
+		switch {
+		case ctx.Err() != nil:
+			return 0 // interrupted while starting (Tor can take minutes)
+		case err == nil:
 			err = errors.New("stopped before it was ready")
 		}
 		return exitErr(stderr, err)
@@ -106,7 +109,7 @@ func (a *app) cmdRun(ctx context.Context, cmd string, args []string, stdin io.Re
 	if a.plain {
 		code = runPlain(ctx, ctl, target, a.json, stdin, stdout, stderr)
 	} else {
-		code = tui.Run(ctx, ctl, target, e.ListenAddrs())
+		code = tui.Run(ctx, ctl, target, e.ListenAddrs(), stderr)
 	}
 	cancel()
 	<-errc

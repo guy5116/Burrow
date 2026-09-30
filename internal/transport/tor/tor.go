@@ -8,13 +8,17 @@ package tor
 import (
 	"context"
 	"crypto/ed25519"
+	"crypto/sha3"
+	"encoding/base32"
 	"errors"
 	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/cretz/bine/process"
@@ -28,25 +32,38 @@ type Transport struct {
 	Key     ed25519.PrivateKey // onion service key (from the identity blob); wiped by Close
 	Port    uint16             // virtual port announced in invites
 	ExePath string             // "" → "tor" on PATH
-	// DataDir is where tor keeps its state while it runs: a private directory
-	// of ours, emptied at every start. "" → the system's temporary directory.
+	// DataDir is tor's state directory. It is kept from one run to the next,
+	// so that tor keeps its entry guards (a new guard on every start is a new
+	// chance for someone who runs relays to become it). The onion key never
+	// goes there: it reaches tor over the control port. "" → a temporary
+	// directory that is removed on Close (tests).
 	DataDir string
 	// Bootstrap bounds how long starting tor and publishing the service may take.
 	Bootstrap time.Duration
 
-	mu     sync.Mutex
-	proc   *tor.Tor
-	kill   context.CancelFunc // ends the tor process
-	dialer *tor.Dialer
-	onion  *tor.OnionService
+	startMu sync.Mutex // one start at a time; held while tor bootstraps, never by readers
+
+	mu      sync.Mutex // guards the fields below; never held for long
+	closed  bool
+	proc    *tor.Tor
+	kill    context.CancelFunc // ends the tor process
+	dialer  *tor.Dialer
+	onion   *tor.OnionService
+	stop    context.Context // ends when Close is called, and with it a start in progress
+	onStop  context.CancelFunc
+	onionID atomic.Pointer[string]
 }
 
 // ErrNoTor is returned when no tor binary can be found.
 var ErrNoTor = errors.New("tor: no tor binary found (install tor or set tor_exe)")
 
+var errClosed = errors.New("tor: closed")
+
 // New builds a transport for the given onion key and virtual port.
 func New(key ed25519.PrivateKey, port uint16, exePath, dataDir string) *Transport {
-	return &Transport{Key: key, Port: port, ExePath: exePath, DataDir: dataDir, Bootstrap: 3 * time.Minute}
+	t := &Transport{Key: key, Port: port, ExePath: exePath, DataDir: dataDir, Bootstrap: 3 * time.Minute}
+	t.stop, t.onStop = context.WithCancel(context.Background())
+	return t
 }
 
 // Kind returns "tor".
@@ -90,68 +107,93 @@ func launch(ctx context.Context, conf *tor.StartConf) (proc *tor.Tor, kill conte
 	return proc, kill, nil
 }
 
-// start launches tor once and waits for bootstrap. tor's state lives in a
-// fresh directory under DataDir that is deleted on Close; what a crash left
-// there is deleted first. tor's own output is discarded: it must reach
-// neither the chat nor the JSON event stream.
+// start launches tor once and waits for bootstrap. tor's own output is
+// discarded: it must reach neither the chat nor the JSON event stream. tor
+// exits by itself when this process dies, however it dies.
 func (t *Transport) start(ctx context.Context) error {
+	t.startMu.Lock()
+	defer t.startMu.Unlock()
 	t.mu.Lock()
-	defer t.mu.Unlock()
-	if t.proc != nil {
+	closed, running := t.closed, t.proc != nil
+	t.mu.Unlock()
+	switch {
+	case closed:
+		return errClosed
+	case running:
 		return nil
-	}
-	if !t.Available() {
+	case !t.Available():
 		return ErrNoTor
 	}
-	base := t.DataDir
-	if base == "" {
-		base = os.TempDir()
-	} else {
-		stale, _ := filepath.Glob(filepath.Join(base, "data-dir-*"))
-		for _, d := range stale {
-			_ = os.RemoveAll(d)
-		}
-	}
-	if err := os.MkdirAll(base, 0o700); err != nil {
-		return err
-	}
+	conf := &tor.StartConf{ExtraArgs: []string{"__OwningControllerProcess", strconv.Itoa(os.Getpid())}}
 	exe := t.exe()
-	quiet := process.CmdCreatorFunc(func(ctx context.Context, args ...string) (*exec.Cmd, error) {
-		return exec.CommandContext(ctx, exe, args...), nil // #nosec G204 -- the tor binary the user configured
+	conf.ProcessCreator = process.CmdCreatorFunc(func(ctx context.Context, args ...string) (*exec.Cmd, error) {
+		return exec.CommandContext(ctx, exe, args...), nil // #nosec G204 G702 -- the tor binary the user configured
 	})
+	if t.DataDir == "" {
+		conf.TempDataDirBase = os.TempDir()
+	} else {
+		if err := os.MkdirAll(t.DataDir, 0o700); err != nil { // #nosec G703 -- a directory inside our own data directory
+			return err
+		}
+		// The control library writes a torrc and a port file for every run and
+		// leaves them behind; tor's own state stays.
+		for _, pattern := range []string{"torrc-*", "control-port-*"} {
+			stale, _ := filepath.Glob(filepath.Join(t.DataDir, pattern))
+			for _, f := range stale {
+				_ = os.Remove(f) // #nosec G703 -- the control library's files, inside that directory
+			}
+		}
+		conf.DataDir = t.DataDir
+	}
 	bctx, cancel := context.WithTimeout(ctx, t.Bootstrap)
 	defer cancel()
-	proc, kill, err := launch(bctx, &tor.StartConf{ProcessCreator: quiet, TempDataDirBase: base})
+	defer context.AfterFunc(t.stop, cancel)()
+	proc, kill, err := launch(bctx, conf)
 	if err != nil {
 		return err
 	}
-	proc.DeleteDataDirOnClose = true
+	proc.DeleteDataDirOnClose = t.DataDir == ""
 	proc.StopProcessOnClose = true
 	d, err := proc.Dialer(bctx, nil)
+	if err == nil {
+		t.mu.Lock()
+		if t.closed {
+			err = errClosed
+		} else {
+			t.proc, t.kill, t.dialer = proc, kill, d
+		}
+		t.mu.Unlock()
+	}
 	if err != nil {
 		_ = proc.Close()
 		kill()
-		return err
 	}
-	t.proc, t.kill, t.dialer = proc, kill, d
-	return nil
+	return err
 }
 
 // Listen publishes the onion service and returns its listener. The onion
-// address is available afterwards through OnionAddress.
+// address is available afterwards through OnionAddress. There is one service
+// per key: a second Listen is refused.
 func (t *Transport) Listen(ctx context.Context) (transport.Listener, error) {
 	if err := t.start(ctx); err != nil {
 		return nil, err
+	}
+	t.mu.Lock()
+	proc, listening := t.proc, t.onion != nil
+	t.mu.Unlock()
+	if proc == nil {
+		return nil, errClosed
+	}
+	if listening {
+		return nil, errors.New("tor: already listening")
 	}
 	local, err := (&net.ListenConfig{}).Listen(ctx, "tcp", "127.0.0.1:0")
 	if err != nil {
 		return nil, err
 	}
-	t.mu.Lock()
-	proc := t.proc
-	t.mu.Unlock()
 	bctx, cancel := context.WithTimeout(ctx, t.Bootstrap)
 	defer cancel()
+	defer context.AfterFunc(t.stop, cancel)()
 	svc, err := proc.Listen(bctx, &tor.ListenConf{Key: t.Key, RemotePorts: []int{int(t.Port)}, LocalListener: local, Version3: true})
 	if err != nil {
 		_ = local.Close()
@@ -159,19 +201,24 @@ func (t *Transport) Listen(ctx context.Context) (transport.Listener, error) {
 	}
 	svc.CloseLocalListenerOnClose = true
 	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.closed || t.onion != nil {
+		_ = svc.Close()
+		return nil, errClosed
+	}
 	t.onion = svc
-	t.mu.Unlock()
+	id := svc.ID + ".onion"
+	t.onionID.Store(&id)
 	return svc, nil
 }
 
 // OnionAddress returns "<56 chars>.onion" once Listen succeeded ("" before).
+// It never waits, not even for a tor that is still starting.
 func (t *Transport) OnionAddress() string {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	if t.onion == nil {
-		return ""
+	if id := t.onionID.Load(); id != nil {
+		return *id
 	}
-	return t.onion.ID + ".onion"
+	return ""
 }
 
 // Dial connects to an onion address through tor's SOCKS port.
@@ -191,12 +238,14 @@ func (t *Transport) Dial(ctx context.Context, addr transport.Address) (net.Conn,
 	return d.DialContext(ctx, "tcp", net.JoinHostPort(addr.Host, strconv.Itoa(int(addr.Port))))
 }
 
-// Close stops tor, removes its data directory and wipes the onion key. The
+// Close stops tor (and a start in progress) and wipes the onion key. The
 // copy tor.Listen handed to the library stays inside the library until it is
-// collected (SECURITY.md).
+// collected (SECURITY.md). A closed transport does not start again.
 func (t *Transport) Close() error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
+	t.closed = true
+	t.onStop()
 	clear(t.Key)
 	if t.onion != nil {
 		_ = t.onion.Close()
@@ -209,4 +258,14 @@ func (t *Transport) Close() error {
 	t.kill()
 	t.proc, t.dialer = nil, nil
 	return err
+}
+
+// Address returns the onion address of key without running tor: the
+// address is the key's public half, a checksum and a version byte, in
+// base32 (rend-spec-v3 §6).
+func Address(key ed25519.PrivateKey) string {
+	pub := key.Public().(ed25519.PublicKey)
+	sum := sha3.Sum256(append(append([]byte(".onion checksum"), pub...), 3))
+	raw := append(append(append([]byte(nil), pub...), sum[:2]...), 3)
+	return strings.ToLower(base32.StdEncoding.EncodeToString(raw)) + ".onion"
 }

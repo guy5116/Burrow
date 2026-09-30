@@ -3,10 +3,14 @@
 package gui
 
 import (
+	"context"
 	"log/slog"
 	"path/filepath"
+	"slices"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/test"
@@ -29,7 +33,8 @@ func newApp(t *testing.T) *App {
 		t.Fatal(err)
 	}
 	a := &App{fa: test.NewTempApp(t), paths: store.Paths{Config: dir, Data: dir}, cfg: store.DefaultConfig(), log: slog.Default(),
-		msgs: map[core.PeerID][]*row{}, byMsg: map[core.MsgID]*row{}, offers: map[core.TransferID]dialogT{}}
+		unread: map[core.PeerID]bool{}, msgs: map[core.PeerID][]*row{}, byMsg: map[core.MsgID]*row{},
+		transfers: map[core.TransferID]*row{}, offers: map[core.TransferID]dialogT{}}
 	a.cfg.ListenPort = 0
 	a.win = a.fa.NewWindow("test")
 	a.st = st
@@ -76,8 +81,6 @@ func TestEventsRenderAndStatus(t *testing.T) {
 	a := newApp(t)
 	var peer core.PeerID
 	peer[0] = 7
-	// A contact must exist for the sidebar; create one through the engine's contact path.
-	a.e.RenameContact(peer, "x") // unknown: no-op error, fine
 	a.apply(core.MessageReceived{Peer: peer, ID: 1, Text: "hello"})
 	if len(a.msgs[peer]) != 1 || a.msgs[peer][0].text != "hello" || a.msgs[peer][0].mine {
 		t.Fatalf("%+v", a.msgs[peer])
@@ -94,8 +97,11 @@ func TestEventsRenderAndStatus(t *testing.T) {
 		t.Fatal("row not appended")
 	}
 	a.apply(core.PeerConnected{Peer: peer, Transport: "tcp"})
-	if len(a.conv.Objects) != 3 || a.msgs[peer][2].kind != rowSystem {
+	if len(a.msgs[peer]) != 3 || a.msgs[peer][2].kind != rowSystem {
 		t.Fatal("system row")
+	}
+	if _, open := a.selected(); open {
+		t.Fatal("a conversation with someone who is no contact stayed open")
 	}
 	a.apply(core.Typing{Peer: peer, Typing: true})
 	if !strings.Contains(a.status.Text, "typing") {
@@ -170,12 +176,152 @@ func TestConversationIsBounded(t *testing.T) {
 	if len(a.msgs[peer]) != maxRows || len(a.byMsg) != maxRows {
 		t.Fatal(len(a.msgs[peer]), len(a.byMsg))
 	}
+	// Long messages are bounded by size, long before the row count.
+	big := strings.Repeat("y", 16<<10)
+	for i := 0; i < 100; i++ {
+		a.addRow(peer, &row{kind: rowText, text: big})
+	}
+	size := 0
+	for _, r := range a.msgs[peer] {
+		size += len(r.text)
+	}
+	if size > maxRowBytes {
+		t.Fatal(size)
+	}
+}
+
+// started runs the app's engine and drains its events, as the real app does
+// with a goroutine of its own; the tests apply the events they care about.
+func started(t *testing.T, e *core.Engine) {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { _ = e.Start(ctx); close(done) }()
+	go func() {
+		for {
+			select {
+			case <-e.Events():
+			case <-e.Done():
+				return
+			}
+		}
+	}()
+	t.Cleanup(func() { cancel(); <-done })
+	for len(e.ListenAddrs()) == 0 {
+		time.Sleep(2 * time.Millisecond)
+	}
+}
+
+// contact starts another engine named name and makes it a contact of a
+// through a's invite.
+func contact(t *testing.T, a *App, inv, name string) core.PeerID {
+	t.Helper()
+	dir := t.TempDir()
+	st, err := store.Init(dir, []byte("pw"), fast)
+	if err != nil {
+		t.Fatal(err)
+	}
+	e, err := core.New(core.Config{ListenAddr: "127.0.0.1:0", DataDir: dir, DisplayName: name}, st, core.Transports("127.0.0.1:0", nil), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { e.Close(); st.Close() })
+	started(t, e)
+	id, err := e.Connect(context.Background(), core.Target{Invite: inv})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for !slices.ContainsFunc(a.e.Contacts(), func(c core.Contact) bool { return c.ID == e.Identity().ID }) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	_ = id
+	return e.Identity().ID
+}
+
+// The sidebar highlight follows the contact messages go to, when a new
+// contact sorts in above it, and a removed contact's conversation closes.
+func TestSidebarFollowsTheRecipient(t *testing.T) {
+	a := newApp(t)
+	started(t, a.e)
+	inv, err := a.e.CreateInvite(core.InviteOptions{Host: "127.0.0.1", MultiUse: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	bob := contact(t, a, inv.String, "Bob")
+	a.openChat(bob)
+	if sel, ok := a.selected(); !ok || sel != bob || !strings.HasPrefix(a.header.Text, "Bob (") {
+		t.Fatal("Bob not open", a.header.Text)
+	}
+	aaron := contact(t, a, inv.String, "Aaron") // sorts above Bob
+	a.refreshContacts()
+	a.list.Select(a.indexOf(aaron)) // the user clicks Aaron
+	if sel, _ := a.selected(); sel != aaron {
+		t.Fatal("clicking Aaron left the conversation with Bob open")
+	}
+	if err := a.e.RemoveContact(aaron); err != nil {
+		t.Fatal(err)
+	}
+	a.refreshContacts()
+	if _, ok := a.selected(); ok || !strings.HasPrefix(a.header.Text, "No conversation") {
+		t.Fatal("a removed contact's conversation stayed open")
+	}
+}
+
+// Accepting an offer never rejects it, and neither does a failure that
+// closes its dialog.
+func TestAcceptNeverRejects(t *testing.T) {
+	a := newApp(t)
+	var rejected atomic.Int32
+	rejectImage = func(*core.Engine, core.TransferID) error { rejected.Add(1); return nil }
+	t.Cleanup(func() { rejectImage = (*core.Engine).RejectImage })
+	a.apply(core.ImageOffered{Peer: core.PeerID{1}, ID: core.TransferID{1}, Size: 10, Ext: "zip"})
+	var accept *widget.Button
+	for _, o := range test.LaidOutObjects(a.win.Canvas().Overlays().Top()) {
+		if b, ok := o.(*widget.Button); ok && b.Text == "Accept" {
+			accept = b
+		}
+	}
+	if accept == nil {
+		t.Fatal("no Accept button")
+	}
+	test.Tap(accept)
+	a.inFlight.Wait()
+	a.apply(core.ImageOffered{Peer: core.PeerID{1}, ID: core.TransferID{2}, Size: 10, Ext: "zip"})
+	a.apply(core.TransferFailed{Peer: core.TransferPeer{Peer: core.PeerID{1}}, ID: core.TransferID{2}, Reason: "timed out"})
+	if n := rejected.Load(); n != 0 || len(a.offers) != 0 {
+		t.Fatal(n, len(a.offers))
+	}
+}
+
+// A message's delivery mark changes in place, and automatic reconnect
+// failures open no dialog.
+func TestQuietUpdates(t *testing.T) {
+	a := newApp(t)
+	peer := core.PeerID{4}
+	a.sel = &peer
+	r := &row{kind: rowText, text: "hi", mine: true, id: 9, status: core.StatusPending}
+	a.byMsg[r.id] = r
+	a.addRow(peer, r)
+	w := r.widget
+	a.apply(core.MessageStatus{Peer: peer, ID: 9, Status: core.StatusDelivered})
+	if r.widget != w || r.mark.Text != statusMark(core.StatusDelivered) {
+		t.Fatal("status not updated in place", r.mark.Text)
+	}
+	a.apply(core.HandshakeFailed{Peer: peer, Stage: "dial", Reason: "r", Retry: true})
+	if a.win.Canvas().Overlays().Top() != nil {
+		t.Fatal("a dialog for an automatic retry")
+	}
+	a.apply(core.HandshakeFailed{Peer: peer, Stage: "dial", Reason: "r"})
+	if a.win.Canvas().Overlays().Top() == nil {
+		t.Fatal("no dialog for a connection the user asked for")
+	}
 }
 
 func TestUnlockAndWizardValidation(t *testing.T) {
 	dir := t.TempDir()
 	a := &App{fa: test.NewTempApp(t), paths: store.Paths{Config: dir, Data: dir}, cfg: store.DefaultConfig(), log: slog.Default(),
-		msgs: map[core.PeerID][]*row{}, byMsg: map[core.MsgID]*row{}, offers: map[core.TransferID]dialogT{}}
+		unread: map[core.PeerID]bool{}, msgs: map[core.PeerID][]*row{}, byMsg: map[core.MsgID]*row{},
+		transfers: map[core.TransferID]*row{}, offers: map[core.TransferID]dialogT{}}
 	a.win = a.fa.NewWindow("test")
 	a.showUnlock() // no store → wizard
 	c := a.win.Content().(*fyne.Container)

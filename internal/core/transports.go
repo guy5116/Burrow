@@ -18,7 +18,7 @@ type Transport = transport.Transport
 // TorOptions enables the onion transport.
 type TorOptions struct {
 	Key  ed25519.PrivateKey // from store.LoadOnionKey
-	Port uint16             // virtual port in invites (0 → listen port)
+	Port uint16             // virtual port in invites (0 → the default port)
 	Exe  string             // tor binary ("" → PATH)
 	// DataDir is the application's data directory; tor's state goes in a
 	// private sub-directory of it.
@@ -47,6 +47,10 @@ func Transports(listenAddr string, opts *TorOptions) []transport.Transport {
 	}
 	return out
 }
+
+// OnionAddressOf returns the onion address that key publishes, without
+// running tor: invites for it can be made offline.
+func OnionAddressOf(key ed25519.PrivateKey) string { return tor.Address(key) }
 
 // OnionAddress returns this instance's onion address ("" when Tor is not running).
 func (e *Engine) OnionAddress() string {

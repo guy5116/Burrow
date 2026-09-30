@@ -163,7 +163,7 @@ func (e *Engine) CreateInvite(opts InviteOptions) (Invite, error) {
 	if err != nil {
 		return Invite{}, err
 	}
-	rec := &inviteRec{ID: id, Token: hexOf(inv.Token[:]), Kind: opts.Kind, Host: opts.Host, Port: opts.Port,
+	rec := &inviteRec{ID: id, Kind: opts.Kind, Host: opts.Host, Port: opts.Port,
 		Expiry: inv.Expiry, MultiUse: opts.MultiUse}
 	e.do(func() {
 		e.invites[inv.Token] = rec

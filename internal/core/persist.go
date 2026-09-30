@@ -27,6 +27,9 @@ type contactRec struct {
 	InviteID  string              `json:"invite_id,omitempty"`
 }
 
+// inviteRec is an issued invite. Its token is the key of Engine.invites;
+// Token holds its hex form only while the record is read or written, so that
+// the bearer secret does not sit in an immutable string for the whole run.
 type inviteRec struct {
 	ID       string         `json:"id"`
 	Token    string         `json:"token"`
@@ -70,7 +73,9 @@ func (e *Engine) loadState() error {
 		}
 		var k [16]byte
 		copy(k[:], tok)
+		clear(tok)
 		r := irs[i]
+		r.Token = ""
 		e.invites[k] = &r
 	}
 	return nil
@@ -103,13 +108,16 @@ func (e *Engine) saveContacts() error {
 
 func (e *Engine) saveInvites() error {
 	irs := make([]inviteRec, 0, len(e.invites))
-	for _, r := range e.invites {
-		irs = append(irs, *r)
+	for tok, r := range e.invites {
+		rec := *r
+		rec.Token = hex.EncodeToString(tok[:])
+		irs = append(irs, rec)
 	}
 	b, err := json.Marshal(irs)
 	if err != nil {
 		return err
 	}
+	defer clear(b)
 	return e.st.WriteBlob(invitesBlob, b)
 }
 

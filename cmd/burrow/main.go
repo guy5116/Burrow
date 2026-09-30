@@ -21,9 +21,12 @@ const usage = `usage: burrow [global flags] <command> [args]
 commands:
   init [--insecure-no-passphrase]      create an identity (refuses if a store exists)
   id [--qr]                            print your fingerprint
-  invite [--ttl 1h] [--multi-use] [--qr] [--host H]
-  listen                               listen for peers and open the chat
-  connect [<contact>|<invite>|-]       connect (and keep listening); no argument prompts for an invite
+  invite [--ttl 1h] [--multi-use] [--qr] [--host H | --tor]
+  listen [--listen ADDR] [--host H]    listen for peers and open the chat
+  connect [--listen ADDR] [--host H] [<contact>|<invite>|-]
+                                       connect (and keep listening); no argument prompts for an invite
+                                       --listen overrides the address to listen on (default :<listen_port>);
+                                       --host is the address put in invites made from the chat
   contacts list|verify|rename|remove|block|unblock <contact> [name]
   config get|set <key> [value]
   passphrase [--insecure-no-passphrase]   change the passphrase or mode
@@ -101,27 +104,31 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "burrow: config:", err)
 		return 1
 	}
+	// The first Ctrl+C ends the command gracefully (BYE to peers, an
+	// abandoned prompt gives the terminal its echo back); a second one ends
+	// the process at once.
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	context.AfterFunc(ctx, stop)
 	cmd, rest := fs.Arg(0), fs.Args()[1:]
 	var code int
 	switch cmd {
 	case "init":
-		code = a.cmdInit(rest, stdin, stdout, stderr)
+		code = a.cmdInit(ctx, rest, stdin, stdout, stderr)
 	case "id":
-		code = a.cmdID(rest, stdin, stdout, stderr)
+		code = a.cmdID(ctx, rest, stdin, stdout, stderr)
 	case "invite":
-		code = a.cmdInvite(rest, stdin, stdout, stderr)
+		code = a.cmdInvite(ctx, rest, stdin, stdout, stderr)
 	case "listen", "connect":
 		code = a.cmdRun(ctx, cmd, rest, stdin, stdout, stderr)
 	case "contacts":
-		code = a.cmdContacts(rest, stdin, stdout, stderr)
+		code = a.cmdContacts(ctx, rest, stdin, stdout, stderr)
 	case "config":
 		code = a.cmdConfig(rest, stdout, stderr)
 	case "passphrase":
-		code = a.cmdPassphrase(rest, stdin, stdout, stderr)
+		code = a.cmdPassphrase(ctx, rest, stdin, stdout, stderr)
 	case "burn":
-		code = a.cmdBurn(stdin, stdout, stderr)
+		code = a.cmdBurn(ctx, rest, stdin, stdout, stderr)
 	case "help", "-h", "--help":
 		fmt.Fprint(stdout, usage)
 	default:

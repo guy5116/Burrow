@@ -38,7 +38,7 @@ func TestFileTransfer(t *testing.T) {
 	b := imgNode(t, Config{})
 	connect(t, b, a, a.invite(t, false).String)
 	path, want := fileFixture(t, "Quarterly Report (final).ZIP", 3*wire.ChunkData+17)
-	id, err := a.e.SendFile(context.Background(), b.id(), path, "the archive")
+	id, err := a.e.SendFile(context.Background(), b.id(), path, "the archive", false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -69,7 +69,7 @@ func TestFileTransfer(t *testing.T) {
 	}
 	// No extension: saved as .bin.
 	path2, _ := fileFixture(t, "LICENSE", 100)
-	if _, err := a.e.SendFile(context.Background(), b.id(), path2, ""); err != nil {
+	if _, err := a.e.SendFile(context.Background(), b.id(), path2, "", false); err != nil {
 		t.Fatal(err)
 	}
 	off2 := b.wait(t, "second offer", func(ev Event) bool { o, ok := ev.(ImageOffered); return ok && o.ID != off.ID }).(ImageOffered)
@@ -89,7 +89,7 @@ func TestSendFileStripsImages(t *testing.T) {
 	b := imgNode(t, Config{})
 	connect(t, b, a, a.invite(t, false).String)
 	path, _ := pngFixture(t, 40, 30, false)
-	if _, err := a.e.SendFile(context.Background(), b.id(), path, ""); err != nil {
+	if _, err := a.e.SendFile(context.Background(), b.id(), path, "", false); err != nil {
 		t.Fatal(err)
 	}
 	off := b.wait(t, "ImageOffered", isType[ImageOffered]).(ImageOffered)
@@ -114,7 +114,7 @@ func TestFileSizeLimits(t *testing.T) {
 	ok, _ := fileFixture(t, "ok.rar", 4096)
 
 	// Over the receiver's advertised limit: refused locally, nothing is offered.
-	id, err := a.e.SendFile(context.Background(), b.id(), big, "")
+	id, err := a.e.SendFile(context.Background(), b.id(), big, "", false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -122,7 +122,7 @@ func TestFileSizeLimits(t *testing.T) {
 	if !strings.HasPrefix(f.Reason, "too large") {
 		t.Fatal(f.Reason)
 	}
-	if _, err := a.e.SendFile(context.Background(), b.id(), ok, ""); err != nil {
+	if _, err := a.e.SendFile(context.Background(), b.id(), ok, "", false); err != nil {
 		t.Fatal(err)
 	}
 	if off := b.wait(t, "file offer", isFileOffer).(ImageOffered); off.Size != 4096 {
@@ -132,15 +132,15 @@ func TestFileSizeLimits(t *testing.T) {
 		t.Fatal("the oversized file was offered")
 	}
 	// A contact who turned files off cannot be offered one, and offers none.
-	if _, err := a.e.SendFile(context.Background(), c.id(), ok, ""); !errors.Is(err, ErrPeerNoFiles) {
+	if _, err := a.e.SendFile(context.Background(), c.id(), ok, "", false); !errors.Is(err, ErrPeerNoFiles) {
 		t.Fatal(err)
 	}
-	if _, err := c.e.SendFile(context.Background(), a.id(), ok, ""); err == nil {
+	if _, err := c.e.SendFile(context.Background(), a.id(), ok, "", false); err == nil {
 		t.Fatal("sent a file with files turned off")
 	}
 	// Images still work with files turned off.
 	img, _ := pngFixture(t, 10, 10, false)
-	if _, err := a.e.SendFile(context.Background(), c.id(), img, ""); err != nil {
+	if _, err := a.e.SendFile(context.Background(), c.id(), img, "", false); err != nil {
 		t.Fatal(err)
 	}
 	c.wait(t, "ImageOffered", isType[ImageOffered])
@@ -205,12 +205,12 @@ func TestAutoAcceptNeverAppliesToFiles(t *testing.T) {
 		t.Fatal(err)
 	}
 	path, _ := fileFixture(t, "x.pdf", 5000)
-	if _, err := a.e.SendFile(context.Background(), b.id(), path, ""); err != nil {
+	if _, err := a.e.SendFile(context.Background(), b.id(), path, "", false); err != nil {
 		t.Fatal(err)
 	}
 	off := b.wait(t, "file offer", isFileOffer).(ImageOffered)
 	img, _ := pngFixture(t, 10, 10, false)
-	if _, err := a.e.SendFile(context.Background(), b.id(), img, ""); err != nil {
+	if _, err := a.e.SendFile(context.Background(), b.id(), img, "", false); err != nil {
 		t.Fatal(err)
 	}
 	done := b.wait(t, "image auto-accepted", isType[TransferDone]).(TransferDone)

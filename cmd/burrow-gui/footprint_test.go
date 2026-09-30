@@ -40,7 +40,7 @@ func TestGUIFootprint(t *testing.T) {
 		}
 		return strings.TrimSpace(string(out))
 	}
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	ln, err := (&net.ListenConfig{}).Listen(ctx, "tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -61,7 +61,7 @@ func TestGUIFootprint(t *testing.T) {
 	defer func() { _ = gui.Process.Kill(); _ = gui.Wait() }()
 	deadline := time.Now().Add(20 * time.Second)
 	for {
-		c, err := net.DialTimeout("tcp", "127.0.0.1:"+port, time.Second)
+		c, err := (&net.Dialer{Timeout: time.Second}).DialContext(ctx, "tcp", "127.0.0.1:"+port)
 		if err == nil {
 			_ = c.Close()
 			break

@@ -186,11 +186,11 @@ func (e *Engine) onSessionClosedL(s *session.Session) {
 	e.revertSentL(p)
 	e.orphanQueues[id] = append(e.orphanQueues[id], p.queue...)
 	p.queue = nil
-	// The peer replaced this session with one that we are still setting up
-	// (its BYE overtook our own registration): not a disconnect, unless
-	// nothing comes of the dial.
+	// The peer replaced this session with one that is still being set up (its
+	// BYE overtook the registration of the new one, dialed by either side):
+	// not a disconnect, unless nothing comes of it.
 	var bye *session.ByeError
-	if errors.As(err, &bye) && bye.Reason == wire.ByeReplaced && e.dialing[id] > 0 {
+	if errors.As(err, &bye) && bye.Reason == wire.ByeReplaced && e.connecting[id] > 0 {
 		e.heldBack[id] = true
 		return
 	}
@@ -285,7 +285,7 @@ func (e *Engine) reconnectLoop(ctx context.Context, id PeerID, self *reconnect) 
 		case <-ctx.Done():
 			return
 		}
-		var addr transport.Address
+		var addrs []transport.Address
 		give := false
 		e.do(func() {
 			c, ok := e.contacts[id]
@@ -294,12 +294,12 @@ func (e *Engine) reconnectLoop(ctx context.Context, id PeerID, self *reconnect) 
 				give = true
 				return
 			}
-			addr = c.Addrs[0]
+			addrs = append(addrs, c.Addrs...)
 		})
 		if give {
 			return
 		}
-		if err := e.dial(ctx, addr, id, nil, ""); err == nil {
+		if err := e.dialAny(ctx, addrs, id, dialOpts{retry: true}); err == nil {
 			return
 		}
 		if backoff < wire.ReconnectMaxBackoff {

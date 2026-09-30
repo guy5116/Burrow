@@ -19,6 +19,7 @@ import (
 	"github.com/guy5116/burrow/internal/buf"
 	"github.com/guy5116/burrow/internal/media"
 	"github.com/guy5116/burrow/internal/session"
+	"github.com/guy5116/burrow/internal/store"
 	"github.com/guy5116/burrow/internal/text"
 	"github.com/guy5116/burrow/internal/wire"
 )
@@ -76,6 +77,7 @@ type transfer struct {
 	timer    *time.Timer
 	discard  atomic.Bool // a user cancel: the partial is deleted, not kept for resume
 
+	decided  bool // incoming: accepted or rejected, by the user or automatically
 	accepted bool
 	lastProg time.Time
 	ctx      context.Context // ends when the transfer fails or finishes, or the sessions stop
@@ -225,34 +227,64 @@ func (e *Engine) livePeer(id PeerID) (p *peer, err error) {
 	return p, err
 }
 
+// How a file is sent: as an image the user chose to send as one, as an image
+// that was given as a file, or byte for byte.
+type sendKind uint8
+
+const (
+	sendImage     sendKind = iota // SendImage: stripped; the extension must match the bytes
+	sendFileImage                 // SendFile, and the bytes are an image: stripped all the same
+	sendRaw                       // SendFile, anything else: sent as it is
+)
+
 // SendImage strips and offers an image to a connected contact. Both stripping
 // passes run on one file-reader goroutine; the returned id is valid
 // immediately.
 func (e *Engine) SendImage(ctx context.Context, id PeerID, path string, caption string) (TransferID, error) {
-	return e.send(id, path, caption, false)
+	return e.send(id, path, caption, sendImage)
 }
 
-// SendFile offers any file. A supported image goes through SendImage, so its
-// metadata is stripped; everything else is sent byte for byte, and only its
-// extension is revealed, never its name.
-func (e *Engine) SendFile(ctx context.Context, id PeerID, path string, caption string) (TransferID, error) {
-	return e.send(id, path, caption, !isImage(path))
+// ErrKeepsMetadata refuses a photo or video format whose location, time and
+// camera data Burrow cannot remove. SendFile with keepMetadata sends it anyway.
+var ErrKeepsMetadata = errors.New("core: this photo or video format keeps its location and camera data, and Burrow cannot remove it")
+
+// SendFile offers any file. An image in a format Burrow can clean goes the way
+// of SendImage and loses its metadata, whatever its extension says. A photo
+// or video format that keeps metadata Burrow cannot remove (HEIC, TIFF, RAW,
+// MP4 …) is refused with ErrKeepsMetadata unless keepMetadata is set.
+// Anything else is sent byte for byte, and only its extension is revealed,
+// never its name.
+func (e *Engine) SendFile(ctx context.Context, id PeerID, path string, caption string, keepMetadata bool) (TransferID, error) {
+	head, err := readHead(path)
+	if err != nil {
+		return TransferID{}, err
+	}
+	if _, err := media.Sniff(head); err == nil {
+		return e.send(id, path, caption, sendFileImage)
+	}
+	if kind := media.KeepsMetadata(head); kind != "" && !keepMetadata {
+		return TransferID{}, fmt.Errorf("%w (%s)", ErrKeepsMetadata, kind)
+	}
+	return e.send(id, path, caption, sendRaw)
 }
 
-// isImage reports whether path starts like a supported image format.
-func isImage(path string) bool {
+// readHead returns the first bytes of a regular file.
+func readHead(path string) ([]byte, error) {
 	f, err := os.Open(path) // #nosec G304 -- user-chosen file
 	if err != nil {
-		return false
+		return nil, err
 	}
 	defer func() { _ = f.Close() }()
-	head := make([]byte, media.SniffLen)
+	if st, err := f.Stat(); err != nil || !st.Mode().IsRegular() {
+		return nil, fmt.Errorf("core: %s is not a file", filepath.Base(path))
+	}
+	head := make([]byte, 32)
 	n, _ := io.ReadFull(f, head)
-	_, err = media.Sniff(head[:n])
-	return err == nil
+	return head[:n], nil
 }
 
-func (e *Engine) send(id PeerID, path, caption string, raw bool) (TransferID, error) {
+func (e *Engine) send(id PeerID, path, caption string, kind sendKind) (TransferID, error) {
+	raw := kind == sendRaw
 	p, err := e.livePeer(id)
 	if err != nil {
 		return TransferID{}, err
@@ -285,7 +317,7 @@ func (e *Engine) send(id PeerID, path, caption string, raw bool) (TransferID, er
 	if err != nil {
 		return TransferID{}, err
 	}
-	started := e.spawn(func() { e.transfers[t.id] = t }, func() { e.fileReader(p, t, path, raw, mode, limit) })
+	started := e.spawn(func() { e.transfers[t.id] = t }, func() { e.fileReader(p, t, path, kind, mode, limit) })
 	if !started {
 		t.cancel()
 		return TransferID{}, ErrStopping
@@ -295,19 +327,28 @@ func (e *Engine) send(id PeerID, path, caption string, raw bool) (TransferID, er
 
 // fileReader is the per-outgoing-transfer goroutine: pass 1, the offer, and
 // once the peer accepts, pass 2.
-func (e *Engine) fileReader(p *peer, t *transfer, path string, raw bool, mode media.Mode, limit uint64) {
+func (e *Engine) fileReader(p *peer, t *transfer, path string, kind sendKind, mode media.Mode, limit uint64) {
+	raw := kind == sendRaw
 	ph := p.s.PeerHello()
 	var prep media.Prepared
 	var err error
-	if raw {
+	switch kind {
+	case sendRaw:
 		prep, err = media.PrepareFile(t.ctx, path, limit)
-	} else {
+	case sendFileImage:
+		prep, err = media.PrepareByContent(t.ctx, path, mode, limit)
+	default:
 		prep, err = media.Prepare(t.ctx, path, mode, limit)
 	}
 	if err == nil && prep.Animated && ph.Features&wire.FeatureAnimatedGIF == 0 {
 		err = errAnimatedUnsupported
 	}
-	if err != nil {
+	switch {
+	case err == nil:
+	case kind == sendFileImage && errors.Is(err, media.ErrTooLarge):
+		e.failTransfer(t, "too large for a picture: it is a picture, and pictures are always cleaned first, so it cannot go as a plain file")
+		return
+	default:
 		e.failTransfer(t, redactMediaErr(err))
 		return
 	}
@@ -363,6 +404,12 @@ func (e *Engine) fileReader(p *peer, t *transfer, path string, raw bool, mode me
 	case start := <-t.acceptCh:
 		e.streamOut(p, t, start)
 	case <-t.ctx.Done():
+		// Cancelled while the offer was on its way (CancelTransfer may have
+		// seen no stream yet): tell the peer, or its download would wait for
+		// ever. On a stream that is already closed or draining this is refused.
+		if e.sessCtx.Err() == nil {
+			_ = p.s.SendStream(e.sessCtx, t.stream, wire.TypeImgCancel, wire.AppendImgCancel(nil, wire.CancelUser))
+		}
 	}
 }
 
@@ -517,11 +564,11 @@ func (e *Engine) onOfferL(p *peer, stream uint16, o wire.ImgOffer, ext string) {
 	// Auto-accept covers images only: a file is always the user's decision.
 	// When two downloads are running the offer waits for the user instead.
 	if c := e.contacts[t.peer]; e.cfg.AutoAcceptFromVerified && c != nil && c.Verified && o.Format != FormatFile && e.downloadsL(p) < wire.MaxActiveTransfers {
-		t.accepted = true
+		t.decided, t.accepted = true, true
 		if e.spawnL(func() { e.download(p, t, "") }) {
 			return
 		}
-		t.accepted = false
+		t.decided, t.accepted = false, false
 	}
 	tid := t.id
 	t.timer = time.AfterFunc(wire.AcceptPromptTimeout, func() { _ = e.RejectImage(tid) })
@@ -537,26 +584,33 @@ func (e *Engine) downloadsL(p *peer) (n int) {
 	return n
 }
 
-// claimOffer finds an offer that is still awaiting a decision and, when
-// accept is set, marks it accepted.
+// claimOffer takes the decision on an offer that is still awaiting one, and
+// marks it accepted when accept is set. Only one decision is ever taken: an
+// accept and a reject that race each other cannot both go out.
 func (e *Engine) claimOffer(id TransferID, accept bool) (t *transfer, err error) {
 	e.do(func() {
 		t = e.transfers[id]
 		switch {
 		case t == nil:
 			err = ErrUnknownTransfer
-		case t.outgoing || t.accepted:
+		case t.outgoing || t.decided:
 			err = ErrNotOffered
 		case accept && e.downloadsL(t.owner) >= wire.MaxActiveTransfers:
 			err = ErrBusy // the offer stays; the user can accept it later
 		default:
-			t.accepted = accept
+			t.decided, t.accepted = true, accept
 			if t.timer != nil {
 				t.timer.Stop()
 			}
 		}
 	})
 	return t, err
+}
+
+// gone reports whether t has ended (failed, cancelled, finished).
+func (e *Engine) gone(t *transfer) (gone bool) {
+	e.do(func() { gone = e.transfers[t.id] != t })
+	return gone
 }
 
 // AcceptImage accepts an offered image or file into destDir ("" → the image
@@ -601,7 +655,7 @@ func (e *Engine) prepareAccept(p *peer, t *transfer, destDir string) (start uint
 			return 0, err
 		}
 	}
-	if free, err := freeSpace(e.partialsPath()); err == nil && free < t.size+wire.FreeSpaceMargin {
+	if free, err := store.FreeSpace(e.partialsPath()); err == nil && free < t.size+wire.FreeSpaceMargin {
 		reject(wire.RejectTooLarge, "not enough free disk space")
 		return 0, ErrNoSpace
 	}
@@ -645,6 +699,12 @@ func (e *Engine) prepareAccept(p *peer, t *transfer, destDir string) (start uint
 	if err := e.writeMeta(t, start); err != nil {
 		reject(wire.RejectDeclined, "cannot write transfer metadata")
 		return 0, err
+	}
+	// A cancel that came meanwhile removed the partial, perhaps before the
+	// sidecar above was written: remove what is left and stop.
+	if e.gone(t) {
+		e.dropPartial(t)
+		return 0, ErrOffline
 	}
 	err = p.s.SetChunkSink(t.stream, t.chunkCh)
 	if err == nil {
@@ -789,11 +849,7 @@ func (e *Engine) dropPartial(t *transfer) {
 // carried (the wire codec admits a–z and 0–9 only), or .bin without one.
 func (e *Engine) placeImage(t *transfer) (string, error) {
 	if t.format == FormatFile {
-		ext := t.ext
-		if ext == "" {
-			ext = "bin"
-		}
-		return placeAs(t, "file-"+hex.EncodeToString(t.hash[:4]), ext)
+		return placeAs(t, "file-"+hex.EncodeToString(t.hash[:4]), SavedExt(t.ext))
 	}
 	head := make([]byte, media.SniffLen)
 	f, err := os.Open(t.partPath) // #nosec G304 -- our partials dir
@@ -807,6 +863,32 @@ func (e *Engine) placeImage(t *transfer) (string, error) {
 		return "", err
 	}
 	return placeAs(t, "img-"+hex.EncodeToString(t.hash[:4]), media.Ext(format))
+}
+
+// activeExt lists file types that can act without being opened as a document:
+// programs, scripts, shortcuts (Windows fetches a .url or .lnk icon from
+// wherever it points, as soon as a folder shows it), installers, and disk
+// images that Windows mounts without its download warnings.
+var activeExt = map[string]bool{
+	"exe": true, "com": true, "scr": true, "pif": true, "cpl": true, "msi": true, "msp": true, "mst": true,
+	"bat": true, "cmd": true, "ps1": true, "psm1": true, "psd1": true, "vbs": true, "vbe": true,
+	"js": true, "jse": true, "wsf": true, "wsh": true, "hta": true, "reg": true, "inf": true, "chm": true,
+	"url": true, "lnk": true, "scf": true, "appx": true, "msix": true, "gadget": true, "jar": true,
+	"iso": true, "img": true, "vhd": true, "vhdx": true,
+	"desktop": true, "command": true, "tool": true,
+}
+
+// SavedExt is the extension a received file is saved with: the one its offer
+// claimed, with ".bin" added to a type that could act by itself (see
+// activeExt), and "bin" when the offer claimed none.
+func SavedExt(ext string) string {
+	switch {
+	case ext == "":
+		return "bin"
+	case activeExt[ext]:
+		return ext + ".bin"
+	}
+	return ext
 }
 
 // placeAs moves the partial to <destDir>/<base>.<ext>, or <base>-2.<ext> and
@@ -831,6 +913,7 @@ func placeAs(t *transfer, base, ext string) (string, error) {
 			_ = os.Remove(dest)
 			return "", err
 		}
+		markDownloaded(dest)
 		return dest, nil
 	}
 	return "", errors.New("too many collisions")
@@ -984,7 +1067,9 @@ func DecodeImage(ctx context.Context, path string, maxSide int) (image.Image, er
 	} else if uint64(st.Size()) > wire.MaxImageDecodeBytes { // #nosec G115 -- a size is not negative
 		return nil, media.ErrTooLarge
 	}
-	if !isImage(path) { // a received file of another kind is never read into memory
+	if head, err := readHead(path); err != nil {
+		return nil, err
+	} else if _, err := media.Sniff(head); err != nil { // a received file of another kind is never read into memory
 		return nil, media.ErrUnsupported
 	}
 	data, err := os.ReadFile(path) // #nosec G304 -- path came from TransferDone

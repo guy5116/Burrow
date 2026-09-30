@@ -5,8 +5,15 @@ package core
 import (
 	"context"
 	"errors"
+	"github.com/guy5116/burrow/internal/store"
+	"github.com/guy5116/burrow/internal/transport"
+	"net"
 	"os"
 	"path/filepath"
+	"runtime"
+	"slices"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -185,7 +192,7 @@ func TestCancelWhileHashing(t *testing.T) {
 		t.Fatal(err)
 	}
 	for n := 0; n < wire.MaxPendingOffers+1; n++ {
-		id, err := a.e.SendFile(context.Background(), b.id(), big, "")
+		id, err := a.e.SendFile(context.Background(), b.id(), big, "", false)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -199,7 +206,7 @@ func TestCancelWhileHashing(t *testing.T) {
 		}
 	}
 	small, _ := fileFixture(t, "small.zip", 100)
-	if _, err := a.e.SendFile(context.Background(), b.id(), small, ""); err != nil {
+	if _, err := a.e.SendFile(context.Background(), b.id(), small, "", false); err != nil {
 		t.Fatal(err)
 	}
 	if o := b.wait(t, "offer", isType[ImageOffered]).(ImageOffered); o.Size != 100 || b.count(isType[ImageOffered]) != 1 {
@@ -329,4 +336,195 @@ func TestSessionAliveAfterCancelledDownload(t *testing.T) {
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
+}
+
+// Connections that never show a key take no peer's place: while they wait
+// for their msg1, this side still dials out and still accepts contacts.
+func TestHalfOpenConnectionsBlockNobody(t *testing.T) {
+	a := newNode(t, Config{})
+	b := newNode(t, Config{})
+	c := newNode(t, Config{})
+	var conns []net.Conn
+	for i := 0; i < wire.MaxPeers; i++ {
+		conn, err := (&net.Dialer{}).DialContext(context.Background(), "tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(int(a.port))))
+		if err != nil {
+			t.Fatal(err)
+		}
+		conns = append(conns, conn)
+	}
+	defer func() {
+		for _, conn := range conns {
+			_ = conn.Close()
+		}
+	}()
+	time.Sleep(200 * time.Millisecond) // all of them are waiting for msg1 now
+	connect(t, a, b, b.invite(t, false).String)
+	connect(t, c, a, a.invite(t, false).String)
+}
+
+// A photo or video format that keeps its metadata is not sent as a file
+// unless the user says so.
+func TestSendFileRefusesMetadataFormats(t *testing.T) {
+	a := imgNode(t, Config{})
+	b := imgNode(t, Config{})
+	connect(t, b, a, a.invite(t, false).String)
+	heic := append([]byte("\x00\x00\x00\x18ftypheic\x00\x00\x00\x00mif1heic"), make([]byte, 100)...)
+	path := filepath.Join(t.TempDir(), "IMG_0001.HEIC")
+	if err := os.WriteFile(path, heic, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.e.SendFile(context.Background(), b.id(), path, "", false); !errors.Is(err, ErrKeepsMetadata) {
+		t.Fatal(err)
+	}
+	if _, err := a.e.SendFile(context.Background(), b.id(), path, "", true); err != nil {
+		t.Fatal(err)
+	}
+	if o := b.wait(t, "offer", isFileOffer).(ImageOffered); o.Ext != "heic" || o.Size != uint64(len(heic)) {
+		t.Fatalf("%+v", o)
+	}
+	if _, err := a.e.SendFile(context.Background(), b.id(), t.TempDir(), "", false); err == nil || !strings.Contains(err.Error(), "not a file") {
+		t.Fatal("a directory was offered", err)
+	}
+}
+
+// A file type that could act by itself is saved so that it cannot.
+func TestActiveFileTypesAreDefused(t *testing.T) {
+	for ext, want := range map[string]string{"zip": "zip", "": "bin", "url": "url.bin", "lnk": "lnk.bin", "exe": "exe.bin", "desktop": "desktop.bin", "pdf": "pdf"} {
+		if got := SavedExt(ext); got != want {
+			t.Errorf("%q: %q", ext, got)
+		}
+	}
+	a := imgNode(t, Config{})
+	b := imgNode(t, Config{})
+	connect(t, b, a, a.invite(t, false).String)
+	path, _ := fileFixture(t, "shortcut.url", 60)
+	if _, err := a.e.SendFile(context.Background(), b.id(), path, "", false); err != nil {
+		t.Fatal(err)
+	}
+	off := b.wait(t, "offer", isFileOffer).(ImageOffered)
+	_ = b.e.AcceptImage(off.ID, "")
+	if done := b.wait(t, "done", isType[TransferDone]).(TransferDone); !strings.HasSuffix(done.Path, ".url.bin") {
+		t.Fatal(done.Path)
+	}
+}
+
+// Once rejected, an offer cannot be accepted any more, and the other way round.
+func TestOneDecisionPerOffer(t *testing.T) {
+	a := imgNode(t, Config{})
+	b := imgNode(t, Config{ChunkDelay: 10 * time.Millisecond})
+	connect(t, b, a, a.invite(t, false).String)
+	accept := func(id TransferID) error { return b.e.AcceptImage(id, "") }
+	for n, order := range [][2]func(TransferID) error{{b.e.RejectImage, accept}, {accept, b.e.RejectImage}} {
+		path, _ := fileFixture(t, "x"+strconv.Itoa(n)+".zip", 3*wire.ChunkData)
+		if _, err := a.e.SendFile(context.Background(), b.id(), path, "", false); err != nil {
+			t.Fatal(err)
+		}
+		b.waitN(t, "offer", isFileOffer, n+1)
+		offers := offersOf(b)
+		id := offers[len(offers)-1].ID
+		if err := order[0](id); err != nil {
+			t.Fatal(err)
+		}
+		if err := order[1](id); !errors.Is(err, ErrNotOffered) && !errors.Is(err, ErrUnknownTransfer) {
+			t.Fatalf("case %d: the second decision went through: %v", n, err)
+		}
+	}
+}
+
+// A contact is tried at each address it is known at, most recent first.
+func TestConnectTriesEveryAddress(t *testing.T) {
+	a := newNode(t, Config{})
+	b := newNode(t, Config{})
+	connect(t, b, a, a.invite(t, false).String)
+	if err := b.e.Disconnect(a.id()); err != nil {
+		t.Fatal(err)
+	}
+	b.wait(t, "PeerDisconnected", isType[PeerDisconnected])
+	dead, _ := (&net.ListenConfig{}).Listen(context.Background(), "tcp", "127.0.0.1:0")
+	deadPort := uint16(dead.Addr().(*net.TCPAddr).Port)
+	_ = dead.Close()
+	b.e.do(func() {
+		b.e.rememberAddrL(a.id(), transport.Address{Kind: transport.KindTCP, Host: "127.0.0.1", Port: deadPort})
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if _, err := b.e.Connect(ctx, Target{Contact: ptr(a.id())}); err != nil {
+		t.Fatal(err)
+	}
+	if n := b.count(isType[HandshakeFailed]); n != 0 {
+		t.Fatalf("%d failures reported for an address that was not the last one tried", n)
+	}
+}
+
+// An address learned from the LAN is used, never saved: anyone there can
+// send an announcement.
+func TestUnsavedDialLeavesAddresses(t *testing.T) {
+	a := newNode(t, Config{})
+	b := newNode(t, Config{})
+	connect(t, b, a, a.invite(t, false).String)
+	_ = b.e.Disconnect(a.id())
+	b.wait(t, "PeerDisconnected", isType[PeerDisconnected])
+	before, _ := b.e.Contact(a.id())
+	lan := transport.Address{Kind: transport.KindTCP, Host: "localhost", Port: a.port}
+	if err := b.e.dial(context.Background(), lan, a.id(), dialOpts{quiet: true, unsaved: true}); err != nil {
+		t.Fatal(err)
+	}
+	after, _ := b.e.Contact(a.id())
+	if !slices.Equal(before.Addrs, after.Addrs) {
+		t.Fatalf("addresses changed: %v → %v", before.Addrs, after.Addrs)
+	}
+}
+
+// A flush request is answered even when a write in its batch fails half way:
+// History and Burn wait for it.
+func TestHistoryFlushAnsweredWhenWriteFails(t *testing.T) {
+	if os.Getuid() == 0 || runtime.GOOS == "windows" {
+		t.Skip("needs directory permissions that bind the current user")
+	}
+	st, err := store.Init(t.TempDir(), []byte("pw"), fast)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	e, err := New(Config{}, st, nil, nil) // no history writer runs: the test calls writeHistory itself
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer e.Close()
+	e.histCh = make(chan histRec, historyQueue)
+	rec := histRec{Peer: "00", Text: "x"}
+	for range 10 { // a segment that is already partly full
+		e.writeHistory(rec)
+	}
+	dir := filepath.Join(st.Dir(), historyDir)
+	if err := os.Chmod(dir, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = os.Chmod(dir, 0o700) }()
+	// One batch: the segment fills up (and its write fails) before the flush
+	// request in it is reached.
+	for range historySegment - 10 {
+		e.histCh <- rec
+	}
+	flushed := make(chan struct{})
+	e.histCh <- histRec{flushed: flushed}
+	e.writeHistory(rec)
+	select {
+	case <-flushed:
+	default:
+		t.Fatal("the flush request was dropped with the failed write")
+	}
+}
+
+// A failed reconnect attempt says that it was automatic, so that the
+// interfaces can keep their alarms for connections the user asked for.
+func TestReconnectFailuresAreMarked(t *testing.T) {
+	a := newNode(t, Config{})
+	b := newNode(t, Config{AutoReconnect: true})
+	b.e.rand = func() time.Duration { return 300 * time.Millisecond } // time for A to go away
+	connect(t, b, a, a.invite(t, false).String)
+	a.peerOf(b.id()).s.Close(wire.ByeLocalError) // not a goodbye: B will try again
+	a.cancel()
+	<-a.done
+	b.wait(t, "failed retry", func(ev Event) bool { hf, ok := ev.(HandshakeFailed); return ok && hf.Retry && hf.Peer == a.id() })
 }

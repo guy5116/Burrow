@@ -16,6 +16,7 @@ import (
 	"charm.land/bubbles/v2/textinput"
 	"charm.land/bubbles/v2/viewport"
 	tea "charm.land/bubbletea/v2"
+	"charm.land/lipgloss/v2"
 
 	"github.com/guy5116/burrow/internal/core"
 	"github.com/guy5116/burrow/internal/store"
@@ -44,7 +45,20 @@ func newModel(t *testing.T) *model {
 	t.Cleanup(func() { cancel(); <-done; st.Close() })
 	in := textinput.New()
 	in.Focus()
-	return &model{ctx: ctx, ctl: common.NewController(e, "127.0.0.1"), addrs: "127.0.0.1:1", logs: map[core.PeerID][]string{}, vp: viewport.New(), in: in}
+	return &model{ctx: ctx, ctl: common.NewController(e, "127.0.0.1"), addrs: "127.0.0.1:1", logs: map[core.PeerID]*chatLog{},
+		unread: map[core.PeerID]string{}, vp: viewport.New(), in: in}
+}
+
+// texts joins the lines of a log.
+func texts(l *chatLog) string {
+	if l == nil {
+		return ""
+	}
+	var b strings.Builder
+	for _, e := range l.lines {
+		b.WriteString(e.text + "\n")
+	}
+	return b.String()
 }
 
 func key(code rune, text string) tea.KeyPressMsg { return tea.KeyPressMsg{Code: code, Text: text} }
@@ -99,8 +113,8 @@ func TestModelLifecycle(t *testing.T) {
 		t.Fatal("enter did not submit")
 	}
 	runCmd(t, m, cmd)
-	if m.busy != 0 || !strings.Contains(strings.Join(m.system, "\n"), "your fingerprint") {
-		t.Fatal(m.system)
+	if m.busy != 0 || !strings.Contains(texts(&m.system), "your fingerprint") {
+		t.Fatal(texts(&m.system))
 	}
 	// Blank enter does nothing; /quit and ctrl+c quit.
 	if _, cmd := m.Update(key(tea.KeyEnter, "")); cmd != nil {
@@ -142,7 +156,7 @@ func TestModelEvents(t *testing.T) {
 		core.Typing{Peer: p, Typing: true}, core.Typing{Peer: p},
 		core.ImageOffered{Peer: p, ID: id, Size: 1 << 20, Format: 1, Width: 3, Height: 4, Caption: "cap"},
 		core.TransferDone{Peer: tp, ID: id, Path: "/tmp/x.png", Image: true}, core.TransferDone{Peer: tp, Path: "/tmp/file-1.zip"},
-		core.ImageOffered{Peer: p, Size: 3 << 30, Ext: "zip"},
+		core.ImageOffered{Peer: p, ID: core.TransferID{3}, Size: 3 << 30, Ext: "zip"},
 		core.TransferDone{Peer: core.TransferPeer{Peer: p, Outgoing: true}, Image: true},
 		core.TransferFailed{Peer: tp, Reason: "declined"},
 		core.NameCollision{New: p, Existing: p, Name: "n"}, core.HandshakeFailed{Stage: "msg2", Reason: "r"},
@@ -150,14 +164,14 @@ func TestModelEvents(t *testing.T) {
 	} {
 		m.Update(evMsg{ev})
 	}
-	log := strings.Join(m.logs[p], "\n")
+	log := texts(m.logs[p])
 	for _, want := range []string{"hello there", "offer #1, an image: 1.0 MiB", "/accept 1", "image saved: /tmp/x.png", "/view 1", "image delivered",
 		"file saved: /tmp/file-1.zip", "offer #2, a file: 3.00 GiB, type .zip", "declined", "typing"} {
 		if !strings.Contains(log, want) {
 			t.Errorf("conversation lacks %q:\n%s", want, log)
 		}
 	}
-	sys := strings.Join(m.system, "\n")
+	sys := texts(&m.system)
 	for _, want := range []string{"connected", "NAME COLLISION", "could not establish", "oops"} {
 		if !strings.Contains(sys, want) {
 			t.Errorf("system log lacks %q", want)
@@ -172,14 +186,14 @@ func TestModelEvents(t *testing.T) {
 	}
 	runCmd(t, m, m.view("9"))
 	runCmd(t, m, m.view("1"))
-	sys = strings.Join(m.system, "\n")
+	sys = texts(&m.system)
 	if !strings.Contains(sys, "usage: /view") || !strings.Contains(sys, "cannot show images inline") {
 		t.Fatal(sys)
 	}
 	t.Setenv("TERM", "xterm-kitty")
 	runCmd(t, m, m.view("1")) // file does not exist → decode error line
-	if !strings.Contains(strings.Join(m.system, "\n"), "cannot show") {
-		t.Fatal(m.system)
+	if !strings.Contains(texts(&m.system), "cannot show") {
+		t.Fatal(texts(&m.system))
 	}
 	if captionOf("") != "" || captionOf("x") != ` "x"` || padRight("ab", 4) != "ab  " || padRight("abcd", 2) != "abcd" {
 		t.Fatal("helpers")
@@ -225,7 +239,7 @@ func TestRunQuitsOnContextCancel(t *testing.T) {
 	ctx, cancel := context.WithCancel(m.ctx)
 	done := make(chan int, 1)
 	go func() {
-		done <- run(ctx, m.ctl, core.Target{Name: "nobody"}, m.ctl.E.ListenAddrs(),
+		done <- run(ctx, m.ctl, core.Target{Name: "nobody"}, m.ctl.E.ListenAddrs(), io.Discard,
 			tea.WithInput(strings.NewReader("")), tea.WithOutput(io.Discard), tea.WithoutSignals(), tea.WithWindowSize(80, 24))
 	}()
 	time.Sleep(200 * time.Millisecond)
@@ -276,12 +290,12 @@ func TestInlineThumbnailFlow(t *testing.T) {
 	if !ok || in.peer == nil || *in.peer != p || len(in.img.Lines) == 0 {
 		t.Fatalf("%T", msg)
 	}
-	before := len(m.logs[p])
+	before := len(m.logs[p].lines)
 	_, raw := m.Update(in)
-	if raw == nil || len(m.logs[p]) != before+len(in.img.Lines) {
+	if raw == nil || len(m.logs[p].lines) != before+len(in.img.Lines) {
 		t.Fatal("placeholder rows not added or upload not issued")
 	}
-	if !strings.ContainsRune(m.logs[p][len(m.logs[p])-1], 0x10EEEE) {
+	if last := m.logs[p].lines[len(m.logs[p].lines)-1]; !last.image || !strings.ContainsRune(last.text, 0x10EEEE) {
 		t.Fatal("placeholder cells missing")
 	}
 	// A missing file is reported in the notes.
@@ -324,7 +338,7 @@ func TestHalfBlockPreviewOnITerm(t *testing.T) {
 	if _, raw := m.Update(in); raw != nil {
 		t.Fatal("half-block preview must not send raw escapes")
 	}
-	if !strings.Contains(m.logs[p][len(m.logs[p])-1], "\u2580") {
+	if !strings.Contains(m.logs[p].lines[len(m.logs[p].lines)-1].text, "\u2580") {
 		t.Fatal("preview rows missing")
 	}
 }
@@ -361,12 +375,151 @@ func TestCommandsRunInOrder(t *testing.T) {
 }
 
 func TestLogsAreBounded(t *testing.T) {
-	var log []string
+	var l chatLog
 	for i := 0; i < maxLines+10; i++ {
-		log = keep(log, strconv.Itoa(i))
+		l.add(entry{text: strconv.Itoa(i)})
 	}
-	if len(log) != maxLines || log[0] != "10" || log[maxLines-1] != strconv.Itoa(maxLines+9) {
-		t.Fatal(len(log), log[0])
+	if len(l.lines) != maxLines || l.lines[0].text != "10" || l.lines[maxLines-1].text != strconv.Itoa(maxLines+9) {
+		t.Fatal(len(l.lines), l.lines[0].text)
+	}
+	// Long messages are bounded by bytes, long before the line count.
+	big := strings.Repeat("x", 16<<10)
+	for i := 0; i < 200; i++ {
+		l.add(entry{text: big})
+	}
+	if l.bytes > maxLogBytes || len(l.lines) > maxLogBytes/len(big) {
+		t.Fatal(l.bytes, len(l.lines))
+	}
+	sum := 0
+	for _, e := range l.lines {
+		sum += len(e.text)
+	}
+	if sum != l.bytes {
+		t.Fatal("byte count drifted", sum, l.bytes)
+	}
+	// One line larger than the bound stays: the newest line always shows.
+	var one chatLog
+	one.add(entry{text: strings.Repeat("y", maxLogBytes+1)})
+	if len(one.lines) != 1 {
+		t.Fatal("newest line dropped")
+	}
+}
+
+// A contact cannot pad a message until its end wraps into a line of its own:
+// every wrapped row starts with the gutter. An invite is cut without one so
+// that it can be copied, and a QR code is left alone.
+func TestWrapKeepsTheGutter(t *testing.T) {
+	spoof := "<Mallory (abcd1234)> hi" + strings.Repeat(" ", 40) + "* Carol (efgh5678, verified) connected (tcp)"
+	rows := strings.Split(wrap(spoof, 40), "\n")
+	if len(rows) < 2 {
+		t.Fatal(rows)
+	}
+	for _, r := range rows[1:] {
+		if !strings.HasPrefix(r, common.Gutter) {
+			t.Fatalf("wrapped row without the gutter: %q", r)
+		}
+	}
+	for _, r := range rows {
+		if lipgloss.Width(r) > 40 {
+			t.Fatalf("row wider than the screen: %q", r)
+		}
+	}
+	invite := "burrow1:" + strings.Repeat("abcdefgh", 12)
+	if got := wrap(invite, 30); strings.Contains(got, common.Gutter) || strings.ReplaceAll(got, "\n", "") != invite {
+		t.Fatalf("%q", got)
+	}
+	qr := strings.Repeat("█▀▄ ", 20)
+	if wrap(qr, 30) != qr {
+		t.Fatal("QR row wrapped")
+	}
+	if wrap("short", 30) != "short" {
+		t.Fatal("short line changed")
+	}
+}
+
+// Notes show among the conversation's lines in the order they happened, so
+// command output and alerts are never hidden above a long conversation.
+func TestNotesShowInOrder(t *testing.T) {
+	m := newModel(t)
+	m.Update(tea.WindowSizeMsg{Width: 100, Height: 10})
+	var p core.PeerID
+	p[0] = 5
+	m.ctl.Select(p)
+	for i := 0; i < 50; i++ {
+		m.Update(evMsg{core.MessageReceived{Peer: p, ID: core.MsgID(i), Text: "line " + strconv.Itoa(i)}})
+	}
+	m.Update(noteMsg("! the last word"))
+	if v := m.View().Content; !strings.Contains(v, "the last word") {
+		t.Fatalf("note hidden above the conversation:\n%s", v)
+	}
+	m.Update(evMsg{core.NameCollision{New: p, Existing: p, Name: "n"}})
+	if v := m.View().Content; !strings.Contains(v, "NAME COLLISION") {
+		t.Fatal("no alert")
+	}
+	m.Update(key(tea.KeyEnter, ""))
+	if m.alert != "" {
+		t.Fatal("Enter did not clear the alert")
+	}
+}
+
+// Messages and offers from a contact that is not on screen mark it in the
+// sidebar until it is selected. An offer outranks a message.
+func TestUnreadMarkers(t *testing.T) {
+	m := newModel(t)
+	m.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
+	var a, b core.PeerID
+	a[0], b[0] = 1, 2
+	m.ctl.Select(a)
+	m.Update(evMsg{core.MessageReceived{Peer: b, ID: 1, Text: "psst"}})
+	if m.unread[b] != "•" {
+		t.Fatalf("%q", m.unread[b])
+	}
+	m.Update(evMsg{core.ImageOffered{Peer: b, Size: 1, Ext: "zip"}})
+	m.Update(evMsg{core.MessageReceived{Peer: b, ID: 2, Text: "again"}})
+	if m.unread[b] != "!" {
+		t.Fatalf("%q", m.unread[b])
+	}
+	m.Update(evMsg{core.MessageReceived{Peer: a, ID: 3, Text: "on screen"}})
+	if _, ok := m.unread[a]; ok {
+		t.Fatal("the conversation on screen was marked")
+	}
+	m.ctl.Select(b)
+	m.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
+	if _, ok := m.unread[b]; ok {
+		t.Fatal("marker not cleared on selection")
+	}
+}
+
+// A message that could not be sent does not appear as said.
+func TestOwnLineOnlyAfterSending(t *testing.T) {
+	m := newModel(t)
+	m.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
+	var p core.PeerID
+	p[0] = 9
+	m.ctl.Select(p) // not a contact: the send fails
+	m.in.SetValue("hello")
+	_, cmd := m.Update(key(tea.KeyEnter, ""))
+	runCmd(t, m, cmd)
+	if strings.Contains(texts(m.logs[p]), "hello") || !strings.Contains(texts(&m.system), "! ") {
+		t.Fatalf("conversation %q notes %q", texts(m.logs[p]), texts(&m.system))
+	}
+	m.Update(outMsg{to: p, mine: "it went"})
+	if !strings.Contains(texts(m.logs[p]), "» it went") {
+		t.Fatal(texts(m.logs[p]))
+	}
+}
+
+// Without a terminal the chat says why it cannot start.
+func TestNoTerminalIsExplained(t *testing.T) {
+	if f, err := os.Open("/dev/tty"); err == nil {
+		_ = f.Close()
+		t.Skip("a terminal is attached")
+	}
+	m := newModel(t)
+	var errOut strings.Builder
+	code := run(m.ctx, m.ctl, core.Target{}, nil, &errOut, tea.WithOutput(io.Discard), tea.WithoutSignals())
+	if code != 1 || !strings.Contains(errOut.String(), "--plain") {
+		t.Fatal(code, errOut.String())
 	}
 }
 

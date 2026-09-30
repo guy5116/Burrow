@@ -48,36 +48,42 @@ func runPlain(ctx context.Context, ctl *common.Controller, target core.Target, a
 				if o, ok := ev.(core.ImageOffered); ok {
 					m["number"] = ctl.Number(o.ID)
 				}
-				emit(m, ctl.Names.Line(ev))
+				emit(m, ctl.Line(ev))
 			case <-ctx.Done():
 				return
 			}
 		}
 	}()
 
-	exec := func(line string) bool {
-		out, quit := ctl.Exec(ctx, line)
+	// report emits command output and says whether any of it was an error.
+	report := func(out []string) (failed bool) {
 		for _, l := range out {
 			m := map[string]any{"event": "Output", "text": l}
 			if strings.HasPrefix(l, "! ") {
-				m["event"] = "Error"
+				m["event"], failed = "Error", true
 			}
 			emit(m, l)
 		}
-		return quit
+		return failed
 	}
-	if target.InviteBytes != nil {
-		for _, l := range ctl.ConnectInvite(ctx, target.InviteBytes) {
-			m := map[string]any{"event": "Output", "text": l}
-			if strings.HasPrefix(l, "! ") {
-				m["event"] = "Error"
-			}
-			emit(m, l)
-		}
-	} else if target.Invite != "" {
-		exec("/connect " + target.Invite)
-	} else if target.Name != "" {
-		exec("/connect " + target.Name)
+	exec := func(line string) (quit, failed bool) {
+		out, quit := ctl.Exec(ctx, line)
+		return quit, report(out)
+	}
+	// A script that asked for a connection learns from the exit status that
+	// it failed, even though the session goes on listening until input ends.
+	var connectFailed bool
+	switch {
+	case target.InviteBytes != nil:
+		connectFailed = report(ctl.ConnectInvite(ctx, target.InviteBytes))
+	case target.Invite != "":
+		_, connectFailed = exec("/connect " + target.Invite)
+	case target.Name != "":
+		_, connectFailed = exec("/connect " + target.Name)
+	}
+	status := 0
+	if connectFailed {
+		status = 1
 	}
 
 	// Plain mode ends when stdin ends. A line longer than maxLine is an error,
@@ -100,17 +106,17 @@ func runPlain(ctx context.Context, ctl *common.Controller, target core.Target, a
 	for {
 		select {
 		case <-ctx.Done():
-			return 0
+			return status
 		case line, ok := <-lines:
 			if !ok { // input has ended
 				if err := <-readErr; err != nil {
 					fmt.Fprintln(stderr, "burrow: reading input:", err)
 					return 1
 				}
-				return 0
+				return status
 			}
-			if exec(line) { // /quit
-				return 0
+			if quit, _ := exec(line); quit {
+				return status
 			}
 		}
 	}

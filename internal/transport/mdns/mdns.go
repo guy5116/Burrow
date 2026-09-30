@@ -34,6 +34,7 @@ var families = []struct{ network, group string }{{"udp4", group}, {"udp6", group
 type Announcement struct {
 	Name  string
 	IP    net.IP // the packet's source address, never a claimed A record
+	Zone  string // the interface of a link-local IPv6 source, needed to dial it
 	Port  uint16
 	Nonce [16]byte
 	Tag   [16]byte
@@ -273,6 +274,7 @@ func Browse(ctx context.Context, fn func(Announcement)) error {
 					return
 				}
 				if an, ok := Parse(buf[:n], src.IP); ok && limit.take(time.Now()) {
+					an.Zone = src.Zone
 					mu.Lock()
 					fn(an)
 					mu.Unlock()

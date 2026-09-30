@@ -57,7 +57,7 @@ func (a *App) showInviteDialog() {
 		text.SetText(inv.String)
 		text.Wrapping = fyne.TextWrapBreak
 		text.MultiLine = true
-		cp := widget.NewButtonWithIcon("Copy", theme.ContentCopyIcon(), func() { a.win.Clipboard().SetContent(inv.String) })
+		cp := widget.NewButtonWithIcon("Copy", theme.ContentCopyIcon(), func() { a.fa.Clipboard().SetContent(inv.String) })
 		content := container.NewVBox(
 			widget.NewLabel(fmt.Sprintf("Expires %s. Share it over a channel you trust and treat it like a password.", inv.Expiry.Local().Format(time.RFC822))),
 			qrImage(inv.String), text, cp)
@@ -76,12 +76,13 @@ func qrImage(content string) fyne.CanvasObject {
 	return img
 }
 
-// showConnectDialog pastes an invite (password-style field) or picks a contact.
+// showConnectDialog connects with a pasted invite (a password-style field).
+// A saved contact is connected from its Contact menu.
 func (a *App) showConnectDialog() {
 	inv := widget.NewPasswordEntry()
 	inv.PlaceHolder = "burrow1:… (paste the invite)"
 	dialog.ShowForm("Connect", "Connect", "Cancel", []*widget.FormItem{widget.NewFormItem("Invite", inv)}, func(ok bool) {
-		s := inv.Text
+		s := strings.Join(strings.Fields(inv.Text), "") // an invite never contains spaces; a copy may
 		inv.SetText("")
 		if !ok || s == "" {
 			return
@@ -195,7 +196,7 @@ func (a *App) showSettingsDialog() {
 			return
 		}
 		a.cfg = n
-		dialog.ShowInformation("Settings saved", "Port, name, size limits and reconnect changes apply after a restart.", a.win)
+		dialog.ShowInformation("Settings saved", "Invite host and link opening apply now. Every other setting applies the next time Burrow starts.", a.win)
 	}, a.win)
 }
 
@@ -243,14 +244,19 @@ func (a *App) showOfferDialog(o core.ImageOffered) {
 	label.Wrapping = fyne.TextWrapWord
 	accept := widget.NewButton("Accept", func() {
 		if d := a.offers[o.ID]; d != nil {
+			delete(a.offers, o.ID) // first: closing a dialog whose offer is still listed rejects it
 			d.Hide()
-			delete(a.offers, o.ID)
 		}
 		a.async(func() error { return a.e.AcceptImage(o.ID, "") }, func(err error) {
-			if errors.Is(err, core.ErrBusy) {
+			switch {
+			case errors.Is(err, core.ErrBusy):
 				a.showOfferDialog(o) // still on offer: ask again, with the reason
+				a.errDialog(err)
+			case err != nil:
+				a.errDialog(err)
+			default:
+				a.addRow(o.Peer, a.transferRow(o.ID, "receiving "+common.Offer(o)+"…"))
 			}
-			a.errDialog(err)
 		})
 	})
 	accept.Importance = widget.LowImportance
@@ -258,7 +264,7 @@ func (a *App) showOfferDialog(o core.ImageOffered) {
 	d.SetOnClosed(func() {
 		if _, pending := a.offers[o.ID]; pending {
 			delete(a.offers, o.ID)
-			go func() { _ = a.e.RejectImage(o.ID) }()
+			go func() { _ = rejectImage(a.e, o.ID) }()
 		}
 	})
 	a.offers[o.ID] = d
@@ -281,21 +287,96 @@ func (a *App) pickImage() {
 	}, a.win)
 }
 
-func (a *App) offerImage(path string) {
+// rejectImage is Engine.RejectImage; tests count the calls.
+var rejectImage = (*core.Engine).RejectImage
+
+func (a *App) offerImage(path string) { a.sendFile(path, false) }
+
+// sendFile offers a file to the selected contact. A photo or video format
+// whose metadata Burrow cannot remove is sent only after the user agrees.
+func (a *App) sendFile(path string, keepMetadata bool) {
 	id, ok := a.selected()
 	if !ok {
 		return
 	}
-	a.async(func() error {
-		_, err := a.e.SendFile(context.Background(), id, path, "")
+	var tid core.TransferID
+	a.async(func() (err error) {
+		tid, err = a.e.SendFile(context.Background(), id, path, "", keepMetadata)
 		return err
 	}, func(err error) {
-		if err != nil {
+		switch {
+		case errors.Is(err, core.ErrKeepsMetadata):
+			a.confirm(dialog.NewConfirm("Send it with its metadata?",
+				strings.TrimPrefix(err.Error(), "core: ")+".\n\nIt would tell the recipient where and when it was taken, and with what device. Converting it to JPEG or PNG first removes that.\n\nSend it as it is?",
+				func(yes bool) {
+					if yes {
+						a.sendFile(path, true)
+					}
+				}, a.win))
+		case err != nil:
 			a.errDialog(err)
+		default:
+			a.addRow(id, a.transferRow(tid, "sending (pictures lose their metadata; other files go as they are, without their name)…"))
+		}
+	})
+}
+
+// showContactMenu offers the actions on the open conversation's contact.
+func (a *App) showContactMenu(from fyne.CanvasObject) {
+	id, ok := a.selected()
+	if !ok {
+		dialog.ShowInformation("No contact selected", "Pick a contact in the sidebar first.", a.win)
+		return
+	}
+	c, err := a.e.Contact(id)
+	if err != nil {
+		a.errDialog(err)
+		return
+	}
+	block := fyne.NewMenuItem("Block…", func() {
+		a.confirm(dialog.NewConfirm("Block "+c.Nickname+"?", "Their connections are refused without a word, and Burrow stops reconnecting to them.",
+			func(yes bool) {
+				if yes {
+					a.errDialog(a.e.BlockContact(id, true))
+					a.refreshContacts()
+				}
+			}, a.win))
+	})
+	if c.Blocked {
+		block = fyne.NewMenuItem("Unblock", func() {
+			a.errDialog(a.e.BlockContact(id, false))
+			a.refreshContacts()
+		})
+	}
+	menu := fyne.NewMenu("",
+		fyne.NewMenuItem("Connect", func() { a.connectTarget(core.Target{Contact: &id}) }),
+		fyne.NewMenuItem("Disconnect", func() { a.errDialog(a.e.Disconnect(id)) }),
+		fyne.NewMenuItem("Rename…", func() { a.showRenameDialog(id, c.Nickname) }),
+		block,
+		fyne.NewMenuItem("Remove…", func() {
+			a.confirm(dialog.NewConfirm("Remove "+c.Nickname+"?", "Talking to them again will need a new invite.",
+				func(yes bool) {
+					if yes {
+						a.errDialog(a.e.RemoveContact(id))
+						a.refreshContacts()
+					}
+				}, a.win))
+		}),
+	)
+	widget.ShowPopUpMenuAtRelativePosition(menu, a.win.Canvas(), fyne.NewPos(0, from.Size().Height), from)
+}
+
+func (a *App) showRenameDialog(id core.PeerID, current string) {
+	name := widget.NewEntry()
+	name.SetText(current)
+	dialog.ShowForm("Rename", "Rename", "Cancel", []*widget.FormItem{widget.NewFormItem("Name", name)}, func(ok bool) {
+		if !ok {
 			return
 		}
-		a.addRow(id, &row{kind: rowSystem, text: "sending (images lose their metadata; other files go as they are, without their name)…"})
-	})
+		a.errDialog(a.e.RenameContact(id, name.Text))
+		a.refreshContacts()
+		a.updateStatus()
+	}, a.win)
 }
 
 // imageBubble is a tappable thumbnail; decoding happens off the UI thread.

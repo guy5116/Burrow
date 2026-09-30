@@ -29,26 +29,34 @@ func (a *App) buildMain() {
 			if i >= len(a.contacts) {
 				return
 			}
-			// Presence and verification come first, in columns of their own:
-			// whatever a contact called itself cannot reach them.
+			// Presence, verification and news come first, in columns of their
+			// own: whatever a contact called itself cannot reach them.
 			c := a.contacts[i]
-			mark, v := "○", "?"
+			mark, v, news := "○", "?", " "
 			if c.Online {
 				mark = "●"
 			}
 			if c.Verified {
 				v = "✓"
 			}
-			o.(*widget.Label).SetText(mark + v + " " + c.Nickname)
+			if a.unread[c.ID] {
+				news = "•"
+			}
+			o.(*widget.Label).SetText(mark + v + news + " " + c.Nickname)
 		})
 	a.list.OnSelected = func(i widget.ListItemID) {
-		if i < len(a.contacts) {
-			id := a.contacts[i].ID
-			a.choose(id)
-			a.renderConversation()
-			a.updateStatus()
-			a.loadHistory(id)
+		if i >= len(a.contacts) {
+			return
 		}
+		id := a.contacts[i].ID
+		if sel, ok := a.selected(); ok && sel == id {
+			return // the highlight caught up with the selection after a re-sort
+		}
+		a.choose(id)
+		a.renderConversation()
+		a.updateStatus()
+		a.loadHistory(id)
+		a.list.RefreshItem(i) // its unread mark is gone
 	}
 	toolbar := container.NewHBox(
 		widget.NewButtonWithIcon("Invite", theme.ContentAddIcon(), a.showInviteDialog),
@@ -68,9 +76,14 @@ func (a *App) buildMain() {
 	imgBtn := widget.NewButtonWithIcon("File", theme.FileIcon(), a.pickImage)
 	bottom := container.NewBorder(nil, nil, nil, container.NewHBox(imgBtn, send), a.composer)
 	a.status = widget.NewLabel("")
+	a.header = widget.NewLabelWithStyle("", fyne.TextAlignLeading, fyne.TextStyle{Bold: true})
+	a.header.Truncation = fyne.TextTruncateEllipsis
+	var contactBtn *widget.Button
+	contactBtn = widget.NewButtonWithIcon("Contact", theme.MenuIcon(), func() { a.showContactMenu(contactBtn) })
 	a.updateStatus()
 	side := container.NewBorder(toolbar, nil, nil, nil, a.list)
-	right := container.NewBorder(nil, container.NewVBox(bottom, a.status), nil, nil, a.scroll)
+	top := container.NewBorder(nil, nil, nil, contactBtn, a.header)
+	right := container.NewBorder(top, container.NewVBox(bottom, a.status), nil, nil, a.scroll)
 	split := container.NewHSplit(side, right)
 	split.SetOffset(0.28)
 	a.win.SetContent(split)
@@ -87,20 +100,44 @@ func (a *App) buildMain() {
 	}
 }
 
+// refreshContacts reloads the sidebar. Sorting may move the selected contact
+// to another row, and the highlight moves with it: the sidebar must never
+// show one contact while messages go to another. A removed contact's
+// conversation closes.
 func (a *App) refreshContacts() {
 	a.contacts = a.e.Contacts()
 	sort.Slice(a.contacts, func(i, j int) bool { return a.contacts[i].Nickname < a.contacts[j].Nickname })
-	if a.list != nil {
-		a.list.Refresh()
+	if a.list == nil {
+		return
 	}
+	a.list.Refresh()
+	id, ok := a.selected()
+	if !ok {
+		return
+	}
+	if i := a.indexOf(id); i >= 0 {
+		a.list.Select(i)
+		return
+	}
+	a.list.UnselectAll()
+	a.setTyping(false)
+	a.sel = nil
+	a.ctl.Deselect()
+	a.renderConversation()
+	a.updateStatus()
 }
 
+// updateStatus refreshes the status bar and the conversation header.
 func (a *App) updateStatus() {
 	if a.status == nil {
 		return
 	}
-	s := a.ctl.Status()
-	a.status.SetText(s)
+	a.status.SetText(a.ctl.Status())
+	if id, ok := a.selected(); ok {
+		a.header.SetText(a.label(id))
+	} else {
+		a.header.SetText("No conversation open: pick a contact")
+	}
 }
 
 func (a *App) sendText(s string) {
@@ -125,20 +162,32 @@ func (a *App) sendText(s string) {
 }
 
 // addRow appends a row to a conversation and shows it when the conversation
-// is selected. Beyond maxRows the oldest rows are dropped.
+// is selected. Beyond the limits the oldest rows are dropped.
 func (a *App) addRow(id core.PeerID, r *row) {
 	rows := append(a.msgs[id], r)
-	dropped := len(rows) - maxRows
+	size := 0
+	for _, old := range rows {
+		size += len(old.text)
+	}
+	dropped := 0
+	for len(rows)-dropped > maxRows || size > maxRowBytes && dropped < len(rows)-1 {
+		size -= len(rows[dropped].text)
+		delete(a.byMsg, rows[dropped].id)
+		dropped++
+	}
 	if dropped > 0 {
-		for _, old := range rows[:dropped] {
-			delete(a.byMsg, old.id)
-		}
 		rows = append(rows[:0], rows[dropped:]...)
 	}
 	a.msgs[id] = rows
 	sel, ok := a.selected()
 	switch {
 	case !ok || sel != id:
+		if r.kind == rowText && !r.mine && !a.unread[id] {
+			a.unread[id] = true
+			if a.list != nil {
+				a.list.Refresh()
+			}
+		}
 	case dropped > 0:
 		a.renderConversation()
 	default:
@@ -170,6 +219,14 @@ func (a *App) rowWidget(r *row) fyne.CanvasObject {
 		l.Wrapping = fyne.TextWrapWord
 		l.TextStyle = fyne.TextStyle{Italic: true}
 		r.widget = l
+		if r.transfer != nil {
+			id := *r.transfer
+			r.cancel = widget.NewButtonWithIcon("Cancel", theme.CancelIcon(), func() { a.errDialog(a.e.CancelTransfer(id)) })
+			if a.transfers[id] == nil {
+				r.cancel.Hide() // it ended before its row was drawn
+			}
+			r.widget = container.NewBorder(nil, nil, nil, r.cancel, l)
+		}
 	case rowImage:
 		r.widget = a.imageBubble(r)
 	default:
@@ -188,8 +245,8 @@ func (a *App) rowWidget(r *row) fyne.CanvasObject {
 			items = append(items, a.linkRow(u))
 		}
 		if r.mine {
-			st := widget.NewLabel(statusMark(r.status))
-			items = append(items, st)
+			r.mark = widget.NewLabel(statusMark(r.status))
+			items = append(items, r.mark)
 		}
 		r.widget = container.NewVBox(items...)
 	}
@@ -211,7 +268,7 @@ func statusMark(s core.Status) string {
 // linkRow shows a detected URL as text with "Copy link" and, only when the
 // open_links setting is on, "Open in browser" behind a confirmation.
 func (a *App) linkRow(u string) fyne.CanvasObject {
-	copyBtn := widget.NewButtonWithIcon("Copy link", theme.ContentCopyIcon(), func() { a.win.Clipboard().SetContent(u) })
+	copyBtn := widget.NewButtonWithIcon("Copy link", theme.ContentCopyIcon(), func() { a.fa.Clipboard().SetContent(u) })
 	items := []fyne.CanvasObject{copyBtn}
 	if a.cfg.OpenLinks {
 		items = append(items, widget.NewButton("Open in browser…", func() {
@@ -240,8 +297,7 @@ func (a *App) apply(ev core.Event) {
 	case core.NewPeerViaInvite:
 		a.refreshContacts()
 		if a.sel == nil {
-			a.choose(e.Peer)
-			a.renderConversation()
+			a.openChat(e.Peer)
 		}
 		c, _ := a.e.Contact(e.Peer)
 		dialog.ShowInformation("New contact",
@@ -251,6 +307,9 @@ func (a *App) apply(ev core.Event) {
 			fmt.Sprintf("A new contact uses the name %q like an existing contact. Someone may be impersonating.\n\nNew:      %s\nExisting: %s", e.Name, e.New.Display(), e.Existing.Display()), a.win)
 		a.refreshContacts()
 	case core.HandshakeFailed:
+		if e.Retry {
+			break // automatic: the conversation already shows each reconnect attempt
+		}
 		who := "peer"
 		if e.Peer != (core.PeerID{}) {
 			who = a.label(e.Peer)
@@ -261,12 +320,11 @@ func (a *App) apply(ev core.Event) {
 	case core.MessageStatus:
 		if r := a.byMsg[e.ID]; r != nil {
 			r.status = e.Status
-			r.widget = nil
+			if r.mark != nil {
+				r.mark.SetText(statusMark(e.Status)) // in place: the rest of the conversation stays as it is
+			}
 			if e.Status == core.StatusDelivered || e.Status == core.StatusFailed {
 				delete(a.byMsg, e.ID) // final: no further status will arrive
-			}
-			if sel, ok := a.selected(); ok && sel == e.Peer {
-				a.renderConversation()
 			}
 		}
 	case core.Typing:
@@ -285,6 +343,7 @@ func (a *App) apply(ev core.Event) {
 		}
 	case core.TransferDone:
 		a.updateStatus()
+		a.ended(e.ID)
 		switch {
 		case e.Peer.Outgoing:
 			a.addRow(e.Peer.Peer, &row{kind: rowSystem, text: common.Kind(e.Image) + " delivered"})
@@ -295,14 +354,33 @@ func (a *App) apply(ev core.Event) {
 		}
 	case core.TransferFailed:
 		a.updateStatus()
+		a.ended(e.ID)
 		if d := a.offers[e.ID]; d != nil {
+			delete(a.offers, e.ID) // first: closing the dialog would reject an offer still listed
 			d.Hide()
-			delete(a.offers, e.ID)
 		}
 		a.addRow(e.Peer.Peer, &row{kind: rowSystem, text: line})
 	case core.ErrorEvent:
 		dialog.ShowError(fmt.Errorf("%s", e.Message), a.win)
 	}
+}
+
+// ended removes the Cancel button of a transfer that has finished.
+func (a *App) ended(id core.TransferID) {
+	if r := a.transfers[id]; r != nil {
+		delete(a.transfers, id)
+		if r.cancel != nil {
+			r.cancel.Hide()
+		}
+	}
+}
+
+// transferRow is a conversation row for a running transfer, with a Cancel
+// button until the transfer ends.
+func (a *App) transferRow(id core.TransferID, text string) *row {
+	r := &row{kind: rowSystem, text: text, transfer: &id}
+	a.transfers[id] = r
+	return r
 }
 
 func peerOf(ev core.Event) (core.PeerID, bool) {
@@ -329,10 +407,7 @@ func (a *App) connectTarget(t core.Target) {
 				a.errDialog(err)
 				return
 			}
-			a.choose(id)
-			a.refreshContacts()
-			a.renderConversation()
-			a.updateStatus()
+			a.openChat(id)
 		})
 	}()
 }
@@ -352,10 +427,7 @@ func (a *App) loadHistory(id core.PeerID) {
 			return
 		}
 		for _, h := range hist {
-			a.msgs[id] = append(a.msgs[id], &row{kind: rowText, text: h.Text, mine: h.Mine, status: core.StatusDelivered})
-		}
-		if sel, ok := a.selected(); ok && sel == id {
-			a.renderConversation()
+			a.addRow(id, &row{kind: rowText, text: h.Text, mine: h.Mine, status: core.StatusDelivered})
 		}
 	})
 }
