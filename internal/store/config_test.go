@@ -29,7 +29,7 @@ func TestConfig(t *testing.T) {
 	if err := c.Set("nope", "1"); !errors.Is(err, ErrConfigKey) {
 		t.Fatal(err)
 	}
-	for _, kv := range [][2]string{{"listen_port", "0"}, {"listen_port", "x"}, {"typing", "maybe"}, {"max_image_mib", "0"}, {"max_file_mib", "-1"}, {"max_file_mib", "1048577"}, {"max_file_mib", "big"}, {"display_name", string(make([]byte, 33))}, {"transport", "udp"}, {"history", "sometimes"}, {"max_peers", "0"}, {"max_peers", "33"}} {
+	for _, kv := range [][2]string{{"listen_port", "0"}, {"listen_port", "x"}, {"typing", "maybe"}, {"max_image_mib", "0"}, {"max_file_mib", "-1"}, {"max_file_mib", "1048577"}, {"max_file_mib", "big"}, {"display_name", "\xff\xfe"}, {"image_dir", "/tmp/\xff"}, {"display_name", string(make([]byte, 33))}, {"transport", "udp"}, {"history", "sometimes"}, {"max_peers", "0"}, {"max_peers", "33"}} {
 		if err := c.Set(kv[0], kv[1]); err == nil {
 			t.Fatalf("Set(%s,%q) accepted", kv[0], kv[1])
 		}

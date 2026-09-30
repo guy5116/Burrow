@@ -174,6 +174,9 @@ func AppendImgOffer(dst []byte, o ImgOffer) ([]byte, error) {
 	if len(o.Caption) > MaxCaptionBytes {
 		return dst, ErrTooLarge
 	}
+	if o.Size == 0 || o.Size > MaxTransferSize {
+		return dst, ErrValue // the receiver would close the session over it
+	}
 	dst = binary.BigEndian.AppendUint64(dst, o.Size)
 	dst = append(dst, o.Format)
 	dst = binary.BigEndian.AppendUint32(dst, o.Width)
@@ -198,6 +201,9 @@ const fileOfferFixed = 8 + HashSize + 1 + 2
 func AppendFileOffer(dst []byte, o FileOffer) ([]byte, error) {
 	if len(o.Ext) > MaxFileExt || len(o.Caption) > MaxCaptionBytes {
 		return dst, ErrTooLarge
+	}
+	if o.Size == 0 || o.Size > MaxTransferSize {
+		return dst, ErrValue // the receiver would close the session over it
 	}
 	dst = binary.BigEndian.AppendUint64(dst, o.Size)
 	dst = append(dst, o.Hash[:]...)

@@ -55,8 +55,11 @@ func (e *Error) Unwrap() error { return e.Err }
 
 // Sentinel causes.
 var (
-	ErrLength     = errors.New("handshake message has illegal length")
-	ErrReplay     = errors.New("msg1 ephemeral seen before")
+	ErrLength = errors.New("handshake message has illegal length")
+	ErrReplay = errors.New("msg1 ephemeral seen before")
+	// ErrReplayRace is a replay that arrived while the first copy was still
+	// being verified: it is caught after its DH, not before.
+	ErrReplayRace = errors.New("msg1 ephemeral seen during verification")
 	ErrRejected   = errors.New("initiator not authorized")
 	ErrBadKEM     = errors.New("invalid ML-KEM encapsulation key")
 	ErrBadPayload = errors.New("malformed handshake payload")
@@ -145,7 +148,7 @@ func Initiate(ctx context.Context, conn net.Conn, self *identity.Identity, peer 
 	}
 	pt3 := wire.AppendHS3(nil, &hs3)
 	defer secret.Wipe(pt3)
-	hs3.R = [wire.HSRandomSize]byte{}
+	hs3.R, hs3.Token = [wire.HSRandomSize]byte{}, [wire.InviteTokenSz]byte{}
 	buf = make([]byte, wire.HSLenPrefix, wire.HSLenPrefix+wire.HS3Len)
 	msg3, _, _, err := hs.WriteMessage(buf, pt3)
 	if err != nil {
@@ -171,7 +174,11 @@ func Respond(ctx context.Context, conn net.Conn, self *identity.Identity, auth A
 	start := time.Now()
 	stop := armDeadline(ctx, conn, wire.HandshakeTimeout)
 	defer stop()
+	// Setting a deadline undoes the one a cancellation installs: look again.
 	if err := conn.SetReadDeadline(start.Add(wire.HandshakeMsg1Wait)); err != nil {
+		return nil, fail("msg1", err)
+	}
+	if err := ctx.Err(); err != nil {
 		return nil, fail("msg1", err)
 	}
 	msg1, err := readHS(conn, wire.HS1Len)
@@ -182,7 +189,7 @@ func Respond(ctx context.Context, conn net.Conn, self *identity.Identity, auth A
 	if err := conn.SetReadDeadline(start.Add(wire.HandshakeTimeout)); err != nil {
 		return nil, fail("msg1", err)
 	}
-	if err := ctx.Err(); err != nil { // the line above may have undone a cancellation
+	if err := ctx.Err(); err != nil {
 		return nil, fail("msg1", err)
 	}
 	// Cost ordering: replay check (map lookup) before any DH.
@@ -208,7 +215,7 @@ func Respond(ctx context.Context, conn net.Conn, self *identity.Identity, auth A
 		return nil, fail("msg1", err)
 	}
 	if replay != nil && !replay.Add(epub) {
-		return nil, fail("msg1", ErrReplay)
+		return nil, fail("msg1", ErrReplayRace)
 	}
 	var hs1 wire.HS1
 	if err := wire.DecodeHS1(pt1, &hs1); err != nil {
@@ -262,8 +269,9 @@ func Respond(ctx context.Context, conn net.Conn, self *identity.Identity, auth A
 	var token *[wire.InviteTokenSz]byte
 	if hs3.HasToken {
 		t := hs3.Token
-		token = &t
+		token = &t // the caller wipes this copy once it has decided
 	}
+	hs3.Token = [wire.InviteTokenSz]byte{}
 	if auth == nil || auth(peer, token) != Accept {
 		return nil, fail("authorize", ErrRejected)
 	}

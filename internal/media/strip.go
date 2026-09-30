@@ -44,7 +44,30 @@ type Prepared struct {
 	Path     string
 	Ext      string // ModeRaw only: the extension offered to the peer
 
-	orientation int // EXIF orientation found by pass 1; above 1 means re-encode
+	orientation int  // EXIF orientation found by pass 1; above 1 means re-encode
+	byContent   bool // the file's extension was not checked against its bytes
+}
+
+// KeepsMetadata names the photo and video formats Burrow cannot clean: HEIC,
+// AVIF and other ISO media files (MP4, MOV, 3GP), TIFF and the camera RAW
+// formats built on it, JPEG XL, Matroska and AVI. Sent as files, they would
+// carry their location, capture time and camera model to the contact. It
+// returns "" for anything else. head is the start of the file.
+func KeepsMetadata(head []byte) string {
+	has := func(off int, s string) bool { return len(head) >= off+len(s) && string(head[off:off+len(s)]) == s }
+	switch {
+	case has(4, "ftyp"):
+		return "an HEIC, AVIF, MP4 or MOV file"
+	case has(0, "II*\x00"), has(0, "MM\x00*"), has(0, "IIRO"), has(0, "IIU\x00"):
+		return "a TIFF or camera RAW photo"
+	case has(0, "\xff\x0a"), has(0, "\x00\x00\x00\x0cJXL \x0d\x0a\x87\x0a"):
+		return "a JPEG XL image"
+	case has(0, "\x1a\x45\xdf\xa3"):
+		return "a Matroska or WebM video"
+	case has(0, "RIFF") && has(8, "AVI "):
+		return "an AVI video"
+	}
+	return ""
 }
 
 // FormatFile marks a transfer that is not an image: the bytes travel as they are.
@@ -92,8 +115,11 @@ func PrepareFile(ctx context.Context, path string, maxSize uint64) (Prepared, er
 	if err := copyFile(ctx, cw, path, limit); err != nil {
 		return Prepared{}, err
 	}
-	if cw.n > limit { // it grew while we read
+	switch {
+	case cw.n > limit: // it grew while we read
 		return Prepared{}, ErrTooLarge
+	case cw.n == 0: // it was emptied while we read
+		return Prepared{}, ErrEmpty
 	}
 	p := Prepared{Format: FormatFile, Size: cw.n, Mode: ModeRaw, Path: path, Ext: FileExt(path)}
 	copy(p.Hash[:], h.Sum(nil))
@@ -127,8 +153,10 @@ func copyFile(ctx context.Context, w io.Writer, path string, limit uint64) error
 }
 
 // ProbeFile sniffs and gates a file without decoding pixels or holding the
-// file in memory.
-func ProbeFile(path string) (Info, error) {
+// file in memory. The file's extension must agree with its bytes.
+func ProbeFile(path string) (Info, error) { return probeFile(path, true) }
+
+func probeFile(path string, checkExt bool) (Info, error) {
 	f, err := os.Open(path) // #nosec G304 -- user-chosen file
 	if err != nil {
 		return Info{}, err
@@ -140,7 +168,7 @@ func ProbeFile(path string) (Info, error) {
 	if err != nil {
 		return Info{}, err
 	}
-	if !extensionAgrees(path, format) {
+	if checkExt && !extensionAgrees(path, format) {
 		return Info{}, ErrMismatch
 	}
 	st, err := f.Stat()
@@ -157,11 +185,22 @@ func ProbeFile(path string) (Info, error) {
 // records size and format for the offer. Nothing is written to disk and, in
 // strip mode without rotation, the file is never held in memory.
 func Prepare(ctx context.Context, path string, mode Mode, maxSize uint64) (Prepared, error) {
-	info, err := ProbeFile(path)
+	return prepare(ctx, path, mode, maxSize, false)
+}
+
+// PrepareByContent is Prepare for a file that was offered as a file and
+// turned out to be an image: its bytes decide, its extension does not
+// (a photo saved as "scan.jfif" or "photo.png.bak" is still stripped).
+func PrepareByContent(ctx context.Context, path string, mode Mode, maxSize uint64) (Prepared, error) {
+	return prepare(ctx, path, mode, maxSize, true)
+}
+
+func prepare(ctx context.Context, path string, mode Mode, maxSize uint64, byContent bool) (Prepared, error) {
+	info, err := probeFile(path, !byContent)
 	if err != nil {
 		return Prepared{}, err
 	}
-	p := Prepared{Format: info.Format, Width: info.Width, Height: info.Height, Animated: info.Animated, Mode: mode, Path: path}
+	p := Prepared{Format: info.Format, Width: info.Width, Height: info.Height, Animated: info.Animated, Mode: mode, Path: path, byContent: byContent}
 	h, _ := blake2b.New256(nil)
 	cw := &countWriter{w: h}
 	// The lossless strip also reveals the orientation. When the image has to
@@ -217,7 +256,7 @@ func Stream(ctx context.Context, p Prepared, sink func(index uint32, chunk []byt
 		format, err = reencode(ctx, p.Path, p.Mode, p.orientation, out)
 	default:
 		var info Info
-		if info, err = ProbeFile(p.Path); err == nil {
+		if info, err = probeFile(p.Path, !p.byContent); err == nil {
 			format = info.Format
 			orientation, err = strip(ctx, p.Path, info.Format, out)
 		}

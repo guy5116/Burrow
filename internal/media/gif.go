@@ -24,10 +24,11 @@ func gifPrescan(rd io.Reader) (frames, area int, err error) {
 		case 0x3B:
 			return frames, area, nil
 		case 0x21:
-			if _, err := r.ReadByte(); err != nil {
+			label, err := r.ReadByte()
+			if err != nil {
 				return 0, 0, ErrCorrupt
 			}
-			if err := skipSubBlocks(r, io.Discard); err != nil {
+			if err := skipExtension(r, label, io.Discard); err != nil {
 				return 0, 0, err
 			}
 		case 0x2C:
@@ -80,6 +81,33 @@ func skipGIFHeader(r *bufio.Reader, w io.Writer) (int, error) {
 		n += len(gct)
 	}
 	return n, nil
+}
+
+// skipExtension walks the extension with the given label, copying its bytes
+// to w, and ends exactly where image/gif ends it. Where the two could
+// disagree, the file is refused: a frame the pre-scan does not see would
+// escape the frame and area limits. image/gif reads a plain-text extension
+// as 13 fixed bytes and a graphic control block as 6, and refuses any label
+// it does not know.
+func skipExtension(r *bufio.Reader, label byte, w io.Writer) error {
+	switch label {
+	case 0x01: // plain text: the fixed part is one sub-block only when it says 12
+		if b, err := r.Peek(1); err != nil || b[0] != 12 {
+			return ErrCorrupt
+		}
+	case 0xF9: // graphic control: exactly one 4-byte sub-block and the terminator
+		if b, err := r.Peek(6); err != nil || b[0] != 4 || b[5] != 0 {
+			return ErrCorrupt
+		}
+	case 0xFF: // application: an empty identifier would be read differently
+		if b, err := r.Peek(1); err != nil || b[0] == 0 {
+			return ErrCorrupt
+		}
+	case 0xFE: // comment: sub-blocks only
+	default:
+		return ErrCorrupt
+	}
+	return skipSubBlocks(r, w)
 }
 
 // skipSubBlocks copies data sub-blocks up to and including the terminator.
@@ -157,7 +185,7 @@ func stripGIF(w io.Writer, r io.Reader) error {
 				return ErrCorrupt
 			}
 			ext := head{b: make([]byte, 0, 32)}
-			if err := skipSubBlocks(br, &ext); err != nil {
+			if err := skipExtension(br, label, &ext); err != nil {
 				return err
 			}
 			if ext.n == len(ext.b) && gifKeepExtension(label, ext.b) {

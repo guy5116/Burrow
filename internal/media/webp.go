@@ -9,10 +9,12 @@ import (
 
 // VP8X feature flags.
 const (
-	vp8xICC  = 0x20
-	vp8xEXIF = 0x08
-	vp8xXMP  = 0x04
-	vp8xAnim = 0x02
+	vp8xICC   = 0x20
+	vp8xAlpha = 0x10
+	vp8xEXIF  = 0x08
+	vp8xXMP   = 0x04
+	vp8xAnim  = 0x02
+	vp8xLen   = 10 // flags, 3 reserved bytes, canvas width and height (3 bytes each)
 )
 
 // webpKeep names the chunks a still image consists of. Everything else is
@@ -103,7 +105,7 @@ func stripWebP(w io.Writer, r io.ReadSeeker) (orientation int, err error) {
 		case "VP8X":
 			flags, err := br.ReadByte()
 			switch {
-			case err != nil || c.n < 10:
+			case err != nil || c.n != vp8xLen:
 				return ErrCorrupt
 			case flags&vp8xAnim != 0:
 				return ErrAnimated
@@ -145,17 +147,28 @@ func stripWebP(w io.Writer, r io.ReadSeeker) (orientation int, err error) {
 		if _, err := bw.Write(c.raw[:]); err != nil {
 			return err
 		}
-		if c.fourcc != "VP8X" {
-			return copyN(bw, br, c.padded, buf)
-		}
-		flags, err := br.ReadByte()
-		if err != nil {
-			return ErrCorrupt
-		}
-		if err := bw.WriteByte(flags &^ (vp8xICC | vp8xEXIF | vp8xXMP)); err != nil {
+		if c.fourcc == "VP8X" {
+			// Of the flags only "has alpha" survives (metadata is gone, and
+			// animation was refused); the reserved bytes become zero.
+			var x [vp8xLen]byte
+			if _, err := io.ReadFull(br, x[:]); err != nil {
+				return ErrCorrupt
+			}
+			x[0] &= vp8xAlpha
+			x[1], x[2], x[3] = 0, 0, 0
+			_, err := bw.Write(x[:])
 			return err
 		}
-		return copyN(bw, br, c.padded-1, buf)
+		if err := copyN(bw, br, c.n, buf); err != nil {
+			return err
+		}
+		if c.padded > c.n { // the pad byte of an odd-sized chunk is written as zero
+			if _, err := br.Discard(1); err != nil {
+				return ErrCorrupt
+			}
+			return bw.WriteByte(0)
+		}
+		return nil
 	})
 	if err != nil {
 		return 0, err

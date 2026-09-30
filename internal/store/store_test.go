@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"github.com/guy5116/burrow/internal/secret"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -471,7 +472,6 @@ func TestRecoverStates(t *testing.T) {
 		{[]string{StoreDir, newDir}, StoreDir},
 		{[]string{StoreDir, oldDir}, StoreDir},
 		{[]string{oldDir}, oldDir},
-		{[]string{newDir}, ""},
 		{[]string{StoreDir, newDir, oldDir}, StoreDir},
 		{nil, ""},
 	}
@@ -486,6 +486,32 @@ func TestRecoverStates(t *testing.T) {
 		if exists(filepath.Join(dir, newDir)) || exists(filepath.Join(dir, oldDir)) {
 			t.Errorf("%v: leftovers", c.dirs)
 		}
+	}
+}
+
+// A store.new alone is no state the swap produces, and may be the only copy
+// there is: a whole one becomes the store, an incomplete one is left alone.
+func TestRecoverLoneNewStore(t *testing.T) {
+	whole := t.TempDir()
+	mustInit(t, whole, pass("pw")).Close()
+	if err := os.Rename(filepath.Join(whole, StoreDir), filepath.Join(whole, newDir)); err != nil {
+		t.Fatal(err)
+	}
+	if err := Recover(whole); err != nil {
+		t.Fatal(err)
+	}
+	s, err := Open(whole, pass("pw"))
+	if err != nil {
+		t.Fatal("a whole store.new was not kept", err)
+	}
+	s.Close()
+
+	partial := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(partial, newDir), dirPerm); err != nil {
+		t.Fatal(err)
+	}
+	if err := Recover(partial); err == nil || !exists(filepath.Join(partial, newDir)) {
+		t.Fatal("an incomplete store.new was deleted", err)
 	}
 }
 
@@ -511,8 +537,11 @@ func TestRandomID(t *testing.T) {
 }
 
 func FuzzStoreBlob(f *testing.F) {
-	s := mustInit(&testing.T{}, f.TempDir(), pass("pw"))
-	defer s.Close()
+	master, err := secret.Random(MasterKeyLen)
+	if err != nil {
+		f.Fatal(err)
+	}
+	s := &Store{master: master}
 	good, _ := sealBlob(s.master, "contacts", []byte("hello"))
 	f.Add(good, "contacts")
 	f.Add(good, "invites")
@@ -748,45 +777,121 @@ func TestPassphraseChangeUnderLoad(t *testing.T) {
 	}
 }
 
-// A swap that fails while the process lives on: either the old store is back
-// and works, or the store has closed itself. Never a fresh, empty store/.
+// A step of a passphrase change that fails while the process lives on. The
+// old store is put back when it can be; when it cannot, the store closes
+// itself and the error says which passphrase the next start will want. Never
+// a fresh, empty store/, and never both passphrases or neither.
 func TestSwapFailureInLivingProcess(t *testing.T) {
-	defer func() { rename = os.Rename }()
-	for _, rollbackWorks := range []bool{true, false} {
-		dir := t.TempDir()
-		s := mustInit(t, dir, pass("old"))
-		if err := s.WriteBlob("contacts", []byte("c")); err != nil {
-			t.Fatal(err)
-		}
-		calls := 0
-		rename = func(from, to string) error {
-			calls++
-			if calls == 2 || (calls > 2 && !rollbackWorks && filepath.Base(to) == StoreDir) {
-				return errors.New("injected")
+	defer func() { rename, syncDataDir, removeAll = os.Rename, syncDir, os.RemoveAll }()
+	injected := errors.New("injected")
+	type move struct{ from, to string }
+	for _, c := range []struct {
+		name       string
+		failRename []move
+		failSync   int  // the n-th sync of the data directory fails (0: none)
+		keepNew    bool // removing store.new fails
+		closed     bool // the store closed itself
+		want       error
+		newApplies bool
+	}{
+		{name: "step aside fails", failRename: []move{{StoreDir, oldDir}}, want: injected},
+		{name: "step aside not durable", failSync: 1, want: injected},
+		{name: "step aside not durable, no way back", failSync: 1, failRename: []move{{oldDir, StoreDir}},
+			closed: true, want: ErrChangeFailedAtRestart},
+		{name: "new store cannot move in", failRename: []move{{newDir, StoreDir}}, want: injected},
+		{name: "new store cannot move in, no way back", failRename: []move{{newDir, StoreDir}, {oldDir, StoreDir}},
+			closed: true, want: ErrChangeFailedAtRestart},
+		{name: "no way back, and the new store cannot be removed", failRename: []move{{newDir, StoreDir}, {oldDir, StoreDir}},
+			keepNew: true, closed: true, want: ErrChangeCompletesAtRestart, newApplies: true},
+		{name: "moved in but not durable", failSync: 2, newApplies: true},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			dir := t.TempDir()
+			s := mustInit(t, dir, pass("old"))
+			if err := s.WriteBlob("contacts", []byte("c")); err != nil {
+				t.Fatal(err)
 			}
-			return os.Rename(from, to)
-		}
-		if err := s.ChangePassphrase(pass("new"), fast); err == nil {
-			t.Fatal("the change reported success")
-		}
-		rename = os.Rename
-		err := s.WriteBlob("invites", []byte("i"))
-		if rollbackWorks {
-			if b, rerr := s.ReadBlob("contacts"); err != nil || rerr != nil || string(b) != "c" {
-				t.Fatal("the old store is not back", err, rerr)
+			rename = func(from, to string) error {
+				for _, m := range c.failRename {
+					if filepath.Base(from) == m.from && filepath.Base(to) == m.to {
+						return injected
+					}
+				}
+				return os.Rename(from, to)
 			}
-		} else if !errors.Is(err, ErrClosed) {
-			t.Fatalf("a write after a failed swap: %v", err)
-		}
-		s.Close()
-		// Whatever happened, the next start finds the identity, under exactly one passphrase.
-		sOld, errOld := Open(dir, pass("old"))
-		sOld.Close()
-		sNew, errNew := Open(dir, pass("new"))
-		sNew.Close()
-		if (errOld == nil) == (errNew == nil) {
-			t.Fatalf("rollback=%v: old passphrase %v, new passphrase %v", rollbackWorks, errOld, errNew)
-		}
+			removeAll = func(d string) error {
+				if c.keepNew && filepath.Base(d) == newDir {
+					return injected
+				}
+				return os.RemoveAll(d)
+			}
+			syncs := 0
+			syncDataDir = func(d string) error {
+				if syncs++; syncs == c.failSync {
+					return injected
+				}
+				return syncDir(d)
+			}
+			err := s.ChangePassphrase(pass("new"), fast)
+			rename, syncDataDir, removeAll = os.Rename, syncDir, os.RemoveAll
+			if !errors.Is(err, c.want) || (c.want == nil) != (err == nil) {
+				t.Fatalf("got %v, want %v", err, c.want)
+			}
+			werr := s.WriteBlob("invites", []byte("i"))
+			b, rerr := s.ReadBlob("contacts")
+			if c.closed != errors.Is(werr, ErrClosed) || (!c.closed && (rerr != nil || string(b) != "c")) {
+				t.Fatalf("closed=%v: write %v, read %q %v", c.closed, werr, b, rerr)
+			}
+			s.Close()
+			sOld, errOld := Open(dir, pass("old"))
+			sOld.Close()
+			sNew, errNew := Open(dir, pass("new"))
+			sNew.Close()
+			if c.newApplies != (errNew == nil) || c.newApplies == (errOld == nil) {
+				t.Fatalf("old passphrase: %v, new passphrase: %v", errOld, errNew)
+			}
+		})
+	}
+}
+
+// A store.old left by an earlier change in the same process does not stand
+// in the way of the next change.
+func TestChangeAfterLeftover(t *testing.T) {
+	dir := t.TempDir()
+	s := mustInit(t, dir, pass("a"))
+	defer s.Close()
+	if err := os.MkdirAll(filepath.Join(dir, oldDir, "sub"), dirPerm); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.ChangePassphrase(pass("b"), fast); err != nil {
+		t.Fatal(err)
+	}
+	if exists(filepath.Join(dir, oldDir)) {
+		t.Fatal("store.old remains")
+	}
+}
+
+// A failed init leaves no store, so that the next init can run.
+func TestInitNotDurable(t *testing.T) {
+	defer func() { syncDataDir = syncDir }()
+	syncDataDir = func(string) error { return errors.New("injected") }
+	dir := t.TempDir()
+	if _, err := Init(dir, pass("pw"), fast); err == nil {
+		t.Fatal("init reported success")
+	}
+	syncDataDir = syncDir
+	s, err := Init(dir, pass("pw"), fast)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.Close()
+}
+
+func TestDeleteBlobInMissingDirectory(t *testing.T) {
+	s := mustInit(t, t.TempDir(), pass("pw"))
+	defer s.Close()
+	if err := s.DeleteBlob("partials/none.meta"); err != nil {
+		t.Fatal(err)
 	}
 }
 

@@ -16,12 +16,19 @@ const (
 )
 
 // pngKeep says whether a chunk of type t and length n survives strip mode.
-// gAMA and sRGB have one legal length each; under any other they could carry
-// arbitrary bytes, so they are dropped.
+// A chunk kept at a length its type does not allow could carry arbitrary
+// bytes, so it is dropped (a missing IEND or PLTE makes the file fail to
+// decode rather than leak).
 func pngKeep(t string, n uint32) bool {
 	switch t {
-	case "IHDR", "PLTE", "tRNS", "IDAT", "IEND":
-		return true
+	case "IHDR", "IDAT":
+		return true // checked by the decoder, or pixel data
+	case "IEND":
+		return n == 0
+	case "PLTE":
+		return n > 0 && n%3 == 0 && n <= 3*256
+	case "tRNS":
+		return n <= 256
 	case "gAMA":
 		return n == 4
 	case "sRGB":

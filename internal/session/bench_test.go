@@ -5,6 +5,7 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"runtime"
 	"testing"
 	"time"
 
@@ -116,7 +117,7 @@ func BenchmarkRekey(b *testing.B) {
 				b.Fatal(i.Err())
 			default:
 			}
-			time.Sleep(20 * time.Microsecond)
+			runtime.Gosched()
 		}
 	}
 }

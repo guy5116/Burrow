@@ -371,13 +371,18 @@ type rrEntry struct {
 // streams in id order starting after the one served last, or returns false
 // when none is ready. Called by the writer only.
 func (s *Session) nextTransferFrame() (outFrame, bool) {
+	t := s.streams
+	t.mu.Lock()
+	// Offers first, in the order of their ids, and looked at under the same
+	// lock as the queues: an offer and a CANCEL for its stream are queued
+	// under this lock one after the other, so a snapshot that holds the
+	// CANCEL also sees the offer, which then goes first.
 	select {
-	case f := <-s.offers: // offers first, in the order of their ids
+	case f := <-s.offers:
+		t.mu.Unlock()
 		return f, true
 	default:
 	}
-	t := s.streams
-	t.mu.Lock()
 	s.rr = s.rr[:0]
 	for id, st := range t.open {
 		s.rr = append(s.rr, rrEntry{id, st.queue})

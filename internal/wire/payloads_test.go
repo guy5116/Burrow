@@ -208,7 +208,20 @@ func TestFileOffer(t *testing.T) {
 			t.Fatalf("got %v want %v", err, want)
 		}
 	}
-	try(func(x *FileOffer) { x.Size = 0 }, ErrValue)
+	// A size the receiver would refuse is refused by the encoder already, and
+	// by the decoder when a peer sends it anyway.
+	for _, size := range []uint64{0, MaxTransferSize + 1} {
+		x := o
+		x.Size = size
+		if _, err := AppendFileOffer(nil, x); !errors.Is(err, ErrValue) {
+			t.Errorf("encoded size %d: %v", size, err)
+		}
+		raw, _ := AppendFileOffer(nil, o)
+		binary.BigEndian.PutUint64(raw, size)
+		if _, err := DecodeFileOffer(raw); !errors.Is(err, ErrValue) {
+			t.Errorf("decoded size %d: %v", size, err)
+		}
+	}
 	try(func(x *FileOffer) { x.Ext = nil }, nil)
 	try(func(x *FileOffer) { x.Caption = nil }, nil)
 	try(func(x *FileOffer) { x.Caption = []byte{0xff} }, ErrUTF8)
@@ -269,7 +282,18 @@ func TestImgOffer(t *testing.T) {
 			t.Errorf("got %v want %v", err, want)
 		}
 	}
-	try(func(x *ImgOffer) { x.Size = 0 }, ErrValue)
+	for _, size := range []uint64{0, MaxTransferSize + 1} {
+		x := o
+		x.Size = size
+		if _, err := AppendImgOffer(nil, x); !errors.Is(err, ErrValue) {
+			t.Errorf("encoded size %d: %v", size, err)
+		}
+		raw, _ := AppendImgOffer(nil, o)
+		binary.BigEndian.PutUint64(raw, size)
+		if _, err := DecodeImgOffer(raw); !errors.Is(err, ErrValue) {
+			t.Errorf("decoded size %d: %v", size, err)
+		}
+	}
 	try(func(x *ImgOffer) { x.Format = 0 }, ErrValue)
 	try(func(x *ImgOffer) { x.Format = 5 }, ErrValue)
 	try(func(x *ImgOffer) { x.Caption = []byte{0xff} }, ErrUTF8)

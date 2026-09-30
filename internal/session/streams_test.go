@@ -9,6 +9,7 @@ import (
 	"runtime"
 	"slices"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -17,73 +18,79 @@ import (
 	"github.com/guy5116/burrow/internal/wire"
 )
 
-// transferOut sends size random bytes on a new stream and waits for IMG_RESULT ok.
-// Frames for the sender arrive on the sender's Inbound; the receiver side is
-// driven by transferIn. Both run concurrently in tests.
-func transferOut(t *testing.T, s *Session, size int, inbound <-chan Inbound) {
-	t.Helper()
+// transferOut offers size random bytes on a new stream, sends them once the
+// peer accepts, and checks the RESULT. When pause is not nil it stops half
+// way until pause closes, so that the transfer is in flight meanwhile. It
+// runs on its own goroutine: failures are reported with t.Error.
+func transferOut(t *testing.T, s *Session, size int, inbound <-chan Inbound, pause <-chan struct{}) {
 	ctx := context.Background()
 	data := make([]byte, size)
 	_, _ = rand.Read(data)
 	id, err := s.OpenStream(uint64(size))
 	if err != nil {
-		t.Fatal(err)
+		t.Error(err)
+		return
 	}
 	offer := wire.ImgOffer{Size: uint64(size), Format: wire.FormatPNG, Width: 1, Height: 1, Hash: blake2b.Sum256(data)}
 	op, _ := wire.AppendImgOffer(nil, offer)
 	if err := s.SendStream(ctx, id, wire.TypeImgOffer, op); err != nil {
-		t.Fatal(err)
+		t.Error(err)
+		return
 	}
-	in := <-inbound
-	if in.Type != wire.TypeImgAccept || in.Stream != id {
-		t.Fatalf("expected accept, got %#x on %d", in.Type, in.Stream)
+	if in := <-inbound; in.Type != wire.TypeImgAccept || in.Stream != id {
+		t.Errorf("expected accept, got %#x on %d", in.Type, in.Stream)
+		return
 	}
-	for i := 0; i*wire.ChunkData < size; i++ {
+	chunks := (size + wire.ChunkData - 1) / wire.ChunkData
+	for i := 0; i < chunks; i++ {
+		if i == chunks/2 && pause != nil {
+			<-pause
+		}
 		end := min((i+1)*wire.ChunkData, size)
 		cp, _ := wire.AppendImgChunk(nil, wire.ImgChunk{Index: uint32(i), Data: data[i*wire.ChunkData : end]})
 		if err := s.SendStream(ctx, id, wire.TypeImgChunk, cp); err != nil {
-			t.Fatal(err)
+			t.Error(err)
+			return
 		}
 	}
 	if err := s.SendStream(ctx, id, wire.TypeImgDone, nil); err != nil {
-		t.Fatal(err)
+		t.Error(err)
+		return
 	}
-	in = <-inbound
-	if in.Type != wire.TypeImgResult || in.Stream != id {
-		t.Fatalf("expected result, got %#x", in.Type)
-	}
-	if r, _ := wire.DecodeImgResult(in.Payload); r != wire.ResultOK {
-		t.Fatalf("result %d", r)
+	in := <-inbound
+	if r, _ := wire.DecodeImgResult(in.Payload); in.Type != wire.TypeImgResult || in.Stream != id || r != wire.ResultOK {
+		t.Errorf("expected RESULT ok, got %#x %d", in.Type, r)
 	}
 	if s.StreamOpen(id) {
-		t.Fatal("stream still open after RESULT")
+		t.Error("stream still open after RESULT")
 	}
 }
 
-// transferIn accepts one offer, receives chunks, verifies the hash and answers RESULT ok.
+// transferIn accepts one offer, receives chunks, verifies the hash and
+// answers RESULT. It runs on its own goroutine: failures are reported with
+// t.Error.
 func transferIn(t *testing.T, s *Session, inbound <-chan Inbound) {
-	t.Helper()
 	ctx := context.Background()
 	in := <-inbound
 	if in.Type != wire.TypeImgOffer {
-		t.Fatalf("expected offer, got %#x", in.Type)
+		t.Errorf("expected offer, got %#x", in.Type)
+		return
 	}
 	o, _ := wire.DecodeImgOffer(in.Payload)
 	id := in.Stream
 	if err := s.SendStream(ctx, id, wire.TypeImgAccept, wire.AppendImgAccept(nil, 0)); err != nil {
-		t.Fatal(err)
+		t.Error(err)
+		return
 	}
 	h, _ := blake2b.New256(nil)
 	for {
 		in = <-inbound
-		if in.Stream != id {
-			t.Fatalf("frame on stream %d", in.Stream)
+		if in.Stream != id || (in.Type != wire.TypeImgChunk && in.Type != wire.TypeImgDone) {
+			t.Errorf("got %#x on stream %d", in.Type, in.Stream)
+			return
 		}
 		if in.Type == wire.TypeImgDone {
 			break
-		}
-		if in.Type != wire.TypeImgChunk {
-			t.Fatalf("got %#x", in.Type)
 		}
 		c, _ := wire.DecodeImgChunk(in.Payload)
 		h.Write(c.Data)
@@ -91,12 +98,10 @@ func transferIn(t *testing.T, s *Session, inbound <-chan Inbound) {
 	status := uint8(wire.ResultOK)
 	if !bytes.Equal(h.Sum(nil), o.Hash[:]) {
 		status = wire.ResultHashMismatch
+		t.Error("hash mismatch")
 	}
 	if err := s.SendStream(ctx, id, wire.TypeImgResult, wire.AppendImgResult(nil, status)); err != nil {
-		t.Fatal(err)
-	}
-	if status != wire.ResultOK {
-		t.Fatal("hash mismatch")
+		t.Error(err)
 	}
 }
 
@@ -122,10 +127,11 @@ func splitInbound(s *Session, out map[uint16]chan Inbound, chat chan Inbound, st
 	}
 }
 
-// Transfers in both directions with three rekey epochs while chunks are in flight.
+// Transfers in both directions stay in flight through four rekey epochs, one of
+// them asked for by the responder.
 func TestTransfersBothWaysUnderRekey(t *testing.T) {
 	p := newPair(t, time.Hour)
-	const size = 3*wire.ChunkData + 12345
+	const size = 8*wire.ChunkData + 12345
 	// Initiator sends on stream 2, responder on stream 3.
 	iIn := map[uint16]chan Inbound{2: make(chan Inbound, 64), 3: make(chan Inbound, 64)}
 	rIn := map[uint16]chan Inbound{2: make(chan Inbound, 64), 3: make(chan Inbound, 64)}
@@ -134,18 +140,31 @@ func TestTransfersBothWaysUnderRekey(t *testing.T) {
 	go splitInbound(p.i, iIn, iChat, stop)
 	go splitInbound(p.r, rIn, rChat, stop)
 	defer close(stop)
+	// Both senders stop half way until every epoch has turned over, so that
+	// both transfers are in flight through all of them.
+	pause := make(chan struct{})
+	var finished atomic.Int32
 	done := make(chan struct{}, 4)
-	go func() { transferOut(t, p.i, size, iIn[2]); done <- struct{}{} }()
-	go func() { transferIn(t, p.r, rIn[2]); done <- struct{}{} }()
-	go func() { transferOut(t, p.r, size, rIn[3]); done <- struct{}{} }()
-	go func() { transferIn(t, p.i, iIn[3]); done <- struct{}{} }()
-	for epoch := uint32(1); epoch <= 3; epoch++ {
-		time.Sleep(3 * time.Millisecond)
-		_ = p.i.Rekey()
+	run := func(f func()) {
+		go func() { f(); finished.Add(1); done <- struct{}{} }()
+	}
+	run(func() { transferOut(t, p.i, size, iIn[2], pause) })
+	run(func() { transferIn(t, p.r, rIn[2]) })
+	run(func() { transferOut(t, p.r, size, rIn[3], pause) })
+	run(func() { transferIn(t, p.i, iIn[3]) })
+	for epoch := uint32(1); epoch <= 4; epoch++ {
+		if epoch%2 == 0 {
+			_ = p.r.Rekey() // the responder asks: REKEY_REQUEST
+		} else {
+			_ = p.i.Rekey()
+		}
 		waitEpoch(t, p.i, epoch, epoch)
 		waitEpoch(t, p.r, epoch, epoch)
+		if n := finished.Load(); n != 0 {
+			t.Fatalf("%d transfer halves finished before epoch %d: the rekeys did not overlap them", n, epoch)
+		}
 	}
-	// Chat is not starved by the transfer.
+	// Chat is not starved by the transfers.
 	sendText(t, p.i, 7, "mid-transfer")
 	select {
 	case in := <-rChat:
@@ -155,6 +174,7 @@ func TestTransfersBothWaysUnderRekey(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("chat starved")
 	}
+	close(pause)
 	for i := 0; i < 4; i++ {
 		select {
 		case <-done:
@@ -856,5 +876,92 @@ func TestOffersArriveInIDOrder(t *testing.T) {
 			}
 			frameOn(t, p.i, id)
 		}
+	}
+}
+
+// A CANCEL for a stream never reaches the peer before the stream's offer,
+// however the writer's turns fall: the peer would close the session.
+func TestCancelNeverOvertakesItsOffer(t *testing.T) {
+	a := newAdv(t, true, true)
+	ctx := context.Background()
+	const chunks = 4000
+	busy, err := a.s.Offer(wire.TypeImgOffer, chunks*wire.ChunkData, offerPayload(chunks*wire.ChunkData))
+	if err != nil {
+		t.Fatal(err)
+	}
+	a.recv(t, wire.TypeImgOffer)
+	if err := a.p.SendFrame(wire.TypeImgAccept, busy, wire.AppendImgAccept(nil, 0)); err != nil {
+		t.Fatal(err)
+	}
+	a.recvType(t, wire.TypeImgAccept)
+	var mu sync.Mutex
+	first := map[uint16]wire.FrameType{} // the first frame the peer saw on each stream
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() { // the peer: notes first frames and answers every CANCEL
+		defer wg.Done()
+		for {
+			in, err := a.p.Recv(3 * time.Second)
+			if err != nil {
+				return
+			}
+			mu.Lock()
+			if _, seen := first[in.Stream]; !seen && in.Stream != busy {
+				first[in.Stream] = in.Type
+			}
+			mu.Unlock()
+			if in.Type == wire.TypeImgCancel {
+				_ = a.p.SendFrame(wire.TypeImgCancel, in.Stream, wire.AppendImgCancel(nil, wire.CancelUser))
+			}
+		}
+	}()
+	stop := make(chan struct{})
+	go func() { // chunks keep the writer busy on another stream
+		defer wg.Done()
+		data := make([]byte, wire.ChunkData)
+		for i := 0; i < chunks; i++ {
+			cp, _ := wire.AppendImgChunk(nil, wire.ImgChunk{Index: uint32(i), Data: data})
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			if a.s.SendStream(ctx, busy, wire.TypeImgChunk, cp) != nil {
+				return
+			}
+		}
+	}()
+	for pairs := 0; pairs < 1500 && a.s.Err() == nil; pairs++ {
+		// Holding the table lock a moment lets the writer stop between its
+		// turns, where the offer used to be passed over.
+		a.s.streams.mu.Lock()
+		time.Sleep(20 * time.Microsecond)
+		a.s.streams.mu.Unlock()
+		id, err := a.s.Offer(wire.TypeImgOffer, 10, offerPayload(10))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := a.s.SendStream(ctx, id, wire.TypeImgCancel, wire.AppendImgCancel(nil, wire.CancelUser)); err != nil {
+			t.Fatal(err)
+		}
+		for deadline := time.Now().Add(3 * time.Second); a.s.StreamOpen(id); time.Sleep(10 * time.Microsecond) {
+			if time.Now().After(deadline) {
+				t.Fatalf("stream %d still draining", id)
+			}
+		}
+	}
+	close(stop)
+	a.s.Drop()
+	_ = a.p.Conn.Close()
+	wg.Wait()
+	mu.Lock()
+	defer mu.Unlock()
+	for id, typ := range first {
+		if typ != wire.TypeImgOffer {
+			t.Fatalf("stream %d: the peer saw %#x before the offer", id, typ)
+		}
+	}
+	if len(first) == 0 {
+		t.Fatal("nothing was offered")
 	}
 }

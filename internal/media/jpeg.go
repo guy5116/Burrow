@@ -27,14 +27,21 @@ func isSOF(m byte) bool {
 	return m >= 0xC0 && m <= 0xCF && m != mDHT && m != 0xC8 && m != mDAC
 }
 
-// jpegKeep says whether a segment survives strip mode. APP14 is kept only in
-// the shape of the Adobe transform segment (needed for correct colours):
-// under that marker anything else could carry arbitrary bytes.
-func jpegKeep(m byte, payload []byte) bool {
-	if m == mAPP14 {
-		return len(payload) == 12 && string(payload[:5]) == "Adobe"
-	}
+// jpegKeep says whether a segment survives strip mode as it is. APP14 never
+// does: see adobeSegment.
+func jpegKeep(m byte) bool {
 	return isSOF(m) || m == mDQT || m == mDHT || m == mDAC || m == mDRI || m == mSOS
+}
+
+// adobeSegment rewrites an Adobe APP14 segment to its canonical form, keeping
+// only the colour transform byte that decoders need for correct colours.
+// Version and flags, and anything else under that marker, are dropped. It
+// returns nil for a segment that is not an Adobe one.
+func adobeSegment(payload []byte) []byte {
+	if len(payload) < 12 || string(payload[:5]) != "Adobe" || payload[11] > 2 {
+		return nil
+	}
+	return []byte{0xFF, mAPP14, 0, 14, 'A', 'd', 'o', 'b', 'e', 0, 100, 0, 0, 0, 0, payload[11]}
 }
 
 // stripJPEG streams r to w keeping only structural segments. It returns the
@@ -50,7 +57,8 @@ func stripJPEG(w io.Writer, r io.Reader) (orientation int, err error) {
 		return 0, err
 	}
 	jfifDone := false
-	afterScan := false // copyScan already consumed the 0xFF of the next marker
+	afterScan := false            // copyScan already consumed the 0xFF of the next marker
+	buf := make([]byte, 0xFFFF-2) // every segment fits: its length field is 16 bits
 	for {
 		// Next marker: skip fill bytes.
 		m := byte(0xFF)
@@ -85,7 +93,7 @@ func stripJPEG(w io.Writer, r io.Reader) (orientation int, err error) {
 		if n < 2 {
 			return 0, ErrCorrupt
 		}
-		payload := make([]byte, n-2)
+		payload := buf[:n-2]
 		if _, err := io.ReadFull(br, payload); err != nil {
 			return 0, ErrCorrupt
 		}
@@ -101,7 +109,13 @@ func stripJPEG(w io.Writer, r io.Reader) (orientation int, err error) {
 			if len(payload) >= 6 && string(payload[:6]) == "Exif\x00\x00" && orientation == 0 {
 				orientation = exifOrientation(payload[6:])
 			}
-		case jpegKeep(m, payload):
+		case m == mAPP14:
+			if seg := adobeSegment(payload); seg != nil {
+				if _, err := bw.Write(seg); err != nil {
+					return 0, err
+				}
+			}
+		case jpegKeep(m):
 			if _, err := bw.Write([]byte{0xFF, m, lb[0], lb[1]}); err != nil {
 				return 0, err
 			}

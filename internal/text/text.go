@@ -108,8 +108,26 @@ var fold = cases.Fold()
 
 // Normalize maps a display name to its collision-check form: NFKC → case fold →
 // drop Cf ∪ Other_Default_Ignorable_Code_Point ∪ Variation_Selector → collapse
-// whitespace runs to one space → trim. Compare results byte-equal.
+// whitespace runs to one space → trim, repeated until nothing changes.
+// Compare results byte-equal.
+//
+// One pass is not enough: an invisible character between a letter and a
+// combining mark keeps NFKC from composing them, and removing it afterwards
+// leaves "e" + U+0301 where "é" was meant. Two names that look the same must
+// normalize the same, and Normalize(Normalize(x)) must equal Normalize(x).
 func Normalize(name string) string {
+	s := name
+	for range 4 { // the second pass settles every input seen; the bound keeps it cheap
+		next := normalizeOnce(s)
+		if next == s {
+			break
+		}
+		s = next
+	}
+	return s
+}
+
+func normalizeOnce(name string) string {
 	s := fold.String(norm.NFKC.String(name))
 	var sb strings.Builder
 	sb.Grow(len(s))

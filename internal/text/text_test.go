@@ -176,7 +176,7 @@ func FuzzSanitize(f *testing.F) {
 }
 
 func FuzzNormalize(f *testing.F) {
-	for _, s := range []string{"Alice", "ＡＬＩＣＥ", "Straße", "a\u00ADb", " x  y "} {
+	for _, s := range []string{"Alice", "ＡＬＩＣＥ", "Straße", "a\u00ADb", " x  y ", "Rene\u00AD\u0301"} {
 		f.Add(s)
 	}
 	f.Fuzz(func(t *testing.T, s string) {
@@ -192,5 +192,22 @@ func FuzzNormalize(f *testing.F) {
 				t.Fatalf("rune %U survived", r)
 			}
 		}
+		if again := Normalize(out); again != out {
+			t.Fatalf("not idempotent: %q → %q → %q", s, out, again)
+		}
 	})
+}
+
+// A name that looks like another must collide with it, whatever invisible
+// characters it hides.
+func TestNormalizeSeesThroughInvisibles(t *testing.T) {
+	for _, hidden := range []string{"Rene\u00AD\u0301", "Rene\u034F\u0301", "Rene\u206A\u0301", "Rene\uFFF9\u0301"} {
+		clean, err := Sanitize([]byte(hidden), Name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got, want := Normalize(clean), Normalize("René"); got != want {
+			t.Errorf("%q normalizes to %q, René to %q", hidden, got, want)
+		}
+	}
 }

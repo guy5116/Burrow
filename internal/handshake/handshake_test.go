@@ -8,6 +8,7 @@ import (
 	"errors"
 	"io"
 	"net"
+	"strconv"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -156,7 +157,7 @@ func TestReplayedMsg1(t *testing.T) {
 	if _, err := ci.Write(msg1); err != nil {
 		t.Fatal(err)
 	}
-	if err := <-done; !errors.Is(err, ErrReplay) {
+	if err := <-done; !errors.Is(err, ErrReplay) { // not ErrReplayRace: refused before any DH
 		t.Fatal(err)
 	}
 	if rc2.written.Load() != 0 {
@@ -366,6 +367,22 @@ func TestReplayLRU(t *testing.T) {
 	}
 	if len(l.set) != wire.Msg1ReplayLRU {
 		t.Fatal(len(l.set))
+	}
+}
+
+// A running ban survives any number of other keys failing.
+func TestLimiterKeepsBans(t *testing.T) {
+	l := NewFailureLimiter(1, time.Minute, time.Hour)
+	now := time.Unix(1000, 0)
+	l.Fail("victim-of-its-own-attack", now)
+	for i := 0; i < 3*maxLimiterKeys; i++ {
+		l.Fail(strconv.Itoa(i), now)
+	}
+	if !l.Limited("victim-of-its-own-attack", now) {
+		t.Fatal("a ban was flushed by other keys")
+	}
+	if len(l.entries) > maxLimiterKeys {
+		t.Fatal(len(l.entries))
 	}
 }
 

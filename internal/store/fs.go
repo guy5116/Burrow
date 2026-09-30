@@ -91,24 +91,16 @@ func syncDir(dir string) error {
 	return err
 }
 
-// syncTree fsyncs every file and directory under root.
+// syncTree fsyncs every directory under root, so that the names of the
+// files in it are durable. The files themselves were synced when
+// writeFileAtomic wrote them. (Syncing a file needs write access on Windows,
+// where FlushFileBuffers fails on a read-only handle.)
 func syncTree(root string) error {
 	return filepath.WalkDir(root, func(p string, d os.DirEntry, err error) error {
-		if err != nil {
+		if err != nil || !d.IsDir() {
 			return err
 		}
-		if d.IsDir() {
-			return syncDir(p)
-		}
-		f, err := os.Open(p) // #nosec G122 -- our own 0700 store directory
-		if err != nil {
-			return err
-		}
-		err = f.Sync()
-		if cerr := f.Close(); err == nil {
-			err = cerr
-		}
-		return err
+		return syncDir(p)
 	})
 }
 

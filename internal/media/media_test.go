@@ -518,5 +518,12 @@ func FuzzGIFPrescan(f *testing.F) {
 			t.Fatal("negative")
 		}
 		_, _ = Probe(data) // must never panic
+		// The limits hold only if the decoder makes exactly the frames the
+		// pre-scan counted. (A small area keeps the decode cheap.)
+		if err == nil && area <= 1<<16 {
+			if g, derr := gif.DecodeAll(bytes.NewReader(data)); derr == nil && len(g.Image) != frames {
+				t.Fatalf("pre-scan counted %d frames, the decoder made %d", frames, len(g.Image))
+			}
+		}
 	})
 }

@@ -93,6 +93,9 @@ func (f *FailureLimiter) Fail(key string, now time.Time) {
 		if len(f.entries) >= maxLimiterKeys {
 			f.evict(now)
 		}
+		if len(f.entries) >= maxLimiterKeys {
+			return // full of running bans: they stay, this failure goes uncounted
+		}
 		e = &limitEntry{}
 		f.entries[key] = e
 	}
@@ -111,17 +114,21 @@ func (f *FailureLimiter) Fail(key string, now time.Time) {
 	}
 }
 
-// evict drops the stalest entries so the map stays bounded.
+// evict makes room in the map: first entries with no recent failure, then
+// any other entry that is not banned. A running ban is never dropped, or
+// anyone who can fail from many prefixes could lift the bans of others.
 func (f *FailureLimiter) evict(now time.Time) {
 	for k, e := range f.entries {
 		if now.Sub(e.touched) > f.window && now.After(e.banned) {
 			delete(f.entries, k)
 		}
 	}
-	for k := range f.entries { // still full: drop arbitrary entries
+	for k, e := range f.entries {
 		if len(f.entries) < maxLimiterKeys/2 {
 			break
 		}
-		delete(f.entries, k)
+		if now.After(e.banned) {
+			delete(f.entries, k)
+		}
 	}
 }

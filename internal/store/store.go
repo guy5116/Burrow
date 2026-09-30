@@ -5,6 +5,8 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
+	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"runtime/debug"
@@ -44,6 +46,12 @@ var (
 	// ErrClosed is returned by every operation on a store that was closed, or
 	// that closed itself because a passphrase change left it unusable.
 	ErrClosed = errors.New("store: closed")
+	// ErrChangeCompletesAtRestart and ErrChangeFailedAtRestart report a
+	// passphrase change that failed half way and could not be undone. The
+	// store has closed itself; the next start finishes the job, and the
+	// error says which passphrase applies from then on.
+	ErrChangeCompletesAtRestart = errors.New("store: the passphrase change was interrupted; start Burrow again and use the NEW passphrase")
+	ErrChangeFailedAtRestart    = errors.New("store: the passphrase change failed; start Burrow again and use the OLD passphrase")
 )
 
 // Store is an unlocked store. One process holds it at a time: the lock is
@@ -169,7 +177,7 @@ func initLocked(dataDir string, passphrase []byte, opts Options) (*Store, error)
 		return nil, err
 	}
 	defer onionSeed.Clear()
-	idBlob := encodeIdentity(id, onionSeed.Bytes())
+	idBlob := encodeIdentity(id.Scalar(), onionSeed.Bytes())
 	defer secret.Wipe(idBlob)
 
 	tmp := filepath.Join(dataDir, initDir)
@@ -181,7 +189,9 @@ func initLocked(dataDir string, passphrase []byte, opts Options) (*Store, error)
 	}
 	dir := filepath.Join(dataDir, StoreDir)
 	if err = rename(tmp, dir); err == nil {
-		err = syncDir(dataDir)
+		if err = syncDataDir(dataDir); err != nil {
+			_ = os.RemoveAll(dir) // not durable: a failed init leaves no store behind
+		}
 	}
 	if err != nil {
 		master.Clear()
@@ -191,8 +201,13 @@ func initLocked(dataDir string, passphrase []byte, opts Options) (*Store, error)
 	return &Store{dir: dir, hdr: hdr, master: master}, nil
 }
 
-// rename is os.Rename; tests replace it to make a step of the swap fail.
-var rename = os.Rename
+// rename, syncDataDir and removeAll are os.Rename, syncDir and os.RemoveAll;
+// tests replace them to make a step of the swap fail.
+var (
+	rename      = os.Rename
+	syncDataDir = syncDir
+	removeAll   = os.RemoveAll
+)
 
 // buildStore writes a complete store directory at dir: header, master.key for
 // ModeNone and every blob; then fsyncs the tree. Returns the master key.
@@ -378,7 +393,12 @@ func (s *Store) readBlob(relpath string) ([]byte, error) {
 	if !validRelPath(relpath) {
 		return nil, ErrRelPath
 	}
-	b, err := os.ReadFile(filepath.Join(s.dir, filepath.FromSlash(relpath))) // #nosec G304 -- relpath is validated
+	f, err := os.Open(filepath.Join(s.dir, filepath.FromSlash(relpath))) // #nosec G304 -- relpath is validated
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = f.Close() }()
+	b, err := io.ReadAll(io.LimitReader(f, MaxBlobLen+1)) // one byte more is enough for openBlob to refuse it
 	if err != nil {
 		return nil, err
 	}
@@ -406,7 +426,11 @@ func (s *Store) DeleteBlob(relpath string) error {
 		return ErrRelPath
 	}
 	p := filepath.Join(s.dir, filepath.FromSlash(relpath))
-	if err := os.Remove(p); err != nil && !errors.Is(err, os.ErrNotExist) {
+	err := os.Remove(p)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil // nothing to delete, perhaps not even its directory
+	}
+	if err != nil {
 		return err
 	}
 	return syncDir(filepath.Dir(p))
@@ -453,8 +477,12 @@ const (
 	onionSeedLen   = 32
 )
 
-func encodeIdentity(id *identity.Identity, onionSeed []byte) []byte {
-	b := append([]byte{identityBlobV2}, id.Scalar()...)
+// encodeIdentity allocates the blob once: a slice that grew would leave a
+// copy of the key behind in memory that nobody wipes.
+func encodeIdentity(scalar, onionSeed []byte) []byte {
+	b := make([]byte, 0, 1+len(scalar)+len(onionSeed))
+	b = append(b, identityBlobV2)
+	b = append(b, scalar...)
 	return append(b, onionSeed...)
 }
 
@@ -489,8 +517,7 @@ func (s *Store) LoadOnionKey() (ed25519.PrivateKey, error) {
 			return nil, err
 		}
 		defer seed.Clear()
-		nb := append([]byte{identityBlobV2}, b[1:33]...)
-		nb = append(nb, seed.Bytes()...)
+		nb := encodeIdentity(b[1:33], seed.Bytes())
 		defer secret.Wipe(nb)
 		if err := s.WriteBlob(IdentityKey, nb); err != nil {
 			return nil, err
@@ -521,7 +548,13 @@ func (s *Store) ChangePassphrase(newPassphrase []byte, opts Options) error {
 	}
 	dataDir := filepath.Dir(s.dir)
 	nd, od := filepath.Join(dataDir, newDir), filepath.Join(dataDir, oldDir)
-	_ = os.RemoveAll(nd)
+	// Leftovers of an earlier change in this process (see ErrOldStoreRemains)
+	// would stand in the way of the renames below.
+	for _, d := range []string{nd, od} {
+		if err := os.RemoveAll(d); err != nil {
+			return err
+		}
+	}
 
 	blobs := map[string][]byte{}
 	defer func() {
@@ -571,33 +604,29 @@ func (s *Store) ChangePassphrase(newPassphrase []byte, opts Options) error {
 	if err := crash(1, master); err != nil { // store.new complete, nothing renamed yet
 		return err
 	}
-	if err = rename(s.dir, od); err == nil {
-		err = syncDir(dataDir)
-	}
-	if err != nil {
+	// Step 1: the current store steps aside.
+	if err := rename(s.dir, od); err != nil {
 		master.Clear()
-		_ = rename(od, s.dir) // if the rename itself failed there is nothing to undo
 		_ = os.RemoveAll(nd)
-		return err
+		return err // nothing has changed
+	}
+	if err := syncDataDir(dataDir); err != nil {
+		master.Clear()
+		return s.undo(od, nd, err)
 	}
 	if err := crash(2, master); err != nil { // store.old + store.new, no store
 		return err
 	}
-	if err = rename(nd, s.dir); err == nil {
-		err = syncDir(dataDir)
-	}
-	if err != nil {
+	// Step 2: the new store takes its place. Once this rename is done, the new
+	// passphrase applies whatever happens next: after a crash before the
+	// rename is durable, recovery finds store.old and store.new and rolls
+	// forward. So a failed sync of the directory changes nothing, and is not
+	// reported as a failure.
+	if err := rename(nd, s.dir); err != nil {
 		master.Clear()
-		// Back to the old store. If that fails too, this process must not
-		// write another byte: recovery at the next start sorts it out.
-		_ = rename(s.dir, nd)
-		if rename(od, s.dir) != nil {
-			s.closeLocked()
-		} else {
-			_ = os.RemoveAll(nd)
-		}
-		return err
+		return s.undo(od, nd, err)
 	}
+	_ = syncDataDir(dataDir)
 	if err := crash(3, master); err != nil { // store + store.old
 		return err
 	}
@@ -607,6 +636,23 @@ func (s *Store) ChangePassphrase(newPassphrase []byte, opts Options) error {
 		return ErrOldStoreRemains
 	}
 	return syncDir(dataDir)
+}
+
+// undo puts the old store back after a failed step of a passphrase change,
+// with store.old at od and store.new at nd. When that is not possible the
+// store closes itself and the error says which passphrase applies at the next
+// start, when recovery completes or reverses the change.
+func (s *Store) undo(od, nd string, err error) error {
+	if rename(od, s.dir) == nil {
+		_ = os.RemoveAll(nd)
+		_ = syncDataDir(filepath.Dir(s.dir))
+		return err // the old store is back and in use
+	}
+	s.closeLocked()
+	if removeAll(nd) == nil {
+		return fmt.Errorf("%w (%w)", ErrChangeFailedAtRestart, err) // only store.old is left: it is put back
+	}
+	return fmt.Errorf("%w (%w)", ErrChangeCompletesAtRestart, err) // store.old and store.new: rolled forward
 }
 
 // Recover repairs an interrupted directory swap (§7). It requires no key. It
@@ -623,26 +669,38 @@ func Recover(dataDir string) error {
 	return releaseLock(lock)
 }
 
-// recoverSwap is Recover for a caller that holds the lock.
+// recoverSwap is Recover for a caller that holds the lock. Every rename is
+// made durable before anything is deleted, so that a crash during recovery
+// never leaves less than it found.
 func recoverSwap(dataDir string) error {
 	st, nd, od := filepath.Join(dataDir, StoreDir), filepath.Join(dataDir, newDir), filepath.Join(dataDir, oldDir)
 	_ = os.RemoveAll(filepath.Join(dataDir, initDir))
 	hasStore, hasNew, hasOld := exists(st), exists(nd), exists(od)
 	if !hasStore {
+		var from string
 		switch {
 		case hasNew && hasOld:
-			// The new store was complete before the first rename: roll forward.
-			if err := rename(nd, st); err != nil {
+			from = nd // the new store was complete before the first rename: roll forward
+		case hasOld:
+			from = od
+		case hasNew:
+			// Not a state the swap produces. It may be the only copy there is:
+			// keep it if it is whole, and touch nothing otherwise.
+			if !exists(filepath.Join(nd, headerFile)) || !exists(filepath.Join(nd, IdentityKey)) {
+				return fmt.Errorf("store: %s is incomplete and there is no %s; nothing was changed", nd, st)
+			}
+			from = nd
+		}
+		if from != "" {
+			if err := rename(from, st); err != nil {
 				return err
 			}
-		case hasOld:
-			if err := rename(od, st); err != nil {
+			if err := syncDataDir(dataDir); err != nil {
 				return err
 			}
 		}
 	}
 	// With store/ in place (or nothing to save), any leftover is stale.
-	// store.new alone is incomplete by construction.
 	if err := os.RemoveAll(nd); err != nil {
 		return err
 	}
@@ -650,7 +708,7 @@ func recoverSwap(dataDir string) error {
 		return err
 	}
 	if hasNew || hasOld {
-		return syncDir(dataDir)
+		return syncDataDir(dataDir)
 	}
 	return nil
 }

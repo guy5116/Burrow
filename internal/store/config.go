@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/BurntSushi/toml"
 )
@@ -48,18 +49,21 @@ const ConfigFile = "config.toml"
 // file yields the defaults.
 func LoadConfig(configDir string) (Config, error) {
 	c := DefaultConfig()
-	b, err := os.ReadFile(filepath.Join(configDir, ConfigFile))
+	path := filepath.Join(configDir, ConfigFile)
+	b, err := os.ReadFile(path) // #nosec G304 -- the user's own configuration
 	if errors.Is(err, os.ErrNotExist) {
 		return c, nil
 	}
 	if err != nil {
 		return c, err
 	}
-	if _, err := toml.Decode(string(b), &c); err != nil {
-		return DefaultConfig(), err
+	if _, err = toml.Decode(string(b), &c); err == nil {
+		err = c.validate()
 	}
-	if err := c.validate(); err != nil {
-		return DefaultConfig(), fmt.Errorf("%s: %w", ConfigFile, err)
+	if err != nil {
+		// Every command reads the configuration first, `burrow config set`
+		// included, so the message must say how to get out of it.
+		return DefaultConfig(), fmt.Errorf("%s: %w (correct or delete this file)", path, err)
 	}
 	return c, nil
 }
@@ -138,6 +142,9 @@ func (c *Config) Get(key string) (string, error) {
 
 // Set assigns a key from a string ("burrow config set").
 func (c *Config) Set(key, value string) error {
+	if !utf8.ValidString(value) {
+		return fmt.Errorf("store: %s must be text (valid UTF-8)", key)
+	}
 	parseBool := func(dst *bool) error {
 		v, err := strconv.ParseBool(value)
 		if err != nil {

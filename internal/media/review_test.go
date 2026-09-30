@@ -7,6 +7,7 @@ import (
 	"errors"
 	"image"
 	"image/color"
+	"image/gif"
 	"os"
 	"runtime"
 	"testing"
@@ -74,14 +75,21 @@ func TestKeptBlocksHaveOneShape(t *testing.T) {
 	at := bytes.IndexByte(gifData[13+6:], 0x2C) + 13 + 6
 	in := append(append(append([]byte(nil), gifData[:at]...), fake...), gifData[at:]...)
 	var out bytes.Buffer
-	if err := stripGIF(&out, bytes.NewReader(in)); err != nil {
-		t.Fatal(err)
+	if err := stripGIF(&out, bytes.NewReader(in)); !errors.Is(err, ErrCorrupt) || bytes.Contains(out.Bytes(), []byte("HIDDEN")) {
+		t.Fatal("a graphic control block of the wrong shape was not refused", err) // image/gif refuses it too
 	}
-	if bytes.Contains(out.Bytes(), []byte("HIDDEN")) {
-		t.Fatal("a note survived under the graphic control label")
-	}
-	if pngKeep("gAMA", 4) != true || pngKeep("gAMA", 40) || pngKeep("sRGB", 2) || !pngKeep("sRGB", 1) || pngKeep("tEXt", 4) {
-		t.Fatal("pngKeep")
+	for _, c := range []struct {
+		typ  string
+		n    uint32
+		keep bool
+	}{
+		{"gAMA", 4, true}, {"gAMA", 40, false}, {"sRGB", 1, true}, {"sRGB", 2, false}, {"tEXt", 4, false},
+		{"IEND", 0, true}, {"IEND", 27, false}, {"PLTE", 6, true}, {"PLTE", 7, false}, {"PLTE", 0, false},
+		{"PLTE", 771, false}, {"tRNS", 256, true}, {"tRNS", 257, false},
+	} {
+		if pngKeep(c.typ, c.n) != c.keep {
+			t.Errorf("pngKeep(%s, %d)", c.typ, c.n)
+		}
 	}
 	if !gifKeepExtension(0xF9, []byte{4, 0, 0, 0, 0, 0}) || gifKeepExtension(0xFE, []byte{0}) ||
 		!gifKeepExtension(0xFF, append(append([]byte{11}, "NETSCAPE2.0"...), 3, 1, 0, 0, 0)) ||
@@ -162,5 +170,150 @@ func TestPrepareStopsOnCancel(t *testing.T) {
 	<-decodeSem
 	if !errors.Is(err, context.Canceled) {
 		t.Fatal(err)
+	}
+}
+
+// A progressive JPEG costs image/jpeg a coefficient block per 8×8 block of
+// every component on top of the image, and a pass over the image per scan:
+// the gate counts both.
+func TestProgressiveJPEGBudget(t *testing.T) {
+	const scan = "\xff\xda\x00\x08\x01\x01\x00\x00\x3f\x00" + "\x12\xff\x00\x34\xff\xd0\x56" // header, then data with stuffing and a restart
+	jpeg := func(marker byte, w, h int, sampling []byte, scans int) []byte {
+		b := []byte{0xFF, 0xD8, 0xFF, 0xE0, 0, 4, 'x', 'x', 0xFF, marker, 0, byte(8 + 3*len(sampling)), 8, byte(h >> 8), byte(h), byte(w >> 8), byte(w), byte(len(sampling))}
+		for i, s := range sampling {
+			b = append(b, byte(i+1), s, 0)
+		}
+		for i := 0; i < scans; i++ {
+			b = append(b, scan...)
+		}
+		return append(b, 0xFF, 0xD9)
+	}
+	cmyk := []byte{0x11, 0x11, 0x11, 0x11}
+	// 6320×6320 CMYK: 160 MB for the image, 640 MB more for the scans.
+	if extra, err := jpegScanBytes(bytes.NewReader(jpeg(0xC2, 6320, 6320, cmyk, 3)), 6320, 6320); err != nil || extra != 6320*6320*16 {
+		t.Fatal(extra, err)
+	}
+	if extra, err := jpegScanBytes(bytes.NewReader(jpeg(0xC0, 6320, 6320, cmyk, 1)), 6320, 6320); err != nil || extra != 0 {
+		t.Fatal("baseline", extra, err)
+	}
+	// 4:2:0 YCbCr: luma at full resolution, chroma at a quarter.
+	if extra, err := jpegScanBytes(bytes.NewReader(jpeg(0xC2, 16, 16, []byte{0x22, 0x11, 0x11}, 1)), 16, 16); err != nil || extra != (4+1+1)*256 {
+		t.Fatal("4:2:0", extra, err)
+	}
+	if _, err := jpegScanBytes(bytes.NewReader(jpeg(0xC2, 16, 16, cmyk, maxJPEGScans)), 16, 16); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := jpegScanBytes(bytes.NewReader(jpeg(0xC2, 16, 16, cmyk, maxJPEGScans+1)), 16, 16); !errors.Is(err, ErrTooLarge) {
+		t.Fatal("too many scans", err)
+	}
+	for _, bad := range [][]byte{nil, {0xFF, 0xD8}, {0xFF, 0xD8, 0xFF, 0xDA, 0, 2}, {0xFF, 0xD8, 0xFF, 0xC2, 0, 8, 8, 0}, jpeg(0xC2, 16, 16, cmyk, 1)[:40]} {
+		if _, err := jpegScanBytes(bytes.NewReader(bad), 1, 1); !errors.Is(err, ErrCorrupt) {
+			t.Errorf("%x: %v", bad, err)
+		}
+	}
+}
+
+func TestKeepsMetadata(t *testing.T) {
+	for head, want := range map[string]bool{
+		"\x00\x00\x00\x18ftypheic": true, "\x00\x00\x00\x1cftypavif": true, "\x00\x00\x00\x14ftypqt  ": true,
+		"II*\x00\x08\x00": true, "MM\x00*\x00\x00": true, "\xff\x0a\xff": true, "\x1a\x45\xdf\xa3": true,
+		"RIFF\x00\x00\x00\x00AVI ": true, "RIFF\x00\x00\x00\x00WEBP": false, "PK\x03\x04": false, "%PDF-1.7": false, "": false,
+	} {
+		if got := KeepsMetadata([]byte(head)) != ""; got != want {
+			t.Errorf("%q: %v", head, got)
+		}
+	}
+}
+
+// Sent as a file, an image is stripped whatever its extension says.
+func TestPrepareByContent(t *testing.T) {
+	path := writeTemp(t, "scan.jfif", dirtyPNG(t, testImage(4, 4), 1))
+	if _, err := Prepare(context.Background(), path, ModeStrip, 0); !errors.Is(err, ErrMismatch) {
+		t.Fatal(err)
+	}
+	p, err := PrepareByContent(context.Background(), path, ModeStrip, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out bytes.Buffer
+	if err := Stream(context.Background(), p, func(_ uint32, c []byte) error { out.Write(c); return nil }); err != nil {
+		t.Fatal(err)
+	}
+	assertNoSecrets(t, out.Bytes())
+}
+
+// GIF extensions are walked exactly as image/gif walks them, so the frames
+// the pre-scan counts are the frames the decoder makes.
+func TestGIFExtensionsAsTheDecoderReadsThem(t *testing.T) {
+	two := dirtyGIF(t, []*image.Paletted{palettedFrame(2, 2, color.RGBA{1, 2, 3, 255}), palettedFrame(2, 2, color.RGBA{4, 5, 6, 255})})
+	at := bytes.IndexByte(two[13+6:], 0x2C) + 13 + 6
+	with := func(ext []byte) []byte {
+		return append(append(append([]byte(nil), two[:at]...), ext...), two[at:]...)
+	}
+	for name, ext := range map[string][]byte{
+		// image/gif reads 13 fixed bytes: a first byte other than 12 would
+		// make the two walkers part ways.
+		"plain text of another length":      {0x21, 0x01, 0x00, 0x3B, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 0},
+		"unknown label":                     {0x21, 0x02, 0x01, 0x00, 0x00},
+		"empty application identifier":      {0x21, 0xFF, 0x00, 0x01, 0x00, 0x00},
+		"graphic control of another length": {0x21, 0xF9, 0x05, 0, 0, 0, 0, 0, 0},
+	} {
+		if _, _, err := gifPrescan(bytes.NewReader(with(ext))); !errors.Is(err, ErrCorrupt) {
+			t.Errorf("%s: %v", name, err)
+		}
+	}
+	plain := append([]byte{0x21, 0x01, 12}, make([]byte, 12)...)
+	plain = append(plain, 3, 'a', 'b', 'c', 0)
+	frames, _, err := gifPrescan(bytes.NewReader(with(plain)))
+	g, derr := gif.DecodeAll(bytes.NewReader(with(plain)))
+	if err != nil || derr != nil || frames != len(g.Image) {
+		t.Fatal(frames, err, derr)
+	}
+}
+
+// Kept WebP chunks carry nothing beyond what the format defines: the VP8X
+// reserved bits and bytes and the pad byte of an odd chunk are zero.
+func TestWebPKeptChunksAreClean(t *testing.T) {
+	vp8x := []byte{0xFF, 0xAA, 0xBB, 0xCC, 1, 0, 0, 1, 0, 0} // every flag and reserved bit set
+	vp8x[0] &^= vp8xAnim
+	alph := []byte("odd") // an odd length: one pad byte follows
+	body := riffChunk("VP8X", vp8x)
+	chunk := riffChunk("ALPH", alph)
+	chunk[len(chunk)-1] = 0x5A // a pad byte that says something
+	body = append(body, chunk...)
+	body = append(body, riffChunk("VP8L", vp8l(2, 2, color.NRGBA{9, 9, 9, 255}))...)
+	file := append([]byte("RIFF\x00\x00\x00\x00WEBP"), body...)
+	binary.LittleEndian.PutUint32(file[4:], uint32(4+len(body)))
+	var out bytes.Buffer
+	if _, err := stripWebP(&out, bytes.NewReader(file)); err != nil {
+		t.Fatal(err)
+	}
+	o := out.Bytes()
+	x := o[12+8 : 12+8+vp8xLen]
+	if x[0] != vp8xAlpha || x[1]|x[2]|x[3] != 0 {
+		t.Fatalf("VP8X %x", x)
+	}
+	a := bytes.Index(o, []byte("ALPH"))
+	if o[a+8+3] != 0 {
+		t.Fatal("pad byte copied")
+	}
+	short := riffChunk("VP8X", vp8x[:8])
+	bad := append([]byte("RIFF\x00\x00\x00\x00WEBP"), short...)
+	binary.LittleEndian.PutUint32(bad[4:], uint32(4+len(short)))
+	if _, err := stripWebP(&out, bytes.NewReader(bad)); !errors.Is(err, ErrCorrupt) {
+		t.Fatal(err)
+	}
+}
+
+// Only the colour transform of an Adobe segment is kept, in a fixed form.
+func TestAdobeSegmentIsCanonical(t *testing.T) {
+	long := append([]byte("Adobe\x00\x65\x80\x00\x00\x00\x02"), []byte("made with SecretCam 3.1")...)
+	if got := adobeSegment(long); !bytes.Equal(got, []byte("\xff\xee\x00\x0eAdobe\x00\x64\x00\x00\x00\x00\x02")) {
+		t.Fatalf("%q", got)
+	}
+	for _, bad := range [][]byte{[]byte("Adobe"), []byte("Adobx\x00\x64\x00\x00\x00\x00\x01"), []byte("Adobe\x00\x64\x00\x00\x00\x00\x07")} {
+		if adobeSegment(bad) != nil {
+			t.Errorf("%q kept", bad)
+		}
 	}
 }
