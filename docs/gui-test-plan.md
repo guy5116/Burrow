@@ -20,12 +20,21 @@ same LAN or loopback with a different data directory.
 6. On the other instance: Connect → paste into the password-style field → within a few
    seconds a "New contact" dialog shows the peer's fingerprint and says UNVERIFIED; the
    contact appears in the sidebar with ● when online and no ✓.
-7. Reuse the single-use invite from a third instance → "Could not connect … may be
-   offline, may have blocked you, or their key may have changed".
+7. Reuse the single-use invite from a third instance → a "Could not connect" dialog:
+   "… may be offline, may have blocked you, or their key may have changed (a fresh
+   invite would be needed)". Quit the peer while connected with auto-reconnect on →
+   "reconnecting" rows appear in the conversation, and no dialog opens for them.
+7a. With two contacts, open Bob. Let a third instance join through a multi-use invite
+   under a name that sorts above Bob → the highlight stays on Bob and the header still
+   names Bob. Click the new contact → its conversation opens and the header names it.
+7b. Contact menu → Rename, Block, Unblock, Disconnect, Connect and Remove each work;
+   Remove closes the conversation and the header asks to pick a contact.
 
 ## 3. Messaging
-8. Type, Enter → the line appears as `me: …` with "… queued" then "✓ sent" then
-   "✓✓ delivered". Shift+Enter inserts a newline.
+8. Type, Enter → the message appears under a bold "me" label, with "… queued" then
+   "✓ sent" then "✓✓ delivered" below it, changing in place. Shift+Enter inserts a
+   newline. A message from a contact who is not open marks them with • in the sidebar
+   until you open the conversation.
 9. Receive a message containing `https://example.org` → shown as plain text with a
    "Copy link" button and no "Open in browser" button. Enable "Allow opening links" in
    Settings → the button appears and shows the full URL in a confirmation first.
@@ -43,8 +52,10 @@ same LAN or loopback with a different data directory.
 ## 5. Images
 13. Image button → file chooser → pick a JPEG with EXIF (photo from a phone) → the peer
     gets "Image offered" with size, format, dimensions, caption; the highlighted default
-    button is Reject. Accept → status shows "receiving image: NN%", then a thumbnail
-    bubble with the saved path. Drag a PNG onto the window → same flow.
+    button is Reject. Accept → a "receiving …" row with a Cancel button, the status
+    shows "receiving: NN% of <size>", then a thumbnail bubble with the saved path, and
+    the Cancel button disappears. Drag a PNG onto the window → same flow. Cancel a
+    large transfer halfway → both sides show it failed.
 14. Open the saved file with `exiftool`: no EXIF/GPS/XMP/ICC. Thumbnail click → viewer
     window; "1:1" toggles between fit and actual size.
 15. Reject an offer → sender sees "transfer to <nick> failed: rejected: declined".
@@ -84,3 +95,7 @@ same LAN or loopback with a different data directory.
    not accept files"; images still work.
 6. With "Auto-accept images from verified contacts" on and the peer verified, a file
    still opens the dialog.
+7. Send a `.heic` or `.mp4` → a dialog explains that its metadata cannot be removed;
+   the default button does not send. "Yes" sends it as it is.
+8. Have the peer send a `.exe` → the offer says it is a type that can run by itself,
+   and the file is saved as `file-<code>.exe.bin`.

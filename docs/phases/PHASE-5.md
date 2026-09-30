@@ -156,6 +156,60 @@ Not fixed, on purpose:
 - Plain mode still ends when its input ends. To keep it running without input, give it
   an input that stays open.
 
+## Review round 2 (2026-09-29)
+
+Four reviewers started from scratch on the code after round 1: protocol and storage
+layers, media, the engine and session, and the user interfaces with the build. Every
+finding was checked against the code; the confirmed ones are fixed, each with a test
+that fails on the old code where one could be written.
+
+| Area | Defect | Fix |
+|---|---|---|
+| store | `burrow init` and every passphrase change failed on Windows: the tree sync opened files read-only | Only directories are synced there; files were synced when written. Confirmed under Wine |
+| store | A failed passphrase change could leave the new passphrase in force while the user was told it failed; recovery could delete a complete lone `store.new` | Distinct errors that say which passphrase applies after a restart; every rename is synced before anything is deleted; a lone complete `store.new` is kept |
+| store | One bad `config set` (invalid UTF-8) locked the user out of every command | Invalid UTF-8 is refused; a broken config file names itself and how to fix it |
+| media | A 611 KB progressive JPEG passed the 256 MiB gate and allocated 914 MiB | The gate counts coefficient memory and caps scans; interlaced PNG counted too |
+| media | The GIF pre-scan and `image/gif` read plain-text extensions differently, so the frame limits could be bypassed | Extensions are read exactly as the decoder reads them; unknown labels are rejected; the fuzz target compares both counts |
+| media | Kept blocks could carry text (an IEND with a GPS string; VP8X reserved bits; an arbitrary Adobe segment) | Every kept block has one legal shape; APP14 is rewritten canonically |
+| media, core | `/file` on a picture with an unusual extension failed; HEIC, RAW and video kept their metadata silently | Magic bytes decide; formats Burrow cannot clean need `--as-is` |
+| wire | An offer of size 0 could be encoded, and the peer closed the session on it | The encoders refuse it |
+| text | Invisible characters between letters defeated the name-collision check | Normalization repeats until stable |
+| handshake | A replayed msg1 could reach the DH in a race; limiter eviction dropped active bans | Distinct pre-DH rejection; bans survive eviction |
+| session | A CANCEL could overtake the offer it cancelled | The offer queue is read under the stream lock |
+| core | Half-open connections held handshake slots; one address failing hid the others; history flushes could hang on a write error | Slots counted per dial; every address tried; flushes always answered |
+| core, UI | Accepting an offer in the desktop app could reject it | The offer is unlisted before its dialog closes; core decides each offer once |
+| UI | A message typed during a slow `/connect` went to the contact the connect selected | A line is bound to the conversation open at Enter |
+| UI | The desktop sidebar highlight drifted from the recipient after a re-sort | The highlight follows the selected contact; removals close the conversation |
+| UI | Long lines were cut off in the full-screen chat; notes and alerts scrolled out of sight; a contact named "me" looked like the user | Own wrapping with a gutter; notes interleaved in order; alerts above the status bar; own lines marked `»`, senders named with a fingerprint prefix; unread and offer marks |
+| UI | The desktop app queued events without bound and opened a dialog for every automatic reconnect failure | Events are applied one at a time with backpressure; retries are marked and quiet |
+| UI | The desktop app could not reconnect to, rename, block or remove a contact, or cancel a transfer | A Contact menu and Cancel buttons |
+| CLI | Ctrl+C at a passphrase prompt did nothing; stray arguments were accepted; a failed connect in plain mode exited 0 | Prompts give up and restore echo; arguments checked; exit 1 |
+| transport | IPv6 mDNS announcements could not be dialled and used up their one dial; Tor held a lock through its bootstrap, froze the desktop app, could outlive Burrow and refused a second listener in conformance | Zone kept; start separated from readers; owning-process argument; persistent guard state |
+| build | The GUI was never vetted, linted or vulnerability-checked; docs-check compared generated tables; benchmarks used one sample and no absolute budget; nightly fuzzing ran as one job | `make lint TAGS=gui` in CI; a hand-kept spec table; medians of five runs against the §11 budgets; a fuzz matrix that keeps crashing inputs |
+
+Choices made without asking:
+
+- `SendFile` takes a `keepMetadata` flag (CLAUDE.md §8 updated) and `HandshakeFailed`
+  gained `Retry`.
+- The §6.1 byte estimate counts decoder working memory, and the GIF scan rejects
+  extension labels that `image/gif` does not know. Both are stricter than the letter
+  of §6.1, which is annotated.
+- Name normalization repeats until stable, which deviates from the single pass in §9.5
+  (annotated).
+- Tor keeps its own state in `<data>/tor/` between runs, for its entry guards
+  (SECURITY.md).
+- Received files of types that run when opened are saved with `.bin` appended; on
+  Windows every received file carries the Mark of the Web.
+- In the full-screen chat, a line without spaces, such as an invite, wraps without the
+  gutter so it can be copied, and `/connect` removes the spaces a copy may bring.
+- The rekey benchmark polls without sleeping, so it measures the rekey rather than the
+  timer; it includes both sides and the loopback round trips.
+
+Open for the user:
+
+- mDNS announcement replay (SECURITY.md, "LAN discovery"). The fix binds the tag to the
+  source address and a time window, which changes CLAUDE.md §5.
+
 ## Known issues
 
 - The desktop app idles at 172–179 MiB with one peer on the development machine (AMD

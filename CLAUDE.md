@@ -704,7 +704,9 @@ The handshake and session layers see only `net.Conn`. Every transport passes the
   long-term secret: generated with `crypto/rand`, stored **inside the encrypted identity
   blob**, handed to tor via the control port (`ADD_ONION`) at startup, never left in tor's
   data directory. The full Noise/hybrid layer still runs inside the onion connection —
-  identity binding, PQ, and per-message FS are ours, not Tor's.
+  identity binding, PQ, and per-message FS are ours, not Tor's. Tor's own state (its
+  entry guards) persists in `<data>/tor/`, and tor runs with `__OwningControllerProcess`
+  so it never outlives Burrow (review round 2).
 - **Opt-in — mDNS LAN discovery** (`golang.org/x/net/dns/dnsmessage`, hand-built packets).
   Off by default (it announces presence on the LAN). When on, an instance announces a
   random per-session service name, its port, and a TXT record `nonce[16] || tag[16]` with
@@ -713,7 +715,11 @@ The handshake and session layers see only `net.Conn`. Every transport passes the
   hands `(name, port, nonce, tag)` to core; core recognizes a contact by recomputing the
   tag once per stored contact and dials at most once; anyone else learns only that *some*
   Burrow instance is on the LAN. **No probing handshakes** — they would trip the §3.4
-  failure limits and reveal contact counts.
+  failure limits and reveal contact counts. mDNS runs only alongside the TCP transport;
+  a link-local IPv6 source is dialled through its zone. Open question for the user: a
+  recorded announcement can be replayed elsewhere to find the announcer's contacts
+  (SECURITY.md); binding the tag to the source address and a time window would change
+  this section.
 - **Explicitly rejected:** libp2p (huge dependency surface; DHT participation leaks
   presence), public STUN/TURN (third party sees metadata). UDP hole-punching via a
   user-hosted rendezvous may be revisited after Phase 5.
@@ -729,11 +735,17 @@ rejected at offer time.
 ### 6.1 Size gates (applied by both sender and receiver, before any decode)
 
 - `image.DecodeConfig` only; reject if `width*height > 40,000,000`, either side > 16,384,
-  or `width*height*bytesPerPixel(declared color model) > 256 MiB`.
+  or `width*height*bytesPerPixel(declared color model) > 256 MiB`. The byte estimate also
+  counts what the stdlib decoder allocates beyond the image: a progressive JPEG's
+  coefficient blocks (64 × 4 bytes per block of every component; more than 100 scans →
+  reject) and an interlaced PNG's second buffer. (Review round 2: the literal rule let a
+  611 KB progressive CMYK JPEG allocate 914 MiB.)
 - GIF: **pre-scan the block structure without decoding** (walk image descriptors, skip
   LZW sub-blocks) to count frames and sum frame areas; reject if frames > 200 or
   Σ(frame w×h) > 40,000,000. `gif.DecodeAll` decodes every frame, so it must never be
-  called before this scan.
+  called before this scan. The scan reads extensions exactly as `image/gif` does (a
+  plain-text extension starts with a fixed 12-byte block) and rejects unknown labels,
+  so the two can never count different frames.
 - A process-wide semaphore allows **2 full-size decodes at a time**. Thumbnails are
   produced once and the full-size image is released unless a viewer is open.
 
@@ -832,6 +844,13 @@ anything. Added on 2026-09-29 at the user's request.
   instead, so a photo sent with `/file` still loses its metadata.
 - **Two passes**, like images: pass 1 hashes the file for the offer, pass 2 sends it; a
   file that changed in between → `IMG_CANCEL reason=1`. Resume via `.meta` works the same.
+- **Formats Burrow cannot clean.** A photo or video format whose metadata Burrow cannot
+  remove (HEIC/AVIF/MP4/MOV, TIFF and camera RAW, JPEG XL, Matroska, AVI; detected by
+  magic bytes) is refused with `ErrKeepsMetadata` unless the user confirms
+  (`SendFile(…, keepMetadata = true)`, `/file --as-is`, a dialog in the GUI).
+- **Types that run when opened** (`.exe`, `.bat`, `.lnk`, `.jar`, `.iso`, `.desktop`…)
+  are announced as such in the offer and saved with `.bin` appended. On Windows every
+  received file gets the Mark of the Web.
 - The §6.1 gates, decoding and thumbnails do not apply. Burrow never opens, executes,
   decodes or previews a received file.
 
@@ -926,14 +945,15 @@ func (e *Engine) Disconnect(id PeerID) error
 func (e *Engine) SendText(id PeerID, text string) (MsgID, error)        // queues if offline
 func (e *Engine) SetTyping(id PeerID, typing bool)                      // no-op unless enabled + peer supports it
 func (e *Engine) SendImage(ctx context.Context, id PeerID, path string, caption string) (TransferID, error)
-func (e *Engine) SendFile(ctx context.Context, id PeerID, path string, caption string) (TransferID, error)   // any file; images are stripped (§6.5)
+func (e *Engine) SendFile(ctx context.Context, id PeerID, path string, caption string, keepMetadata bool) (TransferID, error)   // any file; images are stripped (§6.5)
 func (e *Engine) AcceptImage(t TransferID, destDir string) error
 func (e *Engine) RejectImage(t TransferID) error
 func (e *Engine) CancelTransfer(t TransferID) error
 ```
 
 Events (one Go type each; both UIs use an exhaustive switch): `PeerConnected`,
-`PeerDisconnected`, `Reconnecting{Attempt, NextAt}`, `HandshakeFailed{Stage, Reason}`,
+`PeerDisconnected`, `Reconnecting{Attempt, NextAt}`, `HandshakeFailed{Stage, Reason, Retry}`
+(`Retry`: an automatic reconnect attempt, which the UIs report quietly),
 `NewPeerViaInvite`, `InviteConsumed{Id}`, `NameCollision`, `PeerVerified`,
 `MessageReceived`, `MessageStatus` (pending/sent/delivered/failed), `Typing`,
 `ImageOffered`, `TransferProgress`, `TransferResumed`, `TransferDone`, `TransferFailed`,
@@ -1011,7 +1031,9 @@ Display names are additionally **normalized** for the `NameCollision` check only
 stored name stays sanitized-but-unnormalized): NFKC (`x/text/unicode/norm`) → Unicode
 case-fold (`x/text/cases.Fold`) → remove every rune in `unicode.Cf ∪
 unicode.Other_Default_Ignorable_Code_Point ∪ unicode.Variation_Selector` → collapse
-whitespace runs to one space → trim. Compare byte-equal.
+whitespace runs to one space → trim, repeated until the result stops changing (at most
+four rounds): removing an invisible character can let NFKC compose what it had blocked
+(review round 2). Compare byte-equal.
 
 `text.Redact(s)` replaces every peer-provided string in log output with its length and a
 short hash; it is the only way peer strings reach a logger.

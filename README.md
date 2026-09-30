@@ -77,8 +77,8 @@ You are asked to choose a passphrase and type it twice. Nothing appears while yo
 type; that is normal. The passphrase protects your identity and contact list on
 your disk. **There is no way to recover it**, so pick something you will remember.
 
-You will see your **fingerprint**, a long code in groups of four letters. That is
-your identity in Burrow. It is not secret.
+You will see your **fingerprint**, a long code in groups of four letters and digits.
+That is your identity in Burrow. It is not secret.
 
 You will also see a warning that Burrow does not hide your IP address by default.
 [Who can see your IP address](#who-can-see-your-ip-address) explains what that means
@@ -190,8 +190,11 @@ The order matters: `--config` and `--data` go **before** the command, and
 
 ### Chat with yourself
 
-Type in either window and the message appears in the other. Try `/contacts`,
-`/safety` and `/image` as well.
+Bob's window opens the conversation with Alice by itself, because she is his only
+contact. In Alice's window, type `/contacts` to see Bob's name, then `/to` followed
+by that name. Then type in either window and the message appears in the other. Try
+`/safety` followed by the other's name, and `/image` followed by the path of a
+picture.
 
 ### Clean up
 
@@ -215,6 +218,7 @@ are commands.
 | `/msg Alice hello` | Sends to Alice without switching |
 | `/image photo.jpg` | Offers a picture to the current contact |
 | `/file backup.zip` | Offers any file to the current contact |
+| `/file --as-is clip.mp4` | Sends a photo or video format that Burrow cannot clean, with its metadata (see [Sending pictures](#sending-pictures)) |
 | `/accept 1` or `/reject 1` | Answers a picture or file someone offered you |
 | `/cancel 1` | Stops a transfer you are sending or receiving |
 | `/safety Alice` | Shows the safety number for Alice |
@@ -225,11 +229,26 @@ are commands.
 
 A name or a path with spaces goes in quotes: `/msg "Bob Smith" hello` or
 `/file "my holiday.zip"`. If a name could mean two contacts, Burrow refuses and asks
-you to be more specific. It never guesses who a message is for.
+you to be more specific. It never guesses who a message is for: a message goes to
+the conversation you were in when you pressed Enter. An invite pasted without
+`/connect` in front of it is not sent.
 
-In the contact list, `✓` or `?` before a name shows whether you have verified that
-contact. It stands before the name on purpose: a contact chooses their own name, and a
-check mark inside a name means nothing.
+Your own messages start with `»`. A message you receive starts with the sender's
+name and the first eight characters of their fingerprint, so a contact who calls
+themselves after someone else cannot pass for them. Command output and notices
+appear in the conversation in the order they happen. A name collision also stays
+above the status bar until you press Enter.
+
+The contact list shows up to three marks before each name. They stand before the
+name on purpose: a contact chooses their own name, and a mark inside a name means
+nothing.
+
+| Mark | Meaning |
+|---|---|
+| `*` | Online |
+| `✓` or `?` | Verified, or not yet verified |
+| `•` | A new message you have not seen |
+| `!` | A picture or file is waiting for `/accept` or `/reject` |
 
 Keys: **Enter** sends, **Tab** switches between contacts, **Page Up** and
 **Page Down** scroll.
@@ -271,6 +290,11 @@ contact and exchange a new invite over a channel you trust more.
 
 PNG, JPEG, WebP and GIF are supported, up to 25 MiB.
 
+Other photo and video formats, such as HEIC from an iPhone, camera RAW files, MP4
+and MOV, carry the same kind of hidden information, and Burrow cannot remove it.
+`/file` refuses them and says so. Convert the picture to JPEG or PNG first, or send
+it as it is with `/file --as-is`.
+
 ## Sending other files
 
 ```
@@ -280,7 +304,7 @@ PNG, JPEG, WebP and GIF are supported, up to 25 MiB.
 Any file works: `.zip`, `.rar`, `.pdf`, documents, anything.
 
 - **The other person sees the size first.** Their chat shows something like
-  `offer #1, a file: 1.20 GiB, type .zip`, and nothing is downloaded until they type
+  `offer #1, a file: 48.3 MiB, type .zip`, and nothing is downloaded until they type
   `/accept 1`. `/reject 1` declines. `/transfers` lists the offers that are waiting.
 - **The file name is never sent**, only its type. The received file is saved as
   `file-` followed by a short code and the type, for example `file-3fa91c02.zip`. Use
@@ -290,6 +314,9 @@ Any file works: `.zip`, `.rar`, `.pdf`, documents, anything.
   author's name, and an archive contains the names of the files inside it.
 - A picture sent with `/file` is treated like `/image`, so it is still cleaned.
 - Burrow never opens a received file. Only open one yourself if you trust the sender.
+  A type that runs when opened, such as `.exe`, `.bat` or `.lnk`, is announced as
+  such and saved with `.bin` added to its name, so that a double click does not
+  start it.
 - If the connection drops halfway, send the same file again and the download continues
   where it stopped.
 
@@ -390,6 +417,10 @@ make build-gui
 Building it needs a C compiler and the graphics development packages for your
 system. On Debian or Ubuntu: `sudo apt install gcc libgl1-mesa-dev xorg-dev`.
 
+The **Contact** button above the conversation connects to, disconnects from,
+renames, blocks or removes the contact you are talking to. A transfer in progress has
+a **Cancel** button in the conversation.
+
 The desktop app and the terminal program share the same identity and contacts, but
 only one of them can run at a time.
 
@@ -425,8 +456,8 @@ Install the `tor` program, then:
 burrow config set transport tor
 ```
 
-Create invites from inside the chat with `/invite tor`. Your contact then sees an
-onion address instead of your IP address, and someone watching your network sees
+Create invites with `burrow invite --tor`, or with `/invite tor` inside the chat.
+Your contact then sees an onion address instead of your IP address, and someone watching your network sees
 only that you use Tor. Tor is slower, which you will notice with large files.
 
 A VPN such as Tailscale or WireGuard is a middle way. People on your local network
@@ -482,8 +513,8 @@ of them with `burrow config get`.
 | `max_image_mib` | Largest picture you accept or send, in MiB | `25` |
 | `auto_accept_from_verified` | Skip the accept question for pictures from verified contacts. Other files always ask | off |
 
-With `transport` set to `tor`, create invites from inside the chat with
-`/invite tor`.
+With `transport` set to `tor` or `both`, `burrow invite --tor` creates an invite to
+your onion address.
 
 Other commands: `burrow id` shows your fingerprint, `burrow contacts list` shows
 your contacts, `burrow passphrase` changes your passphrase, and
@@ -497,8 +528,9 @@ make build-gui    # desktop GUI (needs CGo + OpenGL/X11 dev packages)
 go build -tags memguard ./cmd/burrow   # optional: identity key in locked memory (docs/SECURITY.md)
 make test         # go test -race ./...
 make lint         # gofmt, vet, staticcheck, gosec, govulncheck, golangci-lint (run `make tools` once)
-make docs-check   # docs/PROTOCOL.md constants match internal/wire
-make bench        # benchmarks compared with bench/baseline.json
+make lint TAGS=gui   # the same, including the desktop app
+make docs-check   # the constants in internal/wire, docs/PROTOCOL.md and CLAUDE.md agree
+make bench        # medians of five runs, checked against the §11 budgets and bench/baseline.json
 ```
 
 - Design and rules: [CLAUDE.md](CLAUDE.md)

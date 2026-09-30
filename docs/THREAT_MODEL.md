@@ -19,10 +19,11 @@ invites; the fact that two specific peers talk, and when; partial transfers on d
 | Scanners that do not hold a peer's public key | XK: silent close after one cheap DH; responder key never sent; msg1 replay LRU; invite tokens for unknown initiators | done |
 | Image metadata leakage | EXIF/XMP/ICC/IPTC/comments stripped in every format; orientation applied then dropped; no filenames or timestamps on the wire; opaque `img-<hash8>` file names; paranoid mode re-encodes to drop encoder fingerprints | done |
 | Disk theft | Identity, contacts, invites, transfer metadata encrypted under an Argon2id-derived key (or a random key in `--insecure-no-passphrase` mode); no history by default; no core dumps (Linux/macOS) | Phase 0/1 |
-| Terminal/UI injection and name spoofing | Sanitization of every peer string (`internal/text`); NFKC + case-fold normalization for the name-collision check | Phase 0 |
-| Unwanted or oversized files | `max_file_mib` is advertised in HELLO and enforced on both sides; 0 refuses files entirely; an offer over the limit is rejected before the user is asked; every prompt shows the size first; nothing is downloaded before an explicit accept; free disk space is checked; auto-accept never applies to files; the extension is restricted to `a–z0–9` by the wire codec, so a peer cannot choose a path | done |
-| Memory exhaustion, decompression bombs | Hard caps before allocation (frame ≤ 65,552 bytes, rejected before the body is read); bounded queues; per-peer stream/offer caps; image dimension gates and GIF pre-scan before any decode; two-decode semaphore; nothing downloaded before an explicit accept | done |
-| A second local process corrupting the store | Exclusive lock on `store/lock` | Phase 0 |
+| Terminal/UI injection and name spoofing | Sanitization of every peer string (`internal/text`); NFKC + case-fold normalization for the name-collision check, repeated until stable so that invisible characters cannot hide a match; received lines name the sender with a fingerprint prefix; own lines start with `»`; a wrapped or multi-line message keeps a gutter; state marks stand before names | done |
+| Messages or files reaching the wrong contact | A line is bound to the conversation that was open when Enter was pressed; the desktop sidebar highlight follows the recipient through re-sorts and removals; an invite pasted into the chat is not sent; ambiguous names are refused | done |
+| Unwanted or oversized files | `max_file_mib` is advertised in HELLO and enforced on both sides; 0 refuses files entirely; an offer over the limit is rejected before the user is asked; every prompt shows the size first; nothing is downloaded before an explicit accept; free disk space is checked; auto-accept never applies to files; the extension is restricted to `a–z0–9` by the wire codec, so a peer cannot choose a path; types that run when opened are announced and saved with `.bin` appended; Windows gets the Mark of the Web | done |
+| Memory exhaustion, decompression bombs | Hard caps before allocation (frame ≤ 65,552 bytes, rejected before the body is read); bounded queues; per-peer stream/offer caps; image dimension gates, including a progressive JPEG's coefficient memory and an interlaced PNG's second buffer, and a GIF pre-scan that reads extensions exactly as the decoder does, before any decode; two-decode semaphore; nothing downloaded before an explicit accept; each chat log is capped by lines and by bytes, and a window that falls behind slows the engine down instead of queueing | done |
+| A second local process corrupting the store | Exclusive lock on `<data>/store.lock`, taken before anything in the data directory is touched | done |
 
 ## Out of scope (stated in the README)
 
@@ -42,6 +43,11 @@ invites; the fact that two specific peers talk, and when; partial transfers on d
 - Quantum attacks on authentication in *new* sessions (revisit with ML-DSA in v2).
 - IP exposure to the peer in direct-TCP mode (use the Tor transport to hide it).
 - Encoder fingerprints inside images in `strip` mode (`paranoid` mode removes them).
+- Metadata inside photo and video formats Burrow cannot clean (HEIC, RAW, MP4…), when
+  the user sends one with `/file --as-is` after being warned.
+- Contact discovery by replaying a recorded mDNS announcement on another network (mDNS
+  is off by default; see SECURITY.md, an open question).
+- Lines that the terminal wraps in `--plain` mode (see SECURITY.md).
 - Metadata inside files that are not images: author and software fields in documents,
   names and timestamps of files inside an archive. Such files are sent byte for byte.
   Their own name and timestamps are never sent; their extension is.

@@ -67,6 +67,11 @@ Core dumps are disabled at startup by both `burrow` and `burrow-gui`
   garbage-collected.
 - Rekey ephemerals, KEM seeds and the three DH outputs are ours and are wiped after each
   derivation; the previous root is overwritten by the new one.
+- `burrow --plain` prints messages as lines and leaves wrapping to the terminal, which
+  knows nothing of Burrow. A contact can pad a message with spaces until its end starts
+  a new row that looks like a line of its own. Line breaks inside a message always get
+  the `│` gutter, and the full-screen chat wraps long lines itself with the same
+  gutter. Use the full-screen chat or `--json` where that matters.
 - `bubbles/textinput` handles ctrl+v by reading the system clipboard through
   `github.com/atotto/clipboard`, which executes `xclip`/`xsel`/`wl-paste`/`pbpaste`. That is
   a local, user-triggered action; Burrow never writes to the clipboard on its own.
@@ -75,9 +80,20 @@ Core dumps are disabled at startup by both `burrow` and `burrow-gui`
 
 A file that is not an image is written to disk exactly as received, under a name Burrow
 picks (`file-<hash8>.<ext>`). The extension is the sender's claim, limited to eight
-characters from `a–z0–9`; it is never used to decide anything. Burrow does not open,
-execute, decode, preview or scan received files. Treat a file from an unverified contact
-like an e-mail attachment from a stranger.
+characters from `a–z0–9`. Burrow does not open, execute, decode, preview or scan
+received files. Treat a file from an unverified contact like an e-mail attachment from
+a stranger.
+
+The extension decides one thing: a type that acts when it is opened (`.exe`, `.bat`,
+`.ps1`, `.lnk`, `.js`, `.jar`, `.iso`, `.desktop` and the like; the list is `activeExt`
+in `internal/core/transfer.go`) is announced as such in the offer and saved with `.bin`
+appended, so that a double click does not run it. On Windows every received file also
+gets the Mark of the Web (a `Zone.Identifier` stream, zone 3), so that Windows warns
+before running it and opens documents in protected view.
+
+Photo and video formats whose metadata Burrow cannot remove (HEIC, AVIF, MP4, MOV,
+TIFF, camera RAW, JPEG XL, Matroska, AVI) are refused by `/file` unless the user
+confirms with `--as-is`, or with the desktop app's dialog.
 
 ## At-rest protection
 
@@ -122,10 +138,16 @@ built by `make release` are the default build; the memguard build is opt-in.
 
 The Tor transport's ed25519 key is generated with `crypto/rand`, stored inside the
 encrypted identity blob (blob version 2) and handed to tor over the control port with
-`ADD_ONION` at startup. Tor runs with a temporary data directory under `<data>/tor/`
-that is deleted on close, and whatever a crash left there is deleted at the next start;
-the key never lands there. Our copy of the key is wiped when the transport closes; the
-copy inside the control library stays until it is collected. Tor's own output is
+`ADD_ONION` at startup. The key never lands in tor's data directory, `<data>/tor/`.
+That directory is kept from one run to the next, because it holds tor's entry guards:
+choosing new guards at every start would give whoever runs relays more chances to
+become one. It is not encrypted by Burrow, and it shows that this computer uses Tor.
+Tor is started with `__OwningControllerProcess`, so it exits when Burrow does, even
+after a crash.
+
+Our copy of the key is wiped when the transport closes; the copy inside the control
+library stays until it is collected. `burrow invite --tor` derives the onion address
+from the key without starting tor, and wipes the key afterwards. Tor's own output is
 discarded. Rotating identity therefore also rotates the onion address.
 
 **Not verified:** the Tor transport has never run against a real tor on the development
@@ -133,11 +155,25 @@ machine (no tor binary). Its start-up logic is covered by a test with a stand-in
 
 ## LAN discovery
 
-mDNS is off by default. When on, an instance announces a random per-session name, its
-port and `nonce || BLAKE2b-256("burrow/1 mdns" || nonce || pubkey)[:16]` every 30 s.
+mDNS is off by default, and it never runs without the TCP transport. When on, an
+instance announces a random per-session name, its port and
+`nonce || BLAKE2b-256("burrow/1 mdns" || nonce || pubkey)[:16]` every 30 s.
 Recognizing a contact costs one hash per stored contact, once per announcement nonce;
-at most 20 announcements per second are looked at. Nobody is probed. Anyone on the LAN
-learns that some Burrow instance is present, not which one.
+at most 20 announcements per second are looked at. Nobody is probed. An IPv6
+announcement from a link-local address is dialled through the interface it arrived on.
+A dial made because of an announcement neither reports failures nor remembers the
+address.
+
+What mDNS reveals:
+
+- Anyone on the LAN learns that some Burrow instance is present.
+- Anyone who holds the announcer's public key (every contact, every past invite
+  recipient) can recompute the tag and recognize the announcer.
+- **Open:** a recorded announcement can be replayed on another network. Every instance
+  there that has the announcer as a contact then dials the replayer, which reveals that
+  it knows the announcer. Binding the tag to the sender's address and a time window
+  would stop this; it changes the tag defined in CLAUDE.md §5, so it waits for the
+  user's decision.
 
 ## Reconnect beacons
 
