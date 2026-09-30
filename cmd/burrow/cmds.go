@@ -76,7 +76,7 @@ func (a *app) cmdID(args []string, stdin io.Reader, stdout, stderr io.Writer) in
 	fs := flag.NewFlagSet("id", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	qr := fs.Bool("qr", false, "also print a QR code")
-	if err := fs.Parse(args); err != nil {
+	if err := fs.Parse(args); err != nil || tooMany(fs, 0, stderr) {
 		return 2
 	}
 	st, err := a.unlock(stdin, stderr)
@@ -132,7 +132,7 @@ func (a *app) inviteHost(flagHost string) (string, error) {
 	return "", errors.New("cannot guess your address; pass --host <ip-or-hostname> or set `burrow config set invite_host <addr>`")
 }
 
-func (a *app) cmdInvite(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.Writer) int {
+func (a *app) cmdInvite(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("invite", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	ttl := fs.Duration("ttl", time.Hour, "validity")
@@ -140,7 +140,7 @@ func (a *app) cmdInvite(ctx context.Context, args []string, stdin io.Reader, std
 	qr := fs.Bool("qr", false, "also print a QR code")
 	host := fs.String("host", "", "address peers should dial (IP literal, hostname, .onion)")
 	torFlag := fs.Bool("tor", false, "onion invite (only from inside a running `burrow listen` with transport=tor: use /invite there)")
-	if err := fs.Parse(args); err != nil {
+	if err := fs.Parse(args); err != nil || tooMany(fs, 0, stderr) {
 		return 2
 	}
 	if *torFlag {
@@ -172,7 +172,6 @@ func (a *app) cmdInvite(ctx context.Context, args []string, stdin io.Reader, std
 	if *qr {
 		printQR(stdout, inv.String)
 	}
-	_ = ctx
 	return 0
 }
 

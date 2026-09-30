@@ -1,7 +1,6 @@
 GO      ?= go
 FUZZTIME ?= 60s
-PKGS     = $(shell $(GO) list ./... | grep -v /internal/ui/gui)
-FUZZPKGS = internal/wire internal/invite internal/text internal/store internal/media internal/handshake internal/transport/mdns
+FUZZPKGS = internal/wire internal/invite internal/text internal/store internal/media internal/transport/mdns
 BIN      = $(shell $(GO) env GOPATH)/bin
 
 .PHONY: tools build build-gui cross test test-short test-gui lint fuzz bench release docs-check
@@ -43,8 +42,9 @@ lint:
 
 fuzz:
 	@for pkg in $(FUZZPKGS); do \
-	  [ -d $$pkg ] || continue; \
-	  for f in $$($(GO) test -list 'Fuzz.*' ./$$pkg 2>/dev/null | grep '^Fuzz'); do \
+	  list=$$($(GO) test -list 'Fuzz.*' ./$$pkg) || { echo "$$list"; echo "FAIL: $$pkg does not build"; exit 1; }; \
+	  targets=$$(echo "$$list" | grep '^Fuzz') || { echo "FAIL: no fuzz targets in $$pkg"; exit 1; }; \
+	  for f in $$targets; do \
 	    echo "== $$pkg/$$f"; $(GO) test -run '^$$' -fuzz="^$$f$$" -fuzztime=$(FUZZTIME) ./$$pkg || exit 1; \
 	  done; \
 	done

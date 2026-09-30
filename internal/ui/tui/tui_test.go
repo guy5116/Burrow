@@ -7,7 +7,9 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -93,11 +95,11 @@ func TestModelLifecycle(t *testing.T) {
 		t.Fatal(m.in.Value())
 	}
 	_, cmd := m.Update(key(tea.KeyEnter, ""))
-	if !m.busy || m.in.Value() != "" {
+	if m.busy != 1 || m.in.Value() != "" {
 		t.Fatal("enter did not submit")
 	}
 	runCmd(t, m, cmd)
-	if m.busy || !strings.Contains(strings.Join(m.system, "\n"), "your fingerprint") {
+	if m.busy != 0 || !strings.Contains(strings.Join(m.system, "\n"), "your fingerprint") {
 		t.Fatal(m.system)
 	}
 	// Blank enter does nothing; /quit and ctrl+c quit.
@@ -118,7 +120,7 @@ func TestModelLifecycle(t *testing.T) {
 	m.Update(key(tea.KeyPgDown, ""))
 	m.Update(key(tea.KeyTab, "")) // no contacts: no-op
 	m.Update(tea.KeyPressMsg{Code: tea.KeyTab, Mod: tea.ModShift})
-	if m.ctl.Current != nil {
+	if _, selected := m.ctl.Selected(); selected {
 		t.Fatal("selection without contacts")
 	}
 }
@@ -128,7 +130,7 @@ func TestModelEvents(t *testing.T) {
 	m.Update(tea.WindowSizeMsg{Width: 120, Height: 40})
 	var p core.PeerID
 	p[0] = 4
-	m.ctl.Current = &p
+	m.ctl.Select(p)
 	var id core.TransferID
 	id[0] = 2
 	tp := core.TransferPeer{Peer: p}
@@ -176,14 +178,13 @@ func TestModelEvents(t *testing.T) {
 	}
 	t.Setenv("TERM", "xterm-kitty")
 	runCmd(t, m, m.view("1")) // file does not exist → decode error line
-	if !strings.Contains(strings.Join(m.system, "\n"), "cannot decode image") {
+	if !strings.Contains(strings.Join(m.system, "\n"), "cannot show") {
 		t.Fatal(m.system)
 	}
-	m.Update(viewMsg{}) // nothing pending: no-op
 	if captionOf("") != "" || captionOf("x") != ` "x"` || padRight("ab", 4) != "ab  " || padRight("abcd", 2) != "abcd" {
 		t.Fatal("helpers")
 	}
-	m.busy = true
+	m.busy = 1
 	if !strings.Contains(m.View().Content, "working") {
 		t.Fatal("busy marker")
 	}
@@ -196,19 +197,19 @@ func TestSelectionCyclesContacts(t *testing.T) {
 	m.contacts = []core.Contact{{ID: a, Nickname: "a", Online: true, Verified: true}, {ID: b, Nickname: strings.Repeat("long", 12)}}
 	m.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
 	m.selectOffset(1)
-	if m.ctl.Current == nil || *m.ctl.Current != a {
+	if got, ok := m.ctl.Selected(); !ok || got != a {
 		t.Fatal("first selection")
 	}
 	m.selectOffset(1)
-	if *m.ctl.Current != b {
+	if got, _ := m.ctl.Selected(); got != b {
 		t.Fatal("next")
 	}
 	m.selectOffset(1)
-	if *m.ctl.Current != a {
+	if got, _ := m.ctl.Selected(); got != a {
 		t.Fatal("wrap")
 	}
 	m.selectOffset(-1)
-	if *m.ctl.Current != b {
+	if got, _ := m.ctl.Selected(); got != b {
 		t.Fatal("previous wraps")
 	}
 	// The sidebar shows markers and truncates long names (contacts come from the engine on refresh,
@@ -244,7 +245,7 @@ func TestInlineThumbnailFlow(t *testing.T) {
 	m.Update(tea.WindowSizeMsg{Width: 120, Height: 40})
 	var p core.PeerID
 	p[0] = 8
-	m.ctl.Current = &p
+	m.ctl.Select(p)
 	// A PNG on disk, as TransferDone would report it.
 	path := filepath.Join(t.TempDir(), "img-abcd.png")
 	f, err := os.Create(path)
@@ -272,7 +273,7 @@ func TestInlineThumbnailFlow(t *testing.T) {
 	}
 	msg := cmd()
 	in, ok := msg.(inlineMsg)
-	if !ok || in.peer != p || len(in.img.Lines) == 0 {
+	if !ok || in.peer == nil || *in.peer != p || len(in.img.Lines) == 0 {
 		t.Fatalf("%T", msg)
 	}
 	before := len(m.logs[p])
@@ -283,13 +284,13 @@ func TestInlineThumbnailFlow(t *testing.T) {
 	if !strings.ContainsRune(m.logs[p][len(m.logs[p])-1], 0x10EEEE) {
 		t.Fatal("placeholder cells missing")
 	}
-	// A missing file fails silently (the path line is already there).
-	if got := m.inline(p, filepath.Join(t.TempDir(), "gone.png"), common.TermKitty)(); got != nil {
+	// A missing file is reported in the notes.
+	if got, ok := m.inline(&p, filepath.Join(t.TempDir(), "gone.png"), common.TermKitty, thumbCols)().(noteMsg); !ok || !strings.Contains(string(got), "cannot show") {
 		t.Fatalf("%v", got)
 	}
 	// Ids cycle through 1–255 and never use 0.
 	m.nextImage = 255
-	_ = m.inline(p, path, common.TermKitty)
+	_ = m.inline(&p, path, common.TermKitty, thumbCols)
 	if m.nextImage != 1 {
 		t.Fatal(m.nextImage)
 	}
@@ -303,7 +304,7 @@ func TestHalfBlockPreviewOnITerm(t *testing.T) {
 	m.Update(tea.WindowSizeMsg{Width: 120, Height: 40})
 	var p core.PeerID
 	p[0] = 3
-	m.ctl.Current = &p
+	m.ctl.Select(p)
 	path := filepath.Join(t.TempDir(), "img-ffff.png")
 	f, _ := os.Create(path)
 	_ = png.Encode(f, image.NewNRGBA(image.Rect(0, 0, 64, 64)))
@@ -325,5 +326,57 @@ func TestHalfBlockPreviewOnITerm(t *testing.T) {
 	}
 	if !strings.Contains(m.logs[p][len(m.logs[p])-1], "\u2580") {
 		t.Fatal("preview rows missing")
+	}
+}
+
+// Commands run one at a time in the order they were entered, although Bubble
+// Tea starts each on a goroutine of its own.
+func TestCommandsRunInOrder(t *testing.T) {
+	var o inOrder
+	const n = 200
+	tickets := make([]uint64, n)
+	for i := range tickets {
+		tickets[i] = o.ticket()
+	}
+	var mu sync.Mutex
+	var got []int
+	var wg sync.WaitGroup
+	for i := n - 1; i >= 0; i-- { // started in the reverse order, on purpose
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			o.run(tickets[i], func() {
+				mu.Lock()
+				got = append(got, i)
+				mu.Unlock()
+			})
+		}()
+	}
+	wg.Wait()
+	for i, v := range got {
+		if v != i {
+			t.Fatalf("position %d ran command %d", i, v)
+		}
+	}
+}
+
+func TestLogsAreBounded(t *testing.T) {
+	var log []string
+	for i := 0; i < maxLines+10; i++ {
+		log = keep(log, strconv.Itoa(i))
+	}
+	if len(log) != maxLines || log[0] != "10" || log[maxLines-1] != strconv.Itoa(maxLines+9) {
+		t.Fatal(len(log), log[0])
+	}
+}
+
+// The sidebar is cut by characters, never in the middle of one, and the state
+// columns come before the name.
+func TestSidebarLabels(t *testing.T) {
+	if got := truncate("*? "+strings.Repeat("é", 40), 10); got != "*? "+strings.Repeat("é", 7) {
+		t.Fatalf("%q", got)
+	}
+	if got := truncate("short", 10); got != "short" {
+		t.Fatal(got)
 	}
 }

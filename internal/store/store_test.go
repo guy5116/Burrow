@@ -717,7 +717,7 @@ func TestPassphraseChangeUnderLoad(t *testing.T) {
 				return
 			}
 			if b, err := s.ReadBlob(name); err != nil || string(b) != name {
-				done <- fmt.Errorf("%s: %q %v", name, b, err)
+				done <- fmt.Errorf("%s: %q: %w", name, b, err)
 				return
 			}
 		}

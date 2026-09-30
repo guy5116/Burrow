@@ -80,10 +80,13 @@ func runPlain(ctx context.Context, ctl *common.Controller, target core.Target, a
 		exec("/connect " + target.Name)
 	}
 
+	// Plain mode ends when stdin ends. A line longer than maxLine is an error,
+	// not an end of input.
 	lines := make(chan string)
+	readErr := make(chan error, 1)
 	go func() {
 		sc := bufio.NewScanner(stdin)
-		sc.Buffer(make([]byte, 64<<10), 64<<10)
+		sc.Buffer(make([]byte, maxLine), maxLine)
 		for sc.Scan() {
 			select {
 			case lines <- sc.Text():
@@ -91,6 +94,7 @@ func runPlain(ctx context.Context, ctl *common.Controller, target core.Target, a
 				return
 			}
 		}
+		readErr <- sc.Err()
 		close(lines)
 	}()
 	for {
@@ -98,9 +102,19 @@ func runPlain(ctx context.Context, ctl *common.Controller, target core.Target, a
 		case <-ctx.Done():
 			return 0
 		case line, ok := <-lines:
-			if !ok || exec(line) {
+			if !ok { // input has ended
+				if err := <-readErr; err != nil {
+					fmt.Fprintln(stderr, "burrow: reading input:", err)
+					return 1
+				}
+				return 0
+			}
+			if exec(line) { // /quit
 				return 0
 			}
 		}
 	}
 }
+
+// maxLine bounds one line of input: the longest message plus a command.
+const maxLine = 64 << 10

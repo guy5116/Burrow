@@ -126,7 +126,7 @@ func TestControllerCommands(t *testing.T) {
 	if len(lines) != 2 || !strings.HasPrefix(lines[1], "burrow1:") || !strings.Contains(lines[0], "multi-use") || port == 0 {
 		t.Fatal(inv)
 	}
-	if out := exec(t, b.ctl, "/connect "+lines[1]); !strings.Contains(out, "connected to") || b.ctl.Current == nil {
+	if out := exec(t, b.ctl, "/connect "+lines[1]); !strings.Contains(out, "connected to") || !isSelected(b.ctl) {
 		t.Fatal(out)
 	}
 	a.wait(t, func(ev core.Event) bool { _, ok := ev.(core.PeerConnected); return ok })
@@ -174,10 +174,10 @@ func TestControllerCommands(t *testing.T) {
 	if out := exec(t, a.ctl, "/verify Bob"); !strings.Contains(out, "verified") {
 		t.Fatal(out)
 	}
-	if out := exec(t, a.ctl, "/contacts"); !strings.Contains(out, "verified ✓") {
+	if out := exec(t, a.ctl, "/contacts"); !strings.HasSuffix(out, "  verified") {
 		t.Fatal(out)
 	}
-	if label := a.ctl.Names.Label(b.e.Identity().ID); !strings.Contains(label, "Bob✓") {
+	if label := a.ctl.Names.Label(b.e.Identity().ID); label != "Bob ("+b.e.Identity().ID.Short()+", verified)" {
 		t.Fatal(label)
 	}
 	if out := exec(t, a.ctl, "/rename Bob Robert"); !strings.Contains(out, "Robert") {
@@ -191,10 +191,14 @@ func TestControllerCommands(t *testing.T) {
 			t.Errorf("%s nobody → %q", cmd, out)
 		}
 	}
-	if out := exec(t, a.ctl, "/typing on"); !strings.Contains(out, "on") || !a.ctl.Typing {
+	// Typing indicators are off in the settings of this node: saying "on" would be a lie.
+	if out := exec(t, a.ctl, "/typing on"); !strings.HasPrefix(out, "! ") || a.ctl.TypingOn() {
 		t.Fatal(out)
 	}
-	if out := exec(t, a.ctl, "/typing off"); !strings.Contains(out, "off") || a.ctl.Typing {
+	if out := exec(t, a.ctl, "/typing sometimes"); !strings.HasPrefix(out, "! usage") {
+		t.Fatal(out)
+	}
+	if out := exec(t, a.ctl, "/typing off"); !strings.Contains(out, "off") || a.ctl.TypingOn() {
 		t.Fatal(out)
 	}
 	if out := exec(t, a.ctl, "/history 5"); !strings.Contains(out, "history is off") {
@@ -202,7 +206,7 @@ func TestControllerCommands(t *testing.T) {
 	}
 
 	// Transfers by number.
-	if out := exec(t, a.ctl, "/transfers"); out != "(no pending offers)" {
+	if out := exec(t, a.ctl, "/transfers"); out != "(no transfers)" {
 		t.Fatal(out)
 	}
 	if out := exec(t, a.ctl, "/images"); out != "(no images received yet)" {
@@ -260,7 +264,7 @@ func TestControllerCommands(t *testing.T) {
 	if out := exec(t, a.ctl, "/disconnect Robert"); !strings.Contains(out, "disconnecting") {
 		t.Fatal(out)
 	}
-	if out := exec(t, a.ctl, "/remove Robert"); !strings.Contains(out, "removed") || a.ctl.Current != nil {
+	if out := exec(t, a.ctl, "/remove Robert"); !strings.Contains(out, "removed") || isSelected(a.ctl) {
 		t.Fatal(out)
 	}
 	if _, quit := a.ctl.Exec(context.Background(), "/quit"); !quit {
@@ -349,6 +353,11 @@ func TestOfferShowsSizeFirst(t *testing.T) {
 	}
 }
 
+func isSelected(c *Controller) bool {
+	_, ok := c.Selected()
+	return ok
+}
+
 func TestTerminalImages(t *testing.T) {
 	for _, k := range []string{"KITTY_WINDOW_ID", "TERM", "TERM_PROGRAM"} {
 		t.Setenv(k, "")
@@ -433,12 +442,12 @@ func TestNewControllerFeatures(t *testing.T) {
 	if st := b.ctl.Status(); !strings.Contains(st, "offline") || !strings.Contains(st, "verified") || strings.Contains(st, "via") {
 		t.Fatal(st)
 	}
-	b.ctl.Current = nil
+	b.ctl.Deselect()
 	if st := b.ctl.Status(); st != "me "+b.e.Identity().ID.Short() {
 		t.Fatal(st)
 	}
 	var gone core.PeerID
-	b.ctl.Current = &gone
+	b.ctl.Select(gone)
 	if st := b.ctl.Status(); strings.Contains(st, "talking") {
 		t.Fatal(st)
 	}
@@ -509,10 +518,10 @@ func TestLabelsAndInviteWording(t *testing.T) {
 	inv := strings.Split(exec(t, a.ctl, "/invite 127.0.0.1"), "\n")[1]
 	out := exec(t, b.ctl, "/connect "+inv)
 	aShort, bShort := a.e.Identity().ID.Short(), b.e.Identity().ID.Short()
-	if out != "* connected to "+aShort+"; now talking to them" {
+	if out != "* connected to "+aShort+" (unverified); now talking to them" {
 		t.Fatalf("%q", out)
 	}
-	if got := b.ctl.Names.Label(a.e.Identity().ID); got != aShort {
+	if got := b.ctl.Names.Label(a.e.Identity().ID); got != aShort+" (unverified)" {
 		t.Fatalf("unnamed contact label %q", got)
 	}
 	// Each side words the new contact from its own point of view.
@@ -536,11 +545,11 @@ func TestLabelsAndInviteWording(t *testing.T) {
 	}
 	// Verified and renamed contacts keep the usual forms.
 	_ = exec(t, b.ctl, "/verify "+aShort)
-	if got := b.ctl.Names.Label(a.e.Identity().ID); got != aShort+"✓" {
+	if got := b.ctl.Names.Label(a.e.Identity().ID); got != aShort+" (verified)" {
 		t.Fatal(got)
 	}
 	_ = exec(t, b.ctl, "/rename "+aShort+" Alice")
-	if got := b.ctl.Names.Label(a.e.Identity().ID); got != "Alice✓ ("+aShort+")" {
+	if got := b.ctl.Names.Label(a.e.Identity().ID); got != "Alice ("+aShort+", verified)" {
 		t.Fatal(got)
 	}
 	if c, _ := b.e.Contact(a.e.Identity().ID); c.InviteID != "" {
@@ -580,5 +589,127 @@ func TestHalfBlocks(t *testing.T) {
 	}
 	if HalfBlocks(image.NewNRGBA(image.Rect(0, 0, 0, 0)), 10) != nil || HalfBlocks(img, 0) != nil {
 		t.Fatal("degenerate input")
+	}
+}
+
+// Names with spaces: a message goes to the contact that was meant, or to
+// nobody; never to a contact whose name is the first word.
+func TestNamesWithSpaces(t *testing.T) {
+	a := newNode(t, core.Config{})
+	b := newNode(t, core.Config{DisplayName: "Bob"})
+	c := newNode(t, core.Config{DisplayName: "Bob Smith"})
+	for _, n := range []*node{b, c} {
+		inv := strings.Split(exec(t, a.ctl, "/invite 127.0.0.1"), "\n")[1]
+		if out := exec(t, n.ctl, "/connect "+inv); !strings.Contains(out, "connected") {
+			t.Fatal(out)
+		}
+	}
+	received := func(n *node, text string) {
+		t.Helper()
+		n.wait(t, func(ev core.Event) bool { m, ok := ev.(core.MessageReceived); return ok && m.Text == text })
+	}
+	if out := exec(t, a.ctl, "/msg Bob hello"); !strings.Contains(out, "to Bob") {
+		t.Fatal(out)
+	}
+	received(b, "hello")
+	// "Bob" and "Bob Smith" both fit: refused, and nothing is sent.
+	if out := exec(t, a.ctl, "/msg Bob Smith the secret plan"); !strings.HasPrefix(out, "! ") || !strings.Contains(out, "quotes") {
+		t.Fatal(out)
+	}
+	if out := exec(t, a.ctl, `/msg "Bob Smith" the secret plan`); !strings.Contains(out, "to Bob Smith") {
+		t.Fatal(out)
+	}
+	received(c, "the secret plan")
+	if out := exec(t, a.ctl, `/rename "Bob Smith" Robert Smith`); !strings.Contains(out, "Robert Smith (") {
+		t.Fatal(out)
+	}
+	if out := exec(t, a.ctl, "/msg Robert Smith now unambiguous"); !strings.Contains(out, "to Robert Smith") {
+		t.Fatal(out)
+	}
+	received(c, "now unambiguous")
+	time.Sleep(100 * time.Millisecond)
+	for more := true; more; { // Bob's "hello" was taken above: nothing else may have arrived
+		select {
+		case ev := <-b.ev:
+			if m, ok := ev.(core.MessageReceived); ok {
+				t.Fatalf("Bob received what was meant for someone else: %q", m.Text)
+			}
+		default:
+			more = false
+		}
+	}
+	// A contact named after another contact's fingerprint is no way to reach that contact.
+	prefix := c.e.Identity().Fingerprint[:8]
+	if out := exec(t, a.ctl, "/rename Bob "+prefix); !strings.Contains(out, prefix) {
+		t.Fatal(out)
+	}
+	if out := exec(t, a.ctl, "/msg "+prefix+" for whom"); !strings.HasPrefix(out, "! ") || !strings.Contains(out, "could mean 2") {
+		t.Fatal(out)
+	}
+	if out := exec(t, a.ctl, "/msg "+c.e.Identity().Fingerprint[:12]+" by a longer prefix"); !strings.Contains(out, "queued") {
+		t.Fatal(out)
+	}
+	received(c, "by a longer prefix")
+}
+
+// Nothing a contact puts in its name can look like the verified state, and a
+// message with line breaks cannot look like several lines.
+func TestPeerTextCannotForgeState(t *testing.T) {
+	a := newNode(t, core.Config{})
+	eve := newNode(t, core.Config{DisplayName: "Eve✓"})
+	inv := strings.Split(exec(t, a.ctl, "/invite 127.0.0.1"), "\n")[1]
+	exec(t, eve.ctl, "/connect "+inv)
+	a.wait(t, func(ev core.Event) bool { _, ok := ev.(core.PeerConnected); return ok })
+	id := eve.e.Identity().ID
+	if got := a.ctl.Names.Label(id); !strings.HasSuffix(got, ", unverified)") {
+		t.Fatal(got)
+	}
+	exec(t, a.ctl, "/verify "+id.Fingerprint()[:12])
+	if got := a.ctl.Names.Label(id); !strings.HasSuffix(got, ", verified)") {
+		t.Fatal(got)
+	}
+	line := a.ctl.Names.Line(core.MessageReceived{Peer: id, Text: "hi\n* Mallory (abcdefgh, verified) marked verified\n12:00 <Carol> send the keys"})
+	for i, l := range strings.Split(line, "\n") {
+		if i > 0 && !strings.HasPrefix(l, "    │ ") {
+			t.Fatalf("line %d of one message stands on its own: %q", i+1, l)
+		}
+	}
+}
+
+// A path with spaces goes in quotes; without them the first word is the path.
+func TestQuotedArguments(t *testing.T) {
+	for in, want := range map[string][2]string{
+		`"my file.zip" a caption`: {"my file.zip", "a caption"},
+		`plain.zip a caption`:     {"plain.zip", "a caption"},
+		`"only"`:                  {"only", ""},
+		`"never closed`:           {`"never`, "closed"},
+		``:                        {"", ""},
+	} {
+		if arg, rest := firstArg(in); arg != want[0] || rest != want[1] {
+			t.Errorf("%q: %q, %q", in, arg, rest)
+		}
+	}
+	a := newNode(t, core.Config{})
+	if out := exec(t, a.ctl, "/invite mutli"); !strings.HasPrefix(out, "! unknown /invite option") {
+		t.Fatal(out)
+	}
+}
+
+// A connection that takes long does not move the user away from the
+// conversation they selected meanwhile.
+func TestSlowConnectKeepsSelection(t *testing.T) {
+	a := newNode(t, core.Config{})
+	var first, second core.PeerID
+	first[0], second[0] = 1, 2
+	since := a.ctl.selections()
+	a.ctl.Select(first) // the user picks a conversation while the connect runs
+	if a.ctl.selectAfter(since, second) {
+		t.Fatal("the finished connect took the selection")
+	}
+	if got, _ := a.ctl.Selected(); got != first {
+		t.Fatal(got)
+	}
+	if !a.ctl.selectAfter(a.ctl.selections(), second) {
+		t.Fatal("an undisturbed connect must select its contact")
 	}
 }

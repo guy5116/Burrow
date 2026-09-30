@@ -137,19 +137,67 @@ func (t *streamTable) count(outgoing bool, st streamState) int {
 
 // OpenStream allocates a stream id for an outgoing offer (§4.3 parity rule).
 func (s *Session) OpenStream(size uint64) (uint16, error) {
-	t := s.streams
-	t.mu.Lock()
-	defer t.mu.Unlock()
+	s.streams.mu.Lock()
+	defer s.streams.mu.Unlock()
+	st, err := s.streams.allocate(size)
+	if err != nil {
+		return 0, err
+	}
+	return st.id, nil
+}
+
+// allocate opens the next outgoing stream. Caller holds the table mutex.
+func (t *streamTable) allocate(size uint64) (*stream, error) {
 	if t.nextID > 0xFFFF {
-		return 0, ErrStreamsExhaust
+		return nil, ErrStreamsExhaust
 	}
 	if t.count(true, stOffered) >= wire.MaxPendingOffers {
+		return nil, ErrStreamLimit
+	}
+	st := newStream(uint16(t.nextID), true, size) // #nosec G115 -- checked above
+	t.nextID += 2
+	t.open[st.id] = st
+	return st, nil
+}
+
+// Offer opens a stream for a transfer of size bytes and queues its offer
+// (an IMG_OFFER or FILE_OFFER payload) in one step, so that offers reach the
+// peer in the order of their ids however many transfers start at once: the
+// peer refuses an id below one it has seen. It never blocks.
+func (s *Session) Offer(typ wire.FrameType, size uint64, payload []byte) (uint16, error) {
+	if typ != wire.TypeImgOffer && typ != wire.TypeFileOffer {
+		return 0, wire.ErrStream
+	}
+	if !s.ready.Load() {
+		return 0, ErrNotReady
+	}
+	s.streams.mu.Lock()
+	defer s.streams.mu.Unlock()
+	st, err := s.streams.allocate(size)
+	if err != nil {
+		return 0, err
+	}
+	if !s.queueOfferLocked(st, outFrame{typ: typ, stream: st.id, payload: append([]byte(nil), payload...)}) {
+		delete(s.streams.open, st.id) // nothing was sent: the id is free again
+		s.streams.nextID -= 2
 		return 0, ErrStreamLimit
 	}
-	id := uint16(t.nextID) // #nosec G115 -- checked above
-	t.nextID += 2
-	t.open[id] = newStream(id, true, size)
-	return id, nil
+	return st.id, nil
+}
+
+// queueOfferLocked puts a stream's offer in line for the writer. The line has
+// room for every pending offer; it can only be full while the writer has yet
+// to send offers of streams that were cancelled right after. Waiting for room
+// is not an option under the table mutex, so the caller is told instead.
+func (s *Session) queueOfferLocked(st *stream, f outFrame) bool {
+	select {
+	case s.offers <- f:
+		st.offerSent = true
+		s.wakeWriter()
+		return true
+	default:
+		return false
+	}
 }
 
 func chunksFor(size uint64) uint32 {
@@ -213,7 +261,12 @@ func (s *Session) sendStream(ctx context.Context, f outFrame) error {
 			t.mu.Unlock()
 			return ErrStreamState
 		}
-		st.offerSent = true
+		queued := s.queueOfferLocked(st, f) // like Offer; the stream was opened by OpenStream
+		t.mu.Unlock()
+		if !queued {
+			return ErrStreamLimit
+		}
+		return nil
 	case wire.TypeImgAccept:
 		if st.outgoing || st.state != stOffered {
 			t.mu.Unlock()
@@ -318,6 +371,11 @@ type rrEntry struct {
 // streams in id order starting after the one served last, or returns false
 // when none is ready. Called by the writer only.
 func (s *Session) nextTransferFrame() (outFrame, bool) {
+	select {
+	case f := <-s.offers: // offers first, in the order of their ids
+		return f, true
+	default:
+	}
 	t := s.streams
 	t.mu.Lock()
 	s.rr = s.rr[:0]

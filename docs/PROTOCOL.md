@@ -42,7 +42,8 @@ length. Any other length → close without writing.
 `has_token` is 0 or 1; when 0, `token` must be all zeros. After msg3 the responder calls
 its authorization policy (known contact → ok; unknown with a valid invite token → ok and
 the token is reserved; otherwise close silently). The responder also rejects msg1 whose
-ephemeral public key was seen in the last 4096 handshakes, before any DH.
+ephemeral public key is among the last 4096 that verified, before any DH. A key is
+recorded only once its msg1 has verified, so garbage cannot push recorded keys out.
 
 Root key derivation (both sides), `h = ChannelBinding()`:
 
@@ -185,12 +186,16 @@ Per-stream states: `Offered → Accepted → Transferring → Done | Draining �
   IMG_CANCEL and closes. The first sender of a CANCEL enters draining and discards every
   frame on the stream until a terminal frame arrives. A CANCEL on one of the last 64
   closed ids is ignored; any other frame on a closed or unknown id closes the session.
+  A terminal frame is decoded wherever it arrives: a malformed one closes the session on
+  a draining or recently closed stream too.
+- A stream whose offer was never sent is unknown to the peer: cancelling it sends nothing.
 - Limits per peer and direction: 4 pending offers, 2 active transfers (a further offer is
   answered with IMG_REJECT reason 3 and no user-visible event), 32 busy rejects in 10
-  minutes → close, 16 offers in 60 s → close, 16 draining streams, 32 TYPING frames in
-  60 s (further ones are dropped).
-- Writer priority: control > chat > transfer; concurrent transfers are round-robined and
-  every control or chat frame is flushed immediately.
+  minutes → close, 16 offers in 60 s → close, 16 draining streams (a 17th cancel that
+  would exceed it closes the session), 32 TYPING frames in 60 s (further ones are
+  dropped).
+- Writer priority: control > chat > transfer; concurrent transfers take turns in stream id
+  order, and every control or chat frame is flushed immediately.
 
 ### 6.4 Text handling
 

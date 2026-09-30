@@ -91,7 +91,12 @@ like an e-mail attachment from a stranger.
   path-specific HKDF key, so a blob copied to another name fails to open.
 - On Unix, directories are `0700` and files `0600`. On Windows we rely on the per-user
   profile ACL of `%APPDATA%`; no explicit ACLs are set.
-- One process at a time: `flock` on Unix, an exclusive open on Windows.
+- One process at a time: `flock` on Unix, an exclusive open on Windows, on
+  `<data>/store.lock`. The lock is taken before anything in the data directory is
+  touched, and is held across a passphrase change. A second process changes nothing,
+  not even leftovers of an interrupted change.
+- A store that was closed refuses every operation. It never encrypts with the wiped
+  (all-zero) key.
 
 ## Locked memory for the identity key (`-tags memguard`)
 
@@ -117,15 +122,22 @@ built by `make release` are the default build; the memguard build is opt-in.
 
 The Tor transport's ed25519 key is generated with `crypto/rand`, stored inside the
 encrypted identity blob (blob version 2) and handed to tor over the control port with
-`ADD_ONION` at startup. Tor runs with a temporary data directory that is deleted on close;
-the key never lands there. Rotating identity therefore also rotates the onion address.
+`ADD_ONION` at startup. Tor runs with a temporary data directory under `<data>/tor/`
+that is deleted on close, and whatever a crash left there is deleted at the next start;
+the key never lands there. Our copy of the key is wiped when the transport closes; the
+copy inside the control library stays until it is collected. Tor's own output is
+discarded. Rotating identity therefore also rotates the onion address.
+
+**Not verified:** the Tor transport has never run against a real tor on the development
+machine (no tor binary). Its start-up logic is covered by a test with a stand-in.
 
 ## LAN discovery
 
 mDNS is off by default. When on, an instance announces a random per-session name, its
 port and `nonce || BLAKE2b-256("burrow/1 mdns" || nonce || pubkey)[:16]` every 30 s.
-Recognizing a contact costs one hash per stored contact; nobody is probed. Anyone on the
-LAN learns that some Burrow instance is present, not which one.
+Recognizing a contact costs one hash per stored contact, once per announcement nonce;
+at most 20 announcements per second are looked at. Nobody is probed. Anyone on the LAN
+learns that some Burrow instance is present, not which one.
 
 ## Reconnect beacons
 

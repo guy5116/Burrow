@@ -209,8 +209,30 @@ func decode16(s string, dst *[16]byte) bool {
 	return true
 }
 
+// browseBudget is how many announcements per second Browse passes on. The
+// rest are dropped: a host that floods the LAN must not keep the engine busy.
+const browseBudget = 20
+
+// budget is a counter that refills once a second.
+type budget struct {
+	mu     sync.Mutex
+	second int64
+	used   int
+}
+
+func (b *budget) take(now time.Time) bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if s := now.Unix(); s != b.second {
+		b.second, b.used = s, 0
+	}
+	b.used++
+	return b.used <= browseBudget
+}
+
 // Browse delivers announcements from other instances on every available
-// family until ctx ends. It fails only when no family can be joined.
+// family until ctx ends, one call of fn at a time. It fails only when no
+// family can be joined.
 func Browse(ctx context.Context, fn func(Announcement)) error {
 	var conns []*net.UDPConn
 	var firstErr error
@@ -230,25 +252,27 @@ func Browse(ctx context.Context, fn func(Announcement)) error {
 	if len(conns) == 0 {
 		return firstErr
 	}
-	go func() {
-		<-ctx.Done()
+	stop := context.AfterFunc(ctx, func() {
 		for _, c := range conns {
 			_ = c.Close()
 		}
-	}()
+	})
+	defer stop()
 	var mu sync.Mutex
 	var wg sync.WaitGroup
+	var limit budget
 	for _, conn := range conns {
 		wg.Add(1)
 		go func(conn *net.UDPConn) {
 			defer wg.Done()
+			defer func() { _ = conn.Close() }()
 			buf := make([]byte, 9000)
 			for {
 				n, src, err := conn.ReadFromUDP(buf)
 				if err != nil {
 					return
 				}
-				if an, ok := Parse(buf[:n], src.IP); ok {
+				if an, ok := Parse(buf[:n], src.IP); ok && limit.take(time.Now()) {
 					mu.Lock()
 					fn(an)
 					mu.Unlock()

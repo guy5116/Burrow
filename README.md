@@ -210,16 +210,26 @@ are commands.
 | Type this | What happens |
 |---|---|
 | `/help` | Shows every command |
-| `/contacts` | Lists your contacts. `*` means online, `✓` means verified |
+| `/contacts` | Lists your contacts. `*` means online. Each line ends in `verified` or `unverified` |
 | `/to Alice` | Switches the conversation to Alice |
+| `/msg Alice hello` | Sends to Alice without switching |
 | `/image photo.jpg` | Offers a picture to the current contact |
 | `/file backup.zip` | Offers any file to the current contact |
-| `/accept 1` or `/reject 1` | Answers a picture someone offered you |
+| `/accept 1` or `/reject 1` | Answers a picture or file someone offered you |
+| `/cancel 1` | Stops a transfer you are sending or receiving |
 | `/safety Alice` | Shows the safety number for Alice |
 | `/verify Alice` | Marks Alice as verified |
 | `/rename Alice Ali` | Gives a contact a nickname of your choice |
 | `/invite` | Creates an invite without leaving the chat |
 | `/quit` | Leaves |
+
+A name or a path with spaces goes in quotes: `/msg "Bob Smith" hello` or
+`/file "my holiday.zip"`. If a name could mean two contacts, Burrow refuses and asks
+you to be more specific. It never guesses who a message is for.
+
+In the contact list, `✓` or `?` before a name shows whether you have verified that
+contact. It stands before the name on purpose: a contact chooses their own name, and a
+check mark inside a name means nothing.
 
 Keys: **Enter** sends, **Tab** switches between contacts, **Page Up** and
 **Page Down** scroll.

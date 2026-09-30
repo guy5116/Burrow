@@ -369,8 +369,9 @@ Config    = noise.Config{CipherSuite: Suite, Pattern: noise.HandshakeXK, Initiat
 Initiator                                              Responder
   gen e_i ; kem_seed = 64 random bytes ; kem_dk = mlkem.NewDecapsulationKey768(kem_seed)
   msg1: -> e, es        payload HS1 { kem_ek [1184] }                         (1232 bytes on the wire)
-                                                         e_i.pub already in the msg1-replay LRU (last 4096 seen)? → close before any DH
+                                                         e_i.pub already in the msg1-replay LRU (last 4096 verified)? → close before any DH
                                                          ReadMessage verifies msg1 (one DH + AEAD); failure → close
+                                                         record e_i.pub in the LRU (only now: garbage must not evict real entries)
                                                          kem_ek = mlkem.NewEncapsulationKey768(...) ; error → close
                                                          gen e_r ; (kem_ss, kem_ct) = kem_ek.Encapsulate()
                                                          r_r = 32 random bytes
@@ -741,6 +742,11 @@ rejected at offer time.
 1. Sniff magic bytes; reject if they disagree with the extension or are unsupported. Apply
    §6.1.
 2. **Apply EXIF orientation, then strip metadata** (`strip` mode, default, lossless):
+   - Kept blocks are kept only in their one legal shape, so nothing can ride along under
+     their name: APP14 only as the 12-byte Adobe segment, PNG `gAMA` with 4 and `sRGB`
+     with 1 byte, the GIF graphic control block with its single 4-byte sub-block, the
+     NETSCAPE2.0 block with its loop count only. No length field found in a file decides
+     an allocation.
    - JPEG: keep SOI, a rewritten minimal 16-byte APP0/JFIF (no thumbnail), APP14 (Adobe
      transform flag — needed for correct colors, carries nothing identifying), DQT, DHT,
      SOF*, DRI, SOS + scan data, EOI. Drop APP1 (EXIF/XMP), APP2 (ICC), APP13
@@ -748,7 +754,8 @@ rejected at offer time.
    - PNG: keep IHDR, PLTE, tRNS, gAMA, sRGB, IDAT, IEND. Drop tEXt/zTXt/iTXt/tIME/eXIf/
      iCCP/pHYs and every other ancillary chunk. Validate chunk lengths and CRCs while
      walking; recompute CRCs on output.
-   - WebP: drop EXIF, XMP, ICCP chunks; clear the matching VP8X flag bits; rewrite RIFF sizes.
+   - WebP: keep VP8, VP8L, VP8X, ALPH; drop EXIF, XMP, ICCP **and every chunk we do not
+     know**; clear the matching VP8X flag bits; rewrite RIFF sizes.
    - GIF: drop comment, plain-text, and application extension blocks except NETSCAPE2.0
      looping; drop anything after the trailer.
    - If orientation ≠ 1 the image is fully decoded (bounded by §6.1) and re-encoded:
@@ -762,8 +769,9 @@ rejected at offer time.
 3. Stripping is **deterministic** and runs twice so the whole file is never held in memory
    in strip mode and nothing is written to disk: pass 1 strips → streams into BLAKE2b-256
    → discards, recording `size` and the hash for the offer; pass 2 strips again while
-   chunking; if the running hash diverges at the end → `IMG_CANCEL reason=1` +
-   `TransferFailed`.
+   chunking; if the output stops matching pass 1 → `IMG_CANCEL reason=1` +
+   `TransferFailed`. Pass 2 never emits a chunk the offer did not announce: divergence is
+   detected before a chunk of the wrong shape is sent.
 4. Progress events are throttled to at most 4 per second.
 5. Default size limit 25 MiB; the effective limit is the min of both peers' `max_image`.
 
@@ -835,8 +843,13 @@ anything. Added on 2026-09-29 at the user's request.
   (`%APPDATA%\burrow` on Windows, `~/Library/Application Support/burrow` on macOS).
   Directories `0700`, files `0600` on Unix; on Windows rely on the per-user profile ACL and
   say so in `docs/SECURITY.md`.
-- **One process at a time.** On unlock, take an exclusive lock on `<data>/store/lock`
-  (`flock` on Unix, exclusive open on Windows); a second process fails with "store in use".
+- **One process at a time.** Before anything under `<data>/` is read or changed, take an
+  exclusive lock on `<data>/store.lock` (`flock` on Unix, exclusive open on Windows); a
+  second process fails with "store in use" and touches nothing, recovery included. The
+  lock stands beside `store/`, not inside it, so it is held across the directory swap
+  below (changed on 2026-09-29 after review: a lock inside `store/` moves away with the
+  first rename, and Windows cannot rename a directory that holds an open file). A
+  `store/lock` held by a process of an older version is still honoured.
 - Config is TOML (`config.toml`, nothing secret in it). Everything else lives under
   `<data>/store/`:
   - `master.hdr` (plaintext): `magic "BRWM" || version u8 || mode u8 (1 passphrase, 2 none) || argon2 t u32, m u32 (KiB), p u8 || salt[16]`.
@@ -857,8 +870,8 @@ anything. Added on 2026-09-29 at the user's request.
 - All single-file writes are atomic: temp file in the same directory, `fsync`, rename,
   `fsync` the directory (Unix).
 - **Passphrase change / mode change** (`burrow passphrase`) is atomic across files: write a
-  complete `store.new/` (new header, `master.key` if mode 2, every blob re-encrypted, a
-  fresh `lock`), fsync everything, rename
+  complete `store.new/` (new header, `master.key` if mode 2, every blob re-encrypted),
+  fsync everything, rename
   `store/` → `store.old/`, rename `store.new/` → `store/`, delete `store.old/`. Startup
   recovery, in this order: `store.new/` and `store.old/` present but no `store/` → the new
   store was complete before the first rename, so roll forward (rename `store.new/` →
@@ -867,6 +880,10 @@ anything. Added on 2026-09-29 at the user's request.
   delete `store.old/`; only `store.old/` present → rename it back. `burrow init` refuses
   to run while any of `store/`, `store.new/`, `store.old/` exists; every other command,
   once recovery has run and no `store/` exists, exits with "run `burrow init` first".
+  Nothing else reads or writes the store during the change. If a rename fails while the
+  process lives on, the old store is put back; if that fails too, the store closes itself
+  and every later operation fails, so that recovery at the next start finds a state it
+  knows. A blob write never creates `store/`.
 - **No message history by default.** Optional encrypted history (Phase 4) uses the same
   blob format in opaque numbered segment files with an encrypted index (filenames leak
   nothing about days); off by default; `burn` wipes it.
@@ -980,7 +997,12 @@ session/core boundary before it can exist as a Go string:
   U+2060–U+2064, U+FEFF, U+061C, U+180E; tag characters U+E0000–U+E007F;
 - U+200C/U+200D (ZWNJ/ZWJ) are **kept** in TEXT and captions (emoji sequences, Persian,
   Hindi) with runs capped at 2, and removed from display names;
-- runs of combining marks (categories Mn/Me) are capped at 4 per base character;
+- runs of combining marks (categories Mn/Me) are capped at 4 per base character; a joiner
+  is no base character and does not start a new run, and a dropped mark does not end a
+  run of joiners;
+- both UIs state verification in a place a name cannot reach (after the fingerprint, or
+  in a column before the name), and show the lines of a message after the first with a
+  gutter, so that neither a name nor a message can imitate the UI;
 - in single-line fields (names, captions) `\n` and `\t` become a space;
 - the terminal never receives peer bytes directly — only the sanitized string, and only
   through the TUI's rendering layer (never `fmt.Print` of peer content).

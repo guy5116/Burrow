@@ -2,14 +2,14 @@
 package tui
 
 import (
-	"bufio"
 	"context"
 	"fmt"
 	"net"
-	"os"
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
+	"unicode/utf8"
 
 	"charm.land/bubbles/v2/textinput"
 	"charm.land/bubbles/v2/viewport"
@@ -24,12 +24,31 @@ import (
 const Keys = `keys: enter send · tab/shift+tab next/previous contact · pgup/pgdn scroll · ctrl+c quit`
 
 type evMsg struct{ ev core.Event }
+
+// outMsg is the result of a queued command.
 type outMsg struct {
 	lines []string
 	quit  bool
 }
 
-const sidebarWidth = 26
+// noteMsg is a line for the system notes from anything that is not a command.
+type noteMsg string
+
+const (
+	sidebarWidth = 26
+	// maxLines bounds what is kept per conversation and of the system notes.
+	// A contact can send without end; the oldest lines go first.
+	maxLines = 5000
+)
+
+// keep appends to a log and drops its oldest lines beyond maxLines.
+func keep(log []string, lines ...string) []string {
+	log = append(log, lines...)
+	if over := len(log) - maxLines; over > 0 {
+		log = append(log[:0], log[over:]...)
+	}
+	return log
+}
 
 var (
 	dim    = lipgloss.NewStyle().Faint(true)
@@ -39,20 +58,58 @@ var (
 )
 
 type model struct {
-	ctx        context.Context
-	ctl        *common.Controller
-	target     core.Target
-	addrs      string
-	contacts   []core.Contact
-	logs       map[core.PeerID][]string
-	system     []string
-	vp         viewport.Model
-	in         textinput.Model
-	w, h       int
-	busy       bool
-	prog       *tea.Program
-	showInline func()
-	nextImage  uint8 // Kitty image ids 1–255, reused in a cycle
+	ctx       context.Context
+	ctl       *common.Controller
+	target    core.Target
+	addrs     string
+	contacts  []core.Contact
+	logs      map[core.PeerID][]string
+	system    []string
+	vp        viewport.Model
+	in        textinput.Model
+	w, h      int
+	busy      int // commands still running
+	order     inOrder
+	typingTo  *core.PeerID // the contact who was last told that we are typing
+	nextImage uint8        // Kitty image ids 1–255, reused in a cycle
+}
+
+// inOrder runs functions on their own goroutines, one at a time, in the order
+// their tickets were drawn. Bubble Tea runs every command on a goroutine of
+// its own; without this, two messages sent in quick succession could leave in
+// the wrong order.
+type inOrder struct {
+	mu      sync.Mutex
+	turn    *sync.Cond
+	drawn   uint64
+	serving uint64
+}
+
+// ticket reserves the next place in the queue. Call it from Update.
+func (o *inOrder) ticket() uint64 {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if o.turn == nil {
+		o.turn = sync.NewCond(&o.mu)
+	}
+	o.drawn++
+	return o.drawn - 1
+}
+
+// run waits for ticket n's turn, runs fn, and lets the next one go.
+func (o *inOrder) run(n uint64, fn func()) {
+	o.mu.Lock()
+	for o.serving != n {
+		o.turn.Wait()
+	}
+	o.mu.Unlock()
+	defer func() {
+		o.mu.Lock()
+		o.serving++
+		o.mu.Unlock()
+		o.turn.Broadcast()
+	}()
+	fn()
 }
 
 // Run starts the TUI and blocks until it exits.
@@ -72,7 +129,6 @@ func run(ctx context.Context, ctl *common.Controller, target core.Target, addrs 
 		vp: viewport.New(), in: in}
 	m.refreshContacts()
 	p := tea.NewProgram(m, opts...)
-	m.prog = p
 	go func() {
 		for {
 			select {
@@ -95,7 +151,7 @@ func (m *model) Init() tea.Cmd {
 	if m.target.InviteBytes != nil {
 		inv := m.target.InviteBytes
 		m.target.InviteBytes = nil
-		cmds = append(cmds, func() tea.Msg { return outMsg{lines: m.ctl.ConnectInvite(m.ctx, inv)} })
+		cmds = append(cmds, m.queue(func() outMsg { return outMsg{lines: m.ctl.ConnectInvite(m.ctx, inv)} }))
 	} else if m.target.Invite != "" {
 		cmds = append(cmds, m.exec("/connect "+m.target.Invite))
 	} else if m.target.Name != "" {
@@ -108,9 +164,20 @@ func (m *model) Init() tea.Cmd {
 
 // exec runs a controller command off the render thread.
 func (m *model) exec(line string) tea.Cmd {
-	return func() tea.Msg {
+	return m.queue(func() outMsg {
 		out, quit := m.ctl.Exec(m.ctx, line)
 		return outMsg{lines: out, quit: quit}
+	})
+}
+
+// queue runs fn off the render thread, after every command queued before it.
+func (m *model) queue(fn func() outMsg) tea.Cmd {
+	m.busy++
+	n := m.order.ticket()
+	return func() tea.Msg {
+		var out outMsg
+		m.order.run(n, func() { out = fn() })
+		return out
 	}
 }
 
@@ -124,16 +191,30 @@ func (m *model) selectOffset(d int) {
 		return
 	}
 	idx := -1
-	if m.ctl.Current != nil {
+	if current, ok := m.ctl.Selected(); ok {
 		for i, c := range m.contacts {
-			if c.ID == *m.ctl.Current {
+			if c.ID == current {
 				idx = i
 			}
 		}
 	}
 	idx = ((idx+d)%len(m.contacts) + len(m.contacts)) % len(m.contacts)
-	id := m.contacts[idx].ID
-	m.ctl.Current = &id
+	m.typing(false)
+	m.ctl.Select(m.contacts[idx].ID)
+}
+
+// typing tells the selected contact that we started or stopped typing, once
+// per change, and only when typing indicators are on.
+func (m *model) typing(now bool) {
+	current, selected := m.ctl.Selected()
+	switch {
+	case now && m.typingTo == nil && selected && m.ctl.TypingOn():
+		m.ctl.E.SetTyping(current, true)
+		m.typingTo = &current
+	case !now && m.typingTo != nil:
+		m.ctl.E.SetTyping(*m.typingTo, false)
+		m.typingTo = nil
+	}
 }
 
 func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -156,6 +237,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "enter":
 			line := m.in.Value()
 			m.in.Reset()
+			m.typing(false)
 			if strings.TrimSpace(line) == "" {
 				return m, nil
 			}
@@ -165,42 +247,39 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if strings.HasPrefix(line, "/view") {
 				return m, m.view(strings.TrimSpace(strings.TrimPrefix(line, "/view")))
 			}
-			m.busy = true
+			if current, ok := m.ctl.Selected(); ok && !strings.HasPrefix(line, "/") {
+				m.logs[current] = keep(m.logs[current], "<me> "+common.Body(line)) // what was said, not only that it was queued
+			}
 			return m, m.exec(line)
 		default:
 			var cmd tea.Cmd
 			m.in, cmd = m.in.Update(msg)
-			if m.ctl.Typing && m.ctl.Current != nil && msg.Text != "" {
-				m.ctl.E.SetTyping(*m.ctl.Current, true)
-			}
+			m.typing(m.in.Value() != "" && !strings.HasPrefix(m.in.Value(), "/"))
 			return m, cmd
 		}
-	case viewMsg:
-		if m.showInline != nil && m.prog != nil {
-			show := m.showInline
-			m.showInline = nil
-			_ = m.prog.ReleaseTerminal()
-			show()
-			_ = m.prog.RestoreTerminal()
-		}
-		return m, nil
+	case noteMsg:
+		m.system = keep(m.system, string(msg))
 	case outMsg:
-		m.busy = false
+		m.busy--
 		if msg.quit {
 			return m, tea.Quit
 		}
-		m.system = append(m.system, msg.lines...)
+		m.system = keep(m.system, msg.lines...)
 		m.refreshContacts()
 	case evMsg:
 		m.ctl.Observe(msg.ev)
 		m.onEvent(msg.ev)
 		if d, ok := msg.ev.(core.TransferDone); ok && d.Image && !d.Peer.Outgoing && common.DetectTerminal() != common.TermNone {
 			m.render()
-			return m, m.inline(d.Peer.Peer, d.Path, common.DetectTerminal())
+			return m, m.inline(&d.Peer.Peer, d.Path, common.DetectTerminal(), thumbCols)
 		}
 	case inlineMsg:
 		// The placeholder rows scroll with the conversation; the upload goes out raw, once.
-		m.logs[msg.peer] = append(m.logs[msg.peer], msg.img.Lines...)
+		if msg.peer == nil {
+			m.system = keep(m.system, msg.img.Lines...)
+		} else {
+			m.logs[*msg.peer] = keep(m.logs[*msg.peer], msg.img.Lines...)
+		}
 		m.render()
 		if msg.img.Transmit == "" {
 			return m, nil // half-block preview: nothing to upload
@@ -219,41 +298,40 @@ func (m *model) onEvent(ev core.Event) {
 	line := m.ctl.Names.Line(ev)
 	switch e := ev.(type) {
 	case core.MessageReceived:
-		m.logs[e.Peer] = append(m.logs[e.Peer], line)
+		m.logs[e.Peer] = keep(m.logs[e.Peer], line)
 	case core.MessageStatus:
 		if e.Status == core.StatusPending || e.Status == core.StatusFailed {
-			m.logs[e.Peer] = append(m.logs[e.Peer], dim.Render(line))
+			m.logs[e.Peer] = keep(m.logs[e.Peer], dim.Render(line))
 		}
 	case core.Typing:
 		if line != "" {
-			m.logs[e.Peer] = append(m.logs[e.Peer], dim.Render(line))
+			m.logs[e.Peer] = keep(m.logs[e.Peer], dim.Render(line))
 		}
 	case core.ImageOffered:
-		m.logs[e.Peer] = append(m.logs[e.Peer], bold.Render(fmt.Sprintf("* offer #%d, %s%s — /accept %d or /reject %d",
+		m.logs[e.Peer] = keep(m.logs[e.Peer], bold.Render(fmt.Sprintf("* offer #%d, %s%s — /accept %d or /reject %d",
 			m.ctl.Number(e.ID), common.Offer(e), captionOf(e.Caption), m.ctl.Number(e.ID), m.ctl.Number(e.ID))))
 	case core.TransferDone:
 		switch {
 		case e.Peer.Outgoing:
-			m.logs[e.Peer.Peer] = append(m.logs[e.Peer.Peer], dim.Render("* "+common.Kind(e.Image)+" delivered"))
+			m.logs[e.Peer.Peer] = keep(m.logs[e.Peer.Peer], dim.Render("* "+common.Kind(e.Image)+" delivered"))
 		case !e.Image:
-			m.logs[e.Peer.Peer] = append(m.logs[e.Peer.Peer], "* file saved: "+e.Path)
+			m.logs[e.Peer.Peer] = keep(m.logs[e.Peer.Peer], "* file saved: "+e.Path)
 		default:
 			n := len(m.ctl.Images())
-			m.logs[e.Peer.Peer] = append(m.logs[e.Peer.Peer], fmt.Sprintf("* image saved: %s  (/view %d)", e.Path, n))
+			m.logs[e.Peer.Peer] = keep(m.logs[e.Peer.Peer], fmt.Sprintf("* image saved: %s  (/view %d)", e.Path, n))
 		}
 	case core.TransferFailed:
-		m.logs[e.Peer.Peer] = append(m.logs[e.Peer.Peer], alert.Render(line))
+		m.logs[e.Peer.Peer] = keep(m.logs[e.Peer.Peer], alert.Render(line))
 	case core.NameCollision, core.HandshakeFailed:
-		m.system = append(m.system, alert.Render(line))
+		m.system = keep(m.system, alert.Render(line))
 	default:
 		if line != "" {
-			m.system = append(m.system, line)
+			m.system = keep(m.system, line)
 		}
 	}
 	m.refreshContacts()
-	if m.ctl.Current == nil && len(m.contacts) == 1 {
-		id := m.contacts[0].ID
-		m.ctl.Current = &id
+	if _, selected := m.ctl.Selected(); !selected && len(m.contacts) == 1 {
+		m.ctl.Select(m.contacts[0].ID)
 	}
 }
 
@@ -274,8 +352,8 @@ func (m *model) layout() {
 
 func (m *model) render() {
 	var lines []string
-	if m.ctl.Current != nil {
-		lines = m.logs[*m.ctl.Current]
+	if current, ok := m.ctl.Selected(); ok {
+		lines = m.logs[current]
 	}
 	all := append(append([]string{}, m.system...), lines...)
 	if len(m.system) > 0 && len(lines) > 0 {
@@ -287,20 +365,19 @@ func (m *model) render() {
 
 func (m *model) View() tea.View {
 	side := []string{bold.Render("contacts")}
+	current, selected := m.ctl.Selected()
 	for _, c := range m.contacts {
-		mark := " "
+		// Presence and verification stand in two columns of their own, before
+		// the name: whatever a contact called itself cannot reach them.
+		mark, v := " ", "?"
 		if c.Online {
 			mark = "*"
 		}
-		v := " "
 		if c.Verified {
 			v = "✓"
 		}
-		label := fmt.Sprintf("%s%s %s", mark, v, c.Nickname)
-		if len(label) > sidebarWidth-1 {
-			label = label[:sidebarWidth-1]
-		}
-		if m.ctl.Current != nil && c.ID == *m.ctl.Current {
+		label := truncate(mark+v+" "+c.Nickname, sidebarWidth-1)
+		if selected && c.ID == current {
 			label = status.Render(label)
 		}
 		side = append(side, label)
@@ -308,7 +385,7 @@ func (m *model) View() tea.View {
 	sidebar := lipgloss.NewStyle().Width(sidebarWidth).Height(m.vp.Height()).Render(strings.Join(side, "\n"))
 	body := lipgloss.JoinHorizontal(lipgloss.Top, sidebar, dim.Render("│"), m.vp.View())
 	st := m.ctl.Status()
-	if m.busy {
+	if m.busy > 0 {
 		st += " · working…"
 	}
 	v := tea.NewView(strings.Join([]string{body, status.Render(padRight(st, m.w)), "> " + m.in.View()}, "\n"))
@@ -323,67 +400,66 @@ func captionOf(c string) string {
 	return fmt.Sprintf(" %q", c)
 }
 
-// view shows received image n inline when the terminal supports it. The
-// terminal is released for the duration; any key returns to the chat.
+const (
+	thumbCols = 32 // width of the preview shown when an image arrives
+	viewCols  = 72 // width of /view
+)
+
+// view shows received image n in the conversation, larger than the preview.
 func (m *model) view(arg string) tea.Cmd {
 	imgs := m.ctl.Images()
 	n, err := strconv.Atoi(arg)
 	if err != nil || n < 1 || n > len(imgs) {
-		return func() tea.Msg { return outMsg{lines: []string{"! usage: /view <n> (see /images)"}} }
+		return func() tea.Msg { return noteMsg("! usage: /view <n> (see /images)") }
 	}
 	kind := common.DetectTerminal()
 	if kind == common.TermNone {
 		return func() tea.Msg {
-			return outMsg{lines: []string{"! this terminal cannot show images inline; the file is at " + imgs[n-1]}}
+			return noteMsg("! this terminal cannot show images inline; the file is at " + imgs[n-1])
 		}
 	}
-	return func() tea.Msg {
-		img, err := core.DecodeImage(context.Background(), imgs[n-1], 800)
-		if err != nil {
-			return outMsg{lines: []string{"! cannot decode image: " + err.Error()}}
-		}
-		m.showInline = func() {
-			_ = common.WriteImage(os.Stdout, img, kind)
-			fmt.Fprint(os.Stdout, "\n(press Enter to return)")
-			_, _ = bufio.NewReader(os.Stdin).ReadString('\n')
-		}
-		return viewMsg{}
-	}
+	return m.inline(nil, imgs[n-1], kind, viewCols)
 }
 
-type viewMsg struct{}
-
 type inlineMsg struct {
-	peer core.PeerID
+	peer *core.PeerID // the conversation it belongs to; nil for the system notes
 	img  common.InlineImage
 }
 
-// inline decodes a thumbnail off the render thread and prepares it for inline
-// display: Kitty Unicode placeholders where available, otherwise a half-block
-// preview (iTerm2 and other true-colour terminals; /view shows full quality).
-// Failures are silent: the saved path is already in the conversation.
-func (m *model) inline(peer core.PeerID, path string, kind common.TermImage) tea.Cmd {
+// inline decodes an image off the render thread and prepares it for inline
+// display, cols columns wide: Kitty Unicode placeholders where available,
+// otherwise a half-block rendering (iTerm2 and other true-colour terminals).
+func (m *model) inline(peer *core.PeerID, path string, kind common.TermImage, cols int) tea.Cmd {
 	m.nextImage++
 	if m.nextImage == 0 {
 		m.nextImage = 1
 	}
 	id := m.nextImage
 	return func() tea.Msg {
-		img, err := core.DecodeImage(context.Background(), path, 320)
+		img, err := core.DecodeImage(m.ctx, path, 20*cols)
 		if err != nil {
-			return nil
+			return noteMsg("! cannot show " + path + ": " + err.Error())
 		}
 		if kind == common.TermKitty {
-			if in, err := common.KittyInline(img, id, 32); err == nil {
+			if in, err := common.KittyInline(img, id, cols); err == nil {
 				return inlineMsg{peer: peer, img: in}
 			}
 			return nil
 		}
-		if lines := common.HalfBlocks(img, 32); len(lines) > 0 {
+		if lines := common.HalfBlocks(img, cols); len(lines) > 0 {
 			return inlineMsg{peer: peer, img: common.InlineImage{Lines: lines}}
 		}
 		return nil
 	}
+}
+
+// truncate cuts s to at most w columns without splitting a character.
+func truncate(s string, w int) string {
+	for lipgloss.Width(s) > w {
+		_, size := utf8.DecodeLastRuneInString(s)
+		s = s[:len(s)-size]
+	}
+	return s
 }
 
 func padRight(s string, w int) string {

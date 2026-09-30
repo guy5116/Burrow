@@ -121,12 +121,13 @@ func (h *head) Write(p []byte) (int, error) {
 // Comments, plain text, other application data and anything hiding under
 // those two labels are dropped.
 func gifKeepExtension(label byte, body []byte) bool {
-	switch label {
-	case 0xF9: // one 4-byte sub-block and the terminator
-		return len(body) == 6 && body[0] == 4 && body[5] == 0
-	case 0xFF: // "NETSCAPE2.0", then sub-block {1, loop count u16}, terminator
-		return len(body) == 17 && body[0] == 11 && string(body[1:12]) == "NETSCAPE2.0" &&
-			body[12] == 3 && body[13] == 1 && body[16] == 0
+	switch {
+	case label == 0xF9 && len(body) == 6: // one 4-byte sub-block and the terminator
+		b := [6]byte(body)
+		return b[0] == 4 && b[5] == 0
+	case label == 0xFF && len(body) == 17: // "NETSCAPE2.0", sub-block {1, loop count u16}, terminator
+		b := [17]byte(body)
+		return b[0] == 11 && string(b[1:12]) == "NETSCAPE2.0" && b[12] == 3 && b[13] == 1 && b[16] == 0
 	}
 	return false
 }

@@ -12,7 +12,6 @@ import (
 	"log/slog"
 	"regexp"
 	"strconv"
-	"sync"
 
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/app"
@@ -40,7 +39,6 @@ type App struct {
 	done   chan struct{}
 
 	// UI model: touched only on the Fyne thread.
-	mu       sync.Mutex
 	contacts []core.Contact
 	sel      *core.PeerID
 	msgs     map[core.PeerID][]*row
@@ -51,7 +49,11 @@ type App struct {
 	status   *widget.Label
 	composer *widget.Entry
 	offers   map[core.TransferID]dialog.Dialog
+	typingTo *core.PeerID // the contact who was last told that we are typing
 }
+
+// maxRows bounds what is kept per conversation; the oldest rows go first.
+const maxRows = 5000
 
 // dialog is the interface the offers map holds (kept for tests).
 type dialogT = dialog.Dialog
@@ -70,7 +72,25 @@ func Run(paths store.Paths, cfg store.Config, logger *slog.Logger) int {
 	a.win.SetCloseIntercept(func() { a.shutdown(); a.win.Close() })
 	a.showUnlock()
 	a.win.ShowAndRun()
+	a.shutdown() // Quit, SIGINT and SIGTERM end the run loop without the close intercept
 	return 0
+}
+
+// async runs work off the Fyne thread and then on it. Everything that may
+// wait for the disk, the network or Argon2 goes through here: the window
+// stays responsive meanwhile.
+func (a *App) async(work func() error, then func(error)) {
+	go func() {
+		err := work()
+		fyne.Do(func() { then(err) })
+	}()
+}
+
+// confirm asks a question whose safe answer is "no". The button that goes
+// ahead is not the emphasised one.
+func (a *App) confirm(d *dialog.ConfirmDialog) {
+	d.SetConfirmImportance(widget.MediumImportance)
+	d.Show()
 }
 
 // shutdown stops the engine (BYE to peers) and releases the store.
@@ -102,7 +122,7 @@ func (a *App) startEngine(st *store.Store) {
 			dialog.ShowError(err, a.win)
 			return
 		}
-		torOpts = &core.TorOptions{Key: key, Port: a.cfg.ListenPort, Exe: a.cfg.TorExe}
+		torOpts = &core.TorOptions{Key: key, Port: a.cfg.ListenPort, Exe: a.cfg.TorExe, DataDir: a.paths.Data}
 		if a.cfg.Transport == "tor" {
 			listen = ""
 		}
@@ -149,6 +169,7 @@ type row struct {
 	kind   rowKind
 	text   string
 	mine   bool
+	id     core.MsgID // of a message we sent
 	status core.Status
 	path   string // image file
 	widget fyne.CanvasObject
@@ -172,6 +193,27 @@ func (a *App) selected() (core.PeerID, bool) {
 		return core.PeerID{}, false
 	}
 	return *a.sel, true
+}
+
+// choose makes id the selected conversation in the window and the controller.
+func (a *App) choose(id core.PeerID) {
+	a.setTyping(false)
+	a.sel = &id
+	a.ctl.Select(id)
+}
+
+// setTyping tells the selected contact that we started or stopped typing,
+// once per change.
+func (a *App) setTyping(now bool) {
+	id, ok := a.selected()
+	switch {
+	case now && a.typingTo == nil && ok && a.ctl.TypingOn():
+		a.e.SetTyping(id, true)
+		a.typingTo = &id
+	case !now && a.typingTo != nil:
+		a.e.SetTyping(*a.typingTo, false)
+		a.typingTo = nil
+	}
 }
 
 func (a *App) label(id core.PeerID) string { return a.ctl.Names.Label(id) }

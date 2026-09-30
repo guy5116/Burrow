@@ -111,7 +111,7 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	case "id":
 		code = a.cmdID(rest, stdin, stdout, stderr)
 	case "invite":
-		code = a.cmdInvite(ctx, rest, stdin, stdout, stderr)
+		code = a.cmdInvite(rest, stdin, stdout, stderr)
 	case "listen", "connect":
 		code = a.cmdRun(ctx, cmd, rest, stdin, stdout, stderr)
 	case "contacts":

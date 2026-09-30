@@ -93,6 +93,8 @@ type Engine struct {
 	listeners    []transport.Listener
 	orphanQueues map[PeerID][]*queued // a contact's message queue while no session is live
 	reconnects   map[PeerID]*reconnect
+	dialing      map[PeerID]int  // our dials in progress, per contact
+	heldBack     map[PeerID]bool // a disconnect not reported yet: a dial that may replace the session is running
 	transfers    map[TransferID]*transfer
 	dedup        map[PeerID]*dedup // received TEXT ids per contact; outlives the sessions
 	mdnsSeen     map[[16]byte]bool // announcement nonces already examined
@@ -115,6 +117,7 @@ func New(cfg Config, st *store.Store, trs []transport.Transport, logger *slog.Lo
 		limiters: map[transport.Kind]*handshake.FailureLimiter{}, reserved: map[[16]byte]PeerID{}, peers: map[PeerID]*peer{},
 		bySession: map[*session.Session]*peer{}, orphanQueues: map[PeerID][]*queued{}, reconnects: map[PeerID]*reconnect{},
 		transfers: map[TransferID]*transfer{}, dedup: map[PeerID]*dedup{}, mdnsSeen: map[[16]byte]bool{},
+		dialing: map[PeerID]int{}, heldBack: map[PeerID]bool{},
 		cmds: make(chan func()), inbound: make(chan session.Inbound, wire.ChatQueueCap), closedS: make(chan *session.Session),
 		emitCh: make(chan Event), stop: make(chan struct{}), loopDone: make(chan struct{})}
 	e.ctx, e.cancel = context.WithCancel(context.Background())
@@ -559,23 +562,22 @@ func kindOf(k uint8) transport.Kind {
 
 // dial runs the initiator side once. inviteID is non-empty when the peer is
 // new to us and a contact must be created after both HELLOs.
-func (e *Engine) dial(ctx context.Context, addr transport.Address, peerID PeerID, token *[16]byte, inviteID string) error {
+func (e *Engine) dial(ctx context.Context, addr transport.Address, peerID PeerID, token *[16]byte, inviteID string) (err error) {
 	tr, ok := e.trs[addr.Kind]
 	if !ok {
 		return ErrNoTransport
 	}
 	full := false
 	e.do(func() {
-		if len(e.peers)+e.pending >= e.cfg.maxPeers() {
-			full = true
-			return
+		if full = len(e.peers)+e.pending >= e.cfg.maxPeers(); !full {
+			e.pending++
+			e.dialing[peerID]++
 		}
-		e.pending++
 	})
 	if full {
 		return ErrTooManyPeers
 	}
-	defer e.do(func() { e.pending-- })
+	defer e.do(func() { e.dialEndedL(peerID) })
 	conn, err := tr.Dial(ctx, addr)
 	if err != nil {
 		e.emit(HandshakeFailed{Peer: peerID, Stage: "dial", Reason: "could not connect"})
@@ -597,6 +599,24 @@ func (e *Engine) dial(ctx context.Context, addr transport.Address, peerID PeerID
 	}
 	e.do(func() { e.rememberAddrL(peerID, addr) })
 	return nil
+}
+
+// dialEndedL closes the books on one dial. If the contact's session was
+// replaced by its peer while we were dialing, and no session came of the
+// dial, the disconnect that was held back is reported now.
+func (e *Engine) dialEndedL(id PeerID) {
+	e.pending--
+	if e.dialing[id]--; e.dialing[id] > 0 {
+		return
+	}
+	delete(e.dialing, id)
+	if !e.heldBack[id] {
+		return
+	}
+	delete(e.heldBack, id)
+	if e.peers[id] == nil {
+		e.disconnectedL(id, errors.New("connection lost"))
+	}
 }
 
 // errLostGlare: a simultaneous dial was resolved in favour of the other session.

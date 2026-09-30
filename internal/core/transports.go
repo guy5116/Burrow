@@ -8,6 +8,7 @@ import (
 	"github.com/guy5116/burrow/internal/transport"
 	"github.com/guy5116/burrow/internal/transport/tcp"
 	"github.com/guy5116/burrow/internal/transport/tor"
+	"github.com/guy5116/burrow/internal/wire"
 )
 
 // Transport is re-exported so UIs can hold the result of Transports without
@@ -19,6 +20,9 @@ type TorOptions struct {
 	Key  ed25519.PrivateKey // from store.LoadOnionKey
 	Port uint16             // virtual port in invites (0 → listen port)
 	Exe  string             // tor binary ("" → PATH)
+	// DataDir is the application's data directory; tor's state goes in a
+	// private sub-directory of it.
+	DataDir string
 }
 
 // Transports returns the transports for a listen address (":port" or
@@ -33,9 +37,13 @@ func Transports(listenAddr string, opts *TorOptions) []transport.Transport {
 	if opts != nil {
 		port := opts.Port
 		if port == 0 {
-			port = 47337
+			port = wire.DefaultListenPort
 		}
-		out = append(out, tor.New(opts.Key, port, opts.Exe))
+		dir := ""
+		if opts.DataDir != "" {
+			dir = filepath.Join(opts.DataDir, "tor")
+		}
+		out = append(out, tor.New(opts.Key, port, opts.Exe, dir))
 	}
 	return out
 }

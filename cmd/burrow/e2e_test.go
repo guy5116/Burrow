@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"image"
 	"image/png"
 	"io"
@@ -39,7 +40,7 @@ func TestMain(m *testing.M) {
 		panic(err)
 	}
 	binPath = filepath.Join(dir, "burrow")
-	if out, err := exec.CommandContext(context.Background(), "go", "build", "-o", binPath, ".").CombinedOutput(); err != nil {
+	if out, err := exec.CommandContext(context.Background(), "go", "build", "-tags", "e2e", "-o", binPath, ".").CombinedOutput(); err != nil {
 		panic(string(out))
 	}
 	code := m.Run()
@@ -474,4 +475,24 @@ func TestEndToEndFile(t *testing.T) {
 	}
 	b.send("/quit")
 	a.send("/quit")
+}
+
+// Arguments a command does not take are an error, not something to ignore:
+// flags written after the target would otherwise be dropped without a word.
+func TestStrayArguments(t *testing.T) {
+	home := t.TempDir()
+	for _, args := range [][]string{
+		{"listen", "extra"},
+		{"connect", "Alice", "--listen", "127.0.0.1:0"},
+		{"invite", "--host", "127.0.0.1", "extra"},
+		{"id", "extra"},
+	} {
+		full := append([]string{"--plain", "--config", home, "--data", home}, args...)
+		cmd := exec.CommandContext(context.Background(), binPath, full...)
+		out, err := cmd.CombinedOutput()
+		var exit *exec.ExitError
+		if !errors.As(err, &exit) || exit.ExitCode() != 2 || !strings.Contains(string(out), "unexpected argument") {
+			t.Errorf("%v: %v\n%s", args, err, out)
+		}
+	}
 }

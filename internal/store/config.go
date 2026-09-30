@@ -2,6 +2,7 @@ package store
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -57,7 +58,26 @@ func LoadConfig(configDir string) (Config, error) {
 	if _, err := toml.Decode(string(b), &c); err != nil {
 		return DefaultConfig(), err
 	}
+	if err := c.validate(); err != nil {
+		return DefaultConfig(), fmt.Errorf("%s: %w", ConfigFile, err)
+	}
 	return c, nil
+}
+
+// validate applies the limits of Set to a whole configuration, so a file
+// edited by hand cannot hold what `burrow config set` would refuse.
+func (c Config) validate() error {
+	var probe Config
+	for _, key := range ConfigKeys() {
+		v, err := c.Get(key)
+		if err == nil {
+			err = probe.Set(key, v)
+		}
+		if err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // SaveConfig writes config.toml atomically.

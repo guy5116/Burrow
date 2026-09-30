@@ -2,6 +2,7 @@ package handshake
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"net"
 	"strconv"
@@ -9,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/guy5116/burrow/internal/identity"
 	"github.com/guy5116/burrow/internal/wire"
 )
 
@@ -86,5 +88,51 @@ func TestLimiterEviction(t *testing.T) {
 	}
 	if len(g.entries) > maxLimiterKeys {
 		t.Fatal(len(g.entries))
+	}
+}
+
+// deadlineConn lets a test decide what each SetReadDeadline does.
+type deadlineConn struct {
+	net.Conn
+	calls int
+	on    func(call int) error
+}
+
+func (c *deadlineConn) SetReadDeadline(t time.Time) error {
+	c.calls++
+	if err := c.on(c.calls); err != nil {
+		return err
+	}
+	return c.Conn.SetReadDeadline(t)
+}
+
+// The responder gives up when it cannot set its deadlines, and when its
+// context ends at the moment the deadline for msg1 is replaced by the one for
+// the whole handshake (setting a deadline undoes the one a cancel installs).
+func TestResponderDeadlines(t *testing.T) {
+	r, _ := identity.Generate()
+	msg1 := make([]byte, wire.HSLenPrefix+wire.HS1Len)
+	binary.BigEndian.PutUint16(msg1, wire.HS1Len)
+	broken := errors.New("deadline not supported")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	for name, on := range map[string]func(int) error{
+		"first deadline fails":  func(call int) error { return broken },
+		"second deadline fails": func(call int) error { return map[bool]error{true: broken}[call == 2] },
+		"cancelled meanwhile": func(call int) error {
+			if call == 2 {
+				cancel()
+			}
+			return nil
+		},
+	} {
+		ci, cr := net.Pipe()
+		go func() { _, _ = ci.Write(msg1) }()
+		_, err := Respond(ctx, &deadlineConn{Conn: cr, on: on}, r, func(identity.PeerID, *[16]byte) Decision { return Accept }, NewReplayLRU())
+		var he *Error
+		if !errors.As(err, &he) || he.Stage != "msg1" || (!errors.Is(err, broken) && !errors.Is(err, context.Canceled)) {
+			t.Errorf("%s: %v", name, err)
+		}
+		_, _ = ci.Close(), cr.Close()
 	}
 }

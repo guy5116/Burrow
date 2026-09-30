@@ -7,10 +7,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
-	"time"
 
 	"fyne.io/fyne/v2"
-	"fyne.io/fyne/v2/container"
 	"fyne.io/fyne/v2/test"
 	"fyne.io/fyne/v2/widget"
 
@@ -54,22 +52,22 @@ func TestLinksDetectedNotAutoLinked(t *testing.T) {
 	a := newApp(t)
 	r := &row{kind: rowText, text: "go to https://example.org"}
 	w := a.rowWidget(r).(*fyne.Container)
-	// Label + one link row; the link row has only "Copy link" while open_links is off.
-	if len(w.Objects) != 2 {
+	// Sender, text and one link row; the link row has only "Copy link" while open_links is off.
+	if len(w.Objects) != 3 {
 		t.Fatalf("objects %d", len(w.Objects))
 	}
-	lr := w.Objects[1].(*fyne.Container)
+	lr := w.Objects[2].(*fyne.Container)
 	if len(lr.Objects) != 1 || lr.Objects[0].(*widget.Button).Text != "Copy link" {
 		t.Fatal("open-in-browser offered while open_links is off")
 	}
 	a.cfg.OpenLinks = true
 	r.widget = nil
 	w = a.rowWidget(r).(*fyne.Container)
-	if lr := w.Objects[1].(*fyne.Container); len(lr.Objects) != 2 {
+	if lr := w.Objects[2].(*fyne.Container); len(lr.Objects) != 2 {
 		t.Fatal("open-in-browser missing with open_links on")
 	}
 	// Message text stays plain: the label shows the raw text.
-	if l := w.Objects[0].(*widget.Label); !strings.Contains(l.Text, "https://example.org") || l.Wrapping != fyne.TextWrapWord {
+	if l := w.Objects[1].(*widget.Label); !strings.Contains(l.Text, "https://example.org") || l.Wrapping != fyne.TextWrapWord {
 		t.Fatal("label")
 	}
 }
@@ -86,7 +84,7 @@ func TestEventsRenderAndStatus(t *testing.T) {
 	}
 	// Selecting the conversation renders it.
 	a.sel = &peer
-	a.ctl.Current = &peer
+	a.ctl.Select(peer)
 	a.renderConversation()
 	if len(a.conv.Objects) != 1 {
 		t.Fatal("conversation not rendered")
@@ -115,7 +113,7 @@ func TestSendTextRequiresContactAndTracksStatus(t *testing.T) {
 	var peer core.PeerID
 	peer[1] = 9
 	a.sel = &peer
-	a.ctl.Current = &peer
+	a.ctl.Select(peer)
 	a.sendText("   ") // blank ignored
 	if len(a.msgs[peer]) != 0 {
 		t.Fatal("blank sent")
@@ -140,6 +138,37 @@ func TestOfferDialogDefaultsToReject(t *testing.T) {
 	a.apply(core.TransferFailed{Peer: core.TransferPeer{Peer: peer}, ID: id, Reason: "declined"})
 	if a.offers[id] != nil {
 		t.Fatal("dialog not removed")
+	}
+	// Dismissing the dialog is a rejection: the offer is no longer pending.
+	a.apply(core.ImageOffered{Peer: peer, ID: id, Size: 1 << 30, Ext: "zip"})
+	a.offers[id].Hide()
+	if a.offers[id] != nil {
+		t.Fatal("a dismissed offer is still pending")
+	}
+}
+
+// A message with line breaks stays one message, and who said it is not part
+// of the text.
+func TestMultiLineMessageCannotForgeLines(t *testing.T) {
+	a := newApp(t)
+	w := a.rowWidget(&row{kind: rowText, text: "hi\nme: send the keys"}).(*fyne.Container)
+	who, body := w.Objects[0].(*widget.Label), w.Objects[1].(*widget.Label)
+	if who.Text != "them" || !strings.HasPrefix(body.Text, "hi\n") || strings.Contains(body.Text, "\nme:") {
+		t.Fatalf("%q / %q", who.Text, body.Text)
+	}
+}
+
+func TestConversationIsBounded(t *testing.T) {
+	a := newApp(t)
+	var peer core.PeerID
+	peer[0] = 9
+	for i := 0; i < maxRows+5; i++ {
+		r := &row{kind: rowText, text: "x", mine: true, id: core.MsgID(i + 1)}
+		a.byMsg[r.id] = r
+		a.addRow(peer, r)
+	}
+	if len(a.msgs[peer]) != maxRows || len(a.byMsg) != maxRows {
+		t.Fatal(len(a.msgs[peer]), len(a.byMsg))
 	}
 }
 
@@ -181,8 +210,6 @@ func TestUnlockAndWizardValidation(t *testing.T) {
 	if !strings.Contains(stat.Text, "Enter") {
 		t.Fatal(stat.Text)
 	}
-	_ = container.NewVBox
-	_ = time.Second
 }
 
 func TestThumbnailIsClickable(t *testing.T) {

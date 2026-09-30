@@ -24,6 +24,9 @@ func (a *App) showUnlock() {
 	switch {
 	case errors.Is(err, store.ErrNoStore):
 		a.win.SetContent(a.wizard())
+	case errors.Is(err, store.ErrInUse):
+		a.win.SetContent(container.NewCenter(widget.NewLabel("Another Burrow process holds this identity. Close it and start again.")))
+		a.showInUse()
 	case err != nil:
 		a.win.SetContent(container.NewCenter(widget.NewLabel("Cannot read the store: " + err.Error())))
 	case mode == store.ModeNone:
@@ -33,21 +36,29 @@ func (a *App) showUnlock() {
 	}
 }
 
-// open unlocks the store with pw (nil for a no-passphrase store) and starts the engine.
+// open unlocks the store with pw (nil for a no-passphrase store) and starts
+// the engine. Deriving the key takes a moment and runs off the Fyne thread.
 func (a *App) open(pw []byte) {
-	st, err := store.Open(a.paths.Data, pw)
-	switch {
-	case errors.Is(err, store.ErrInUse):
-		dialog.ShowInformation("Store in use", "Another Burrow process (perhaps the CLI) holds this identity. Close it first.", a.win)
-		return
-	case errors.Is(err, store.ErrBlob):
-		dialog.ShowError(errors.New("wrong passphrase or corrupted store"), a.win)
-		return
-	case err != nil:
-		dialog.ShowError(err, a.win)
-		return
-	}
-	a.startEngine(st)
+	var st *store.Store
+	a.async(func() (err error) {
+		st, err = store.Open(a.paths.Data, pw)
+		return err
+	}, func(err error) {
+		switch {
+		case errors.Is(err, store.ErrInUse):
+			a.showInUse()
+		case errors.Is(err, store.ErrBlob):
+			dialog.ShowError(errors.New("wrong passphrase or corrupted store"), a.win)
+		case err != nil:
+			dialog.ShowError(err, a.win)
+		default:
+			a.startEngine(st)
+		}
+	})
+}
+
+func (a *App) showInUse() {
+	dialog.ShowInformation("Store in use", "Another Burrow process (perhaps the CLI) holds this identity. Close it first.", a.win)
 }
 
 func (a *App) unlockForm() fyne.CanvasObject {
@@ -95,17 +106,23 @@ func (a *App) wizard() fyne.CanvasObject {
 		}
 		pw1.SetText("")
 		pw2.SetText("")
-		st, err := store.Init(a.paths.Data, pw, store.Options{})
-		if err != nil {
-			status.SetText(err.Error())
-			return
-		}
-		if err := store.SaveConfig(a.paths.Config, a.cfg); err != nil {
-			status.SetText(err.Error())
-			st.Close()
-			return
-		}
-		a.startEngine(st)
+		status.SetText("Creating your identity…")
+		var st *store.Store
+		a.async(func() (err error) {
+			if st, err = store.Init(a.paths.Data, pw, store.Options{}); err != nil {
+				return err
+			}
+			if err = store.SaveConfig(a.paths.Config, a.cfg); err != nil {
+				st.Close()
+			}
+			return err
+		}, func(err error) {
+			if err != nil {
+				status.SetText(err.Error())
+				return
+			}
+			a.startEngine(st)
+		})
 	})
 	create.Importance = widget.HighImportance
 	insecure.OnChanged = func(on bool) {

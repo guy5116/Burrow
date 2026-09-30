@@ -3,6 +3,7 @@ package media
 import (
 	"bufio"
 	"encoding/binary"
+	"errors"
 	"io"
 )
 
@@ -78,7 +79,7 @@ func webpAnimated(r io.Reader) (animated bool, err error) {
 		}
 		return errStop // the first chunk decides
 	})
-	if err == errStop {
+	if errors.Is(err, errStop) {
 		err = nil
 	}
 	return animated, err

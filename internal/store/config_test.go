@@ -2,6 +2,9 @@ package store
 
 import (
 	"errors"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -52,5 +55,24 @@ func TestConfig(t *testing.T) {
 	}
 	if _, err := LoadConfig(dir); err == nil {
 		t.Fatal("corrupt config accepted")
+	}
+}
+
+// The limits hold for a file edited by hand as well.
+func TestLoadConfigValidates(t *testing.T) {
+	for _, line := range []string{"max_peers = 100000", "max_peers = -1", "listen_port = 0", "max_image_mib = 0",
+		"max_file_mib = 2000000", `transport = "udp"`, `display_name = "` + strings.Repeat("x", 33) + `"`} {
+		dir := t.TempDir()
+		if err := os.WriteFile(filepath.Join(dir, ConfigFile), []byte(line+"\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if c, err := LoadConfig(dir); err == nil || c != DefaultConfig() {
+			t.Errorf("%s: accepted (%v)", line, err)
+		}
+	}
+	dir := t.TempDir()
+	_ = os.WriteFile(filepath.Join(dir, ConfigFile), []byte("max_peers = 8\nmax_file_mib = 0\n"), 0o600)
+	if c, err := LoadConfig(dir); err != nil || c.MaxPeers != 8 || c.MaxFileMiB != 0 || c.ListenPort != 47337 {
+		t.Fatal(c, err)
 	}
 }

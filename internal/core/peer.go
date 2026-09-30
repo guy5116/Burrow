@@ -186,8 +186,23 @@ func (e *Engine) onSessionClosedL(s *session.Session) {
 	e.revertSentL(p)
 	e.orphanQueues[id] = append(e.orphanQueues[id], p.queue...)
 	p.queue = nil
+	// The peer replaced this session with one that we are still setting up
+	// (its BYE overtook our own registration): not a disconnect, unless
+	// nothing comes of the dial.
+	var bye *session.ByeError
+	if errors.As(err, &bye) && bye.Reason == wire.ByeReplaced && e.dialing[id] > 0 {
+		e.heldBack[id] = true
+		return
+	}
+	e.disconnectedL(id, err)
+}
+
+// disconnectedL reports that the contact's session has ended and starts
+// reconnecting where that is wanted.
+func (e *Engine) disconnectedL(id PeerID, err error) {
 	e.queueL(PeerDisconnected{Peer: id, Reason: disconnectReason(err)})
-	if e.cfg.AutoReconnect && len(c.Addrs) > 0 && !c.Blocked && !e.stopping && shouldReconnect(err) {
+	c := e.contacts[id]
+	if c != nil && e.cfg.AutoReconnect && len(c.Addrs) > 0 && !c.Blocked && !e.stopping && shouldReconnect(err) {
 		e.scheduleReconnectL(id)
 	}
 }

@@ -315,14 +315,23 @@ func openLocked(dir string, passphrase []byte) (*Store, error) {
 	return s, nil
 }
 
-// removeTemps deletes what an interrupted atomic write left behind.
+// removeTemps deletes what an interrupted atomic write left behind in the
+// store directory and its sub-directories (blobs are at most one level down).
 func removeTemps(dir string) {
-	_ = filepath.WalkDir(dir, func(p string, d os.DirEntry, err error) error {
-		if err == nil && !d.IsDir() && strings.HasPrefix(d.Name(), tempPrefix) {
-			_ = os.Remove(p)
+	ents, _ := os.ReadDir(dir)
+	for _, e := range ents {
+		switch {
+		case e.IsDir():
+			sub, _ := os.ReadDir(filepath.Join(dir, e.Name()))
+			for _, f := range sub {
+				if !f.IsDir() && strings.HasPrefix(f.Name(), tempPrefix) {
+					_ = os.Remove(filepath.Join(dir, e.Name(), f.Name()))
+				}
+			}
+		case strings.HasPrefix(e.Name(), tempPrefix):
+			_ = os.Remove(filepath.Join(dir, e.Name()))
 		}
-		return nil
-	})
+	}
 }
 
 // Close wipes the master key and releases the lock. Operations on a closed

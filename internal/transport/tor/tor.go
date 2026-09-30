@@ -10,11 +10,14 @@ import (
 	"crypto/ed25519"
 	"errors"
 	"net"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"sync"
 	"time"
 
+	"github.com/cretz/bine/process"
 	"github.com/cretz/bine/tor"
 
 	"github.com/guy5116/burrow/internal/transport"
@@ -22,14 +25,18 @@ import (
 
 // Transport runs one tor process on demand.
 type Transport struct {
-	Key     ed25519.PrivateKey // onion service key (from the identity blob)
+	Key     ed25519.PrivateKey // onion service key (from the identity blob); wiped by Close
 	Port    uint16             // virtual port announced in invites
 	ExePath string             // "" → "tor" on PATH
-	// Bootstrap bounds how long Listen waits for tor to build circuits.
+	// DataDir is where tor keeps its state while it runs: a private directory
+	// of ours, emptied at every start. "" → the system's temporary directory.
+	DataDir string
+	// Bootstrap bounds how long starting tor and publishing the service may take.
 	Bootstrap time.Duration
 
 	mu     sync.Mutex
 	proc   *tor.Tor
+	kill   context.CancelFunc // ends the tor process
 	dialer *tor.Dialer
 	onion  *tor.OnionService
 }
@@ -38,8 +45,8 @@ type Transport struct {
 var ErrNoTor = errors.New("tor: no tor binary found (install tor or set tor_exe)")
 
 // New builds a transport for the given onion key and virtual port.
-func New(key ed25519.PrivateKey, port uint16, exePath string) *Transport {
-	return &Transport{Key: key, Port: port, ExePath: exePath, Bootstrap: 3 * time.Minute}
+func New(key ed25519.PrivateKey, port uint16, exePath, dataDir string) *Transport {
+	return &Transport{Key: key, Port: port, ExePath: exePath, DataDir: dataDir, Bootstrap: 3 * time.Minute}
 }
 
 // Kind returns "tor".
@@ -48,17 +55,45 @@ func (t *Transport) Kind() transport.Kind { return transport.KindTor }
 // RateKey is empty: onion connections carry no source address (§3.4 uses a global limit).
 func (t *Transport) RateKey(net.Addr) string { return "" }
 
+// exe is the tor binary to run.
+func (t *Transport) exe() string {
+	if t.ExePath == "" {
+		return "tor"
+	}
+	return t.ExePath
+}
+
 // Available reports whether a tor binary is present.
 func (t *Transport) Available() bool {
-	exe := t.ExePath
-	if exe == "" {
-		exe = "tor"
-	}
-	_, err := exec.LookPath(exe)
+	_, err := exec.LookPath(t.exe())
 	return err == nil
 }
 
-// start launches tor once (temporary data dir, deleted on Close) and waits for bootstrap.
+// startTor is tor.Start; tests replace it.
+var startTor = tor.Start
+
+// launch starts tor with a lifetime of its own. ctx bounds the start only:
+// when it ends before tor is up, tor is killed; once tor is up, ending ctx
+// no longer touches it, and kill is the way to stop it.
+func launch(ctx context.Context, conf *tor.StartConf) (proc *tor.Tor, kill context.CancelFunc, err error) {
+	life, kill := context.WithCancel(context.Background())
+	detach := context.AfterFunc(ctx, kill)
+	proc, err = startTor(life, conf)
+	if !detach() && err == nil { // ctx ended while tor was starting
+		_ = proc.Close()
+		err = ctx.Err()
+	}
+	if err != nil {
+		kill()
+		return nil, nil, err
+	}
+	return proc, kill, nil
+}
+
+// start launches tor once and waits for bootstrap. tor's state lives in a
+// fresh directory under DataDir that is deleted on Close; what a crash left
+// there is deleted first. tor's own output is discarded: it must reach
+// neither the chat nor the JSON event stream.
 func (t *Transport) start(ctx context.Context) error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -68,9 +103,25 @@ func (t *Transport) start(ctx context.Context) error {
 	if !t.Available() {
 		return ErrNoTor
 	}
+	base := t.DataDir
+	if base == "" {
+		base = os.TempDir()
+	} else {
+		stale, _ := filepath.Glob(filepath.Join(base, "data-dir-*"))
+		for _, d := range stale {
+			_ = os.RemoveAll(d)
+		}
+	}
+	if err := os.MkdirAll(base, 0o700); err != nil {
+		return err
+	}
+	exe := t.exe()
+	quiet := process.CmdCreatorFunc(func(ctx context.Context, args ...string) (*exec.Cmd, error) {
+		return exec.CommandContext(ctx, exe, args...), nil // #nosec G204 -- the tor binary the user configured
+	})
 	bctx, cancel := context.WithTimeout(ctx, t.Bootstrap)
 	defer cancel()
-	proc, err := tor.Start(bctx, &tor.StartConf{ExePath: t.ExePath, ProcessCreator: nil})
+	proc, kill, err := launch(bctx, &tor.StartConf{ProcessCreator: quiet, TempDataDirBase: base})
 	if err != nil {
 		return err
 	}
@@ -79,9 +130,10 @@ func (t *Transport) start(ctx context.Context) error {
 	d, err := proc.Dialer(bctx, nil)
 	if err != nil {
 		_ = proc.Close()
+		kill()
 		return err
 	}
-	t.proc, t.dialer = proc, d
+	t.proc, t.kill, t.dialer = proc, kill, d
 	return nil
 }
 
@@ -95,9 +147,12 @@ func (t *Transport) Listen(ctx context.Context) (transport.Listener, error) {
 	if err != nil {
 		return nil, err
 	}
+	t.mu.Lock()
+	proc := t.proc
+	t.mu.Unlock()
 	bctx, cancel := context.WithTimeout(ctx, t.Bootstrap)
 	defer cancel()
-	svc, err := t.proc.Listen(bctx, &tor.ListenConf{Key: t.Key, RemotePorts: []int{int(t.Port)}, LocalListener: local, Version3: true})
+	svc, err := proc.Listen(bctx, &tor.ListenConf{Key: t.Key, RemotePorts: []int{int(t.Port)}, LocalListener: local, Version3: true})
 	if err != nil {
 		_ = local.Close()
 		return nil, err
@@ -127,21 +182,31 @@ func (t *Transport) Dial(ctx context.Context, addr transport.Address) (net.Conn,
 	if err := t.start(ctx); err != nil {
 		return nil, err
 	}
-	return t.dialer.DialContext(ctx, "tcp", net.JoinHostPort(addr.Host, strconv.Itoa(int(addr.Port))))
+	t.mu.Lock()
+	d := t.dialer
+	t.mu.Unlock()
+	if d == nil {
+		return nil, errors.New("tor: closed")
+	}
+	return d.DialContext(ctx, "tcp", net.JoinHostPort(addr.Host, strconv.Itoa(int(addr.Port))))
 }
 
-// Close stops tor and removes its temporary data directory.
+// Close stops tor, removes its data directory and wipes the onion key. The
+// copy tor.Listen handed to the library stays inside the library until it is
+// collected (SECURITY.md).
 func (t *Transport) Close() error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
+	clear(t.Key)
 	if t.onion != nil {
 		_ = t.onion.Close()
 		t.onion = nil
 	}
-	if t.proc != nil {
-		err := t.proc.Close()
-		t.proc = nil
-		return err
+	if t.proc == nil {
+		return nil
 	}
-	return nil
+	err := t.proc.Close()
+	t.kill()
+	t.proc, t.dialer = nil, nil
+	return err
 }

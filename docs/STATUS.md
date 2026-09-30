@@ -19,25 +19,15 @@ See docs/phases/PHASE-5.md and docs/RELEASE_CHECKLIST.md.
   before accepting. Protocol v1 amended in place (HELLO `max_file`, FILE_OFFER 0x27).
 
 ## Mid-flight
-Code review, round 1 of several (five independent reviewers, about 60 findings).
-- FIXED with tests: internal/media, text, identity, invite, handshake, session,
-  core, store (locking, swap, recovery, blob names).
-- NOT STARTED: internal/transport/tor (tor.go `start` kills its own tor process: the
-  bootstrap context is passed to tor.Start; data dir lands in the working directory;
-  tor output goes to stdout; onion key never wiped), mdns rate limit in `Browse`,
-  `store.LoadConfig` validation, scripts/cover.sh, bench/cmp, `make fuzz`, go mod tidy.
-- NOT STARTED: every user-interface finding (contact names with spaces in
-  `/msg` and `/rename`, forgeable verified mark in `Names.Label`, multi-line text forging
-  lines, data race on `Controller.Current`, unbounded scrollback, flags after the
-  target ignored, GUI shutdown on Quit, blocking calls on the Fyne thread, paths with
-  spaces in `/file`).
-- Docs not yet updated for this round: CLAUDE.md §7 (lock path), PROTOCOL.md,
-  SECURITY.md, THREAT_MODEL.md, PHASE-5.md.
-- `make lint`, `make test` (full), `make test-gui`, coverage and bench not run yet.
+- Review round 1 is fixed in every package (table in docs/phases/PHASE-5.md).
+- Review round 2 (from scratch) and the readability pass are next.
 
 ## Next step
-- Finish the list above, run the full gate, then start review round 2 from scratch.
-  After a clean round: the readability and comments pass the user asked for.
+- Run review round 2. Repeat until a round finds nothing that matters, then do the
+  pass for layout and comments.
+- After that, the open items in docs/RELEASE_CHECKLIST.md: ≥ 1 h fuzzing per target, a
+  green CI run on all three OSes, reproducibility on a second machine, Tor with a real
+  tor, the manual GUI plan, a look at Kitty inline thumbnails.
 
 ## Open questions for the user
 - The store lock moved from `<data>/store/lock` to `<data>/store.lock` (the old path

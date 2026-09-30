@@ -257,6 +257,10 @@ func (e *Engine) SendText(id PeerID, msg string) (MsgID, error) {
 	return q.id, nil
 }
 
+// TypingEnabled reports whether typing indicators are turned on in the
+// settings. Without that, SetTyping does nothing and none are shown.
+func (e *Engine) TypingEnabled() bool { return e.cfg.Typing }
+
 // SetTyping sends a typing indicator when enabled locally and supported by
 // the peer. It is dropped when the chat queue is full.
 func (e *Engine) SetTyping(id PeerID, typing bool) {

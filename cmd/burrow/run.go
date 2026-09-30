@@ -7,10 +7,8 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"os"
 	"strconv"
 	"strings"
-	"time"
 
 	"github.com/guy5116/burrow/internal/core"
 	"github.com/guy5116/burrow/internal/store"
@@ -26,6 +24,13 @@ func (a *app) cmdRun(ctx context.Context, cmd string, args []string, stdin io.Re
 	host := fs.String("host", "", "address to embed in invites created from the chat")
 	listen := fs.String("listen", "", "listen address override (default :<listen_port>)")
 	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	most := 0
+	if cmd == "connect" {
+		most = 1
+	}
+	if tooMany(fs, most, stderr) {
 		return 2
 	}
 	var target core.Target
@@ -60,9 +65,7 @@ func (a *app) cmdRun(ctx context.Context, cmd string, args []string, stdin io.Re
 	if *listen != "" {
 		ecfg.ListenAddr = *listen
 	}
-	if d, err := time.ParseDuration(os.Getenv("BURROW_DEBUG_CHUNK_DELAY")); err == nil && d > 0 {
-		ecfg.ChunkDelay = d // debugging aid for transfer tests; not a config key
-	}
+	ecfg.ChunkDelay = testChunkDelay()
 	addr := ":" + strconv.Itoa(int(a.cfg.ListenPort))
 	if *listen != "" {
 		addr = *listen
@@ -80,16 +83,13 @@ func (a *app) cmdRun(ctx context.Context, cmd string, args []string, stdin io.Re
 	defer cancel()
 	errc := make(chan error, 1)
 	go func() { errc <- e.Start(ctx) }()
-	// Wait for the listeners.
-	for len(e.ListenAddrs()) == 0 {
-		select {
-		case err := <-errc:
-			if err == nil {
-				err = errors.New("engine stopped")
-			}
-			return exitErr(stderr, err)
-		default:
+	select {
+	case <-e.Ready(): // the listeners are up (with Tor this can take minutes)
+	case err := <-errc:
+		if err == nil {
+			err = errors.New("stopped before it was ready")
 		}
+		return exitErr(stderr, err)
 	}
 	inviteHost, _ := a.inviteHost(*host)
 	if a.cfg.Transport == "tor" {
@@ -111,6 +111,17 @@ func (a *app) cmdRun(ctx context.Context, cmd string, args []string, stdin io.Re
 	cancel()
 	<-errc
 	return code
+}
+
+// tooMany reports, with a usage message, arguments beyond the most a command
+// takes. The flag package stops at the first argument that is no flag, so
+// `connect Alice --listen :5000` would otherwise run with the flag ignored.
+func tooMany(fs *flag.FlagSet, most int, stderr io.Writer) bool {
+	if fs.NArg() <= most {
+		return false
+	}
+	fmt.Fprintf(stderr, "burrow %s: unexpected argument %q (flags go before other arguments)\n", fs.Name(), fs.Arg(most))
+	return true
 }
 
 // targetOfBytes is targetOf for input read from a prompt or a pipe: an invite
@@ -143,7 +154,7 @@ func (a *app) transports(st *store.Store, listenAddr string) ([]core.Transport, 
 		if err != nil {
 			return nil, err
 		}
-		torOpts = &core.TorOptions{Key: key, Port: a.cfg.ListenPort, Exe: a.cfg.TorExe}
+		torOpts = &core.TorOptions{Key: key, Port: a.cfg.ListenPort, Exe: a.cfg.TorExe, DataDir: a.paths.Data}
 	}
 	if a.cfg.Transport == "tor" {
 		listenAddr = ""

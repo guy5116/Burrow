@@ -13,21 +13,45 @@ import (
 // Names resolves peer ids to display labels.
 type Names struct{ E *core.Engine }
 
-// Label returns "nick (fp8)" or the short fingerprint for an unknown peer.
+// Label names a contact for display: "nick (fp8, verified)". The state is
+// spelled out after the fingerprint, where nothing the contact chose can
+// stand: a name is free text and may end in any symbol, a check mark
+// included. A peer that is no contact is shown by its short fingerprint.
 func (n Names) Label(id core.PeerID) string {
 	c, err := n.E.Contact(id)
 	if err != nil {
 		return id.Short()
 	}
-	mark := ""
-	if c.Verified {
-		mark = "✓"
-	}
 	if c.Nickname == "" || c.Nickname == id.Short() {
-		return id.Short() + mark // an unnamed contact: do not print the same code twice
+		return fmt.Sprintf("%s (%s)", id.Short(), Verification(c.Verified)) // unnamed: the code is not printed twice
 	}
-	return fmt.Sprintf("%s%s (%s)", c.Nickname, mark, id.Short())
+	return fmt.Sprintf("%s (%s, %s)", c.Nickname, id.Short(), Verification(c.Verified))
 }
+
+// Named is Label without the verification state, for a line that states it
+// in its own words.
+func (n Names) Named(id core.PeerID) string {
+	if nick := n.Nick(id); nick != id.Short() {
+		return fmt.Sprintf("%s (%s)", nick, id.Short())
+	}
+	return id.Short()
+}
+
+// Verification is "verified" or "unverified".
+func Verification(verified bool) string {
+	if verified {
+		return "verified"
+	}
+	return "unverified"
+}
+
+// continuation starts every line of a message after the first. A message may
+// contain line breaks; without the gutter its second line could pass for a
+// line of its own: a system notice, or a message from someone else.
+const continuation = "\n    │ "
+
+// Body prepares message text for display under a sender's name.
+func Body(text string) string { return strings.ReplaceAll(text, "\n", continuation) }
 
 // Nick returns just the nickname (or short fingerprint).
 func (n Names) Nick(id core.PeerID) string {
@@ -57,7 +81,7 @@ func (n Names) Line(ev core.Event) string {
 		if e.InviteID != "" {
 			how = "joined with your invite " + e.InviteID
 		}
-		return fmt.Sprintf("* new contact %s %s — UNVERIFIED until you compare safety numbers (/safety)", n.Label(e.Peer), how)
+		return fmt.Sprintf("* new contact %s %s — UNVERIFIED until you compare safety numbers (/safety)", n.Named(e.Peer), how)
 	case core.InviteConsumed:
 		return fmt.Sprintf("* invite %s used", e.ID)
 	case core.NameCollision:
@@ -69,7 +93,7 @@ func (n Names) Line(ev core.Event) string {
 		if !e.SentAt.IsZero() {
 			ts = e.SentAt.Local().Format("15:04 ")
 		}
-		return fmt.Sprintf("%s<%s> %s", ts, n.Nick(e.Peer), e.Text)
+		return fmt.Sprintf("%s<%s> %s", ts, n.Nick(e.Peer), Body(e.Text))
 	case core.MessageStatus:
 		return fmt.Sprintf("* message %016x to %s: %s", uint64(e.ID), n.Nick(e.Peer), e.Status)
 	case core.Typing:

@@ -34,9 +34,9 @@ func readSecret(prompt string, stdin io.Reader, stderr io.Writer, allowStdin boo
 		fmt.Fprintln(tty)
 		return b, err
 	}
-	// `connect -`: the caller asked for stdin explicitly, even when a terminal exists.
-	// Read one line byte by byte: a buffered reader would swallow the chat
-	// commands that follow the invite on the same stream.
+	// `connect -` with stdin that is no terminal (a pipe, a file). Read one
+	// line byte by byte: a buffered reader would swallow the chat commands
+	// that follow the invite on the same stream.
 	var line []byte
 	var b [1]byte
 	for {

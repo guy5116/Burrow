@@ -8,6 +8,7 @@ import (
 	"github.com/guy5116/burrow/internal/buf"
 	"runtime"
 	"slices"
+	"sync"
 	"testing"
 	"time"
 
@@ -601,6 +602,22 @@ func TestBadFileOfferClosesSession(t *testing.T) {
 	a.expectViolation(t)
 }
 
+// frameOn returns the next frame that arrives for stream id, passing over what
+// is left from streams used earlier in the test.
+func frameOn(t *testing.T, s *Session, id uint16) Inbound {
+	t.Helper()
+	for {
+		select {
+		case in := <-s.Inbound():
+			if in.Stream == id {
+				return in
+			}
+		case <-time.After(3 * time.Second):
+			t.Fatalf("no frame on stream %d (session error: %v)", id, s.Err())
+		}
+	}
+}
+
 // openActive offers a stream from the initiator and has the responder accept it.
 func openActive(t *testing.T, p *pairT, size uint64) uint16 {
 	t.Helper()
@@ -612,13 +629,13 @@ func openActive(t *testing.T, p *pairT, size uint64) uint16 {
 	if err := p.i.SendStream(ctx, id, wire.TypeImgOffer, offerPayload(size)); err != nil {
 		t.Fatal(err)
 	}
-	if in := <-p.r.Inbound(); in.Type != wire.TypeImgOffer {
+	if in := frameOn(t, p.r, id); in.Type != wire.TypeImgOffer {
 		t.Fatal(in.Type)
 	}
 	if err := p.r.SendStream(ctx, id, wire.TypeImgAccept, wire.AppendImgAccept(nil, 0)); err != nil {
 		t.Fatal(err)
 	}
-	if in := <-p.i.Inbound(); in.Type != wire.TypeImgAccept {
+	if in := frameOn(t, p.i, id); in.Type != wire.TypeImgAccept {
 		t.Fatal(in.Type)
 	}
 	return id
@@ -795,5 +812,49 @@ func TestTransfersTakeTurns(t *testing.T) {
 	}
 	if want := []uint16{2, 4, 6, 2, 4, 6, 2, 4, 6}; !slices.Equal(got, want) {
 		t.Fatalf("served %v", got)
+	}
+}
+
+// Offers of transfers that start at the same moment reach the peer in the
+// order of their stream ids; any other order is a violation on its side.
+func TestOffersArriveInIDOrder(t *testing.T) {
+	p := newPair(t, time.Hour)
+	for round := 0; round < 40; round++ {
+		p.r.streams.mu.Lock()
+		p.r.streams.offerTimes = nil // this loop is not the offer churn of §4.3
+		p.r.streams.mu.Unlock()
+		var wg sync.WaitGroup
+		ids := make(chan uint16, wire.MaxPendingOffers)
+		for n := 0; n < wire.MaxPendingOffers; n++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				id, err := p.i.Offer(wire.TypeImgOffer, 10, offerPayload(10))
+				if err != nil {
+					t.Error(err)
+				}
+				ids <- id
+			}()
+		}
+		wg.Wait()
+		close(ids)
+		last := uint16(0)
+		for range wire.MaxPendingOffers {
+			select {
+			case in := <-p.r.Inbound():
+				if in.Type != wire.TypeImgOffer || in.Stream <= last {
+					t.Fatalf("round %d: %#x on stream %d after stream %d", round, in.Type, in.Stream, last)
+				}
+				last = in.Stream
+			case <-time.After(3 * time.Second):
+				t.Fatalf("round %d: offers missing (responder: %v)", round, p.r.Err())
+			}
+		}
+		for id := range ids { // make room for the next round
+			if err := p.r.SendStream(context.Background(), id, wire.TypeImgReject, wire.AppendImgReject(nil, wire.RejectDeclined)); err != nil {
+				t.Fatal(err)
+			}
+			frameOn(t, p.i, id)
+		}
 	}
 }

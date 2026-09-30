@@ -95,13 +95,13 @@ func (a *App) showConnectDialog() {
 			a.connectTarget(core.Target{Invite: s})
 			return
 		}
-		dialog.ShowConfirm("This invite uses a hostname",
+		a.confirm(dialog.NewConfirm("This invite uses a hostname",
 			"Looking up "+info.Host+" tells your DNS resolver which host you are contacting. IP addresses and onion addresses avoid that.\n\nConnect anyway?",
 			func(yes bool) {
 				if yes {
 					a.connectTarget(core.Target{Invite: s})
 				}
-			}, a.win)
+			}, a.win))
 	}, a.win)
 }
 
@@ -124,11 +124,11 @@ func (a *App) showVerifyDialog() {
 		num,
 		widget.NewLabel("Your fingerprint: "+a.e.Identity().Display),
 		widget.NewLabel("Their fingerprint: "+id.Display()))
-	dialog.ShowCustomConfirm("Safety number", "Mark as verified", "Not now", content, func(ok bool) {
+	a.confirm(dialog.NewCustomConfirm("Safety number", "Mark as verified", "Not now", content, func(ok bool) {
 		if ok {
 			a.errDialog(a.e.VerifyContact(id))
 		}
-	}, a.win)
+	}, a.win))
 }
 
 // showSettingsDialog edits config.toml; engine-level values apply on restart.
@@ -217,12 +217,13 @@ func (a *App) showPassphraseDialog() {
 		}
 		pw1.SetText("")
 		pw2.SetText("")
-		err := a.st.ChangePassphrase(pw, store.Options{})
-		if err != nil && !errors.Is(err, store.ErrOldStoreRemains) {
-			a.errDialog(err)
-			return
-		}
-		dialog.ShowInformation("Done", "The store was re-encrypted.", a.win)
+		a.async(func() error { return a.st.ChangePassphrase(pw, store.Options{}) }, func(err error) {
+			if err != nil && !errors.Is(err, store.ErrOldStoreRemains) {
+				a.errDialog(err)
+				return
+			}
+			dialog.ShowInformation("Done", "The store was re-encrypted.", a.win)
+		})
 	}, a.win)
 }
 
@@ -245,14 +246,19 @@ func (a *App) showOfferDialog(o core.ImageOffered) {
 			d.Hide()
 			delete(a.offers, o.ID)
 		}
-		a.errDialog(a.e.AcceptImage(o.ID, ""))
+		a.async(func() error { return a.e.AcceptImage(o.ID, "") }, func(err error) {
+			if errors.Is(err, core.ErrBusy) {
+				a.showOfferDialog(o) // still on offer: ask again, with the reason
+			}
+			a.errDialog(err)
+		})
 	})
 	accept.Importance = widget.LowImportance
 	d := dialog.NewCustom(title, "Reject", container.NewVBox(label, accept), a.win)
 	d.SetOnClosed(func() {
 		if _, pending := a.offers[o.ID]; pending {
 			delete(a.offers, o.ID)
-			_ = a.e.RejectImage(o.ID)
+			go func() { _ = a.e.RejectImage(o.ID) }()
 		}
 	})
 	a.offers[o.ID] = d
@@ -280,11 +286,16 @@ func (a *App) offerImage(path string) {
 	if !ok {
 		return
 	}
-	if _, err := a.e.SendFile(context.Background(), id, path, ""); err != nil {
-		a.errDialog(err)
-		return
-	}
-	a.addRow(id, &row{kind: rowSystem, text: "sending (images lose their metadata; other files go as they are, without their name)…"})
+	a.async(func() error {
+		_, err := a.e.SendFile(context.Background(), id, path, "")
+		return err
+	}, func(err error) {
+		if err != nil {
+			a.errDialog(err)
+			return
+		}
+		a.addRow(id, &row{kind: rowSystem, text: "sending (images lose their metadata; other files go as they are, without their name)…"})
+	})
 }
 
 // imageBubble is a tappable thumbnail; decoding happens off the UI thread.

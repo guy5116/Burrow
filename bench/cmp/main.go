@@ -7,6 +7,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"os"
@@ -14,7 +15,6 @@ import (
 	"regexp"
 	"sort"
 	"strconv"
-	"strings"
 )
 
 var lineRE = regexp.MustCompile(`^(Benchmark\S+?)(?:-\d+)?\s+\d+\s+([\d.]+) ns/op(?:\s+([\d.]+) MB/s)?`)
@@ -49,6 +49,9 @@ func main() {
 	}
 	if err := cmd.Wait(); err != nil {
 		fail(err)
+	}
+	if len(results) == 0 {
+		fail(errors.New("no benchmark results in the output: nothing was compared"))
 	}
 	if *update {
 		b, _ := json.MarshalIndent(results, "", "  ")
@@ -86,10 +89,16 @@ func main() {
 		}
 		fmt.Printf("%-40s %10.0f ns/op  baseline %10.0f  %+6.1f%%%s\n", n, results[n], ref, delta, flag)
 	}
-	if bad > 0 {
-		fail(fmt.Errorf("%d benchmark(s) regressed more than 15%%", bad))
+	// A benchmark that was renamed or removed must not drop out of the check unnoticed.
+	for n := range base {
+		if _, ran := results[n]; !ran {
+			fmt.Printf("%-40s did not run (in the baseline; update it with -update if that is intended)\n", n)
+			bad++
+		}
 	}
-	_ = strings.TrimSpace
+	if bad > 0 {
+		fail(fmt.Errorf("%d benchmark(s) regressed more than 15%% or did not run", bad))
+	}
 }
 
 func fail(err error) {

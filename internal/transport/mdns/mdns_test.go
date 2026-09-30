@@ -171,3 +171,20 @@ func TestWriteFuzzSeeds(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestBrowseBudget(t *testing.T) {
+	var b budget
+	now := time.Unix(100, 0)
+	passed := 0
+	for n := 0; n < 10*browseBudget; n++ {
+		if b.take(now.Add(time.Duration(n) * time.Millisecond)) { // all within one second
+			passed++
+		}
+	}
+	if passed != browseBudget {
+		t.Fatalf("%d announcements passed in one second", passed)
+	}
+	if !b.take(now.Add(time.Second)) {
+		t.Fatal("the budget did not refill")
+	}
+}

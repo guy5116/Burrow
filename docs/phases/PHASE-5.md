@@ -108,6 +108,54 @@ Choices made without asking, each the more private or more cautious option:
 - Offer sizes above 1 TiB do not decode (chunk indexes are 32 bits).
 - Received files share the image folder (`image_dir`); there is no separate setting.
 
+## Review round 1 (2026-09-29)
+
+Five reviewers, each given one area and no knowledge of its history, reported about
+sixty findings. Every one was checked against the code; the confirmed ones are fixed,
+each with a regression test. The serious ones:
+
+| Area | Defect | Fix |
+|---|---|---|
+| media | A 41-byte PNG or a 38-byte WebP made the stripper allocate 2 GiB | Payloads are streamed; no length field from a file sizes an allocation |
+| media | Unknown WebP chunks, and anything under the names of kept blocks, survived stripping | Allow-list for WebP; kept blocks only in their one legal shape |
+| media | A file that changed during sending produced chunks the offer had not announced, which the peer treats as a violation | The chunker knows the offered size and stops first |
+| media | The whole file was read into memory to probe it | Probing reads headers from the file |
+| text | Combining marks could be stacked without limit between joiners | A joiner no longer resets the count |
+| handshake | Unverified msg1 entered the replay cache and could flush it | Recorded after verification only |
+| handshake | 15 s instead of 10 s in total | One deadline, counted from accept |
+| session | Simultaneous cancels could lose a CANCEL and leave a stream draining for ever | Draining and queueing the CANCEL are one step under the lock |
+| session | One PING per tick was queued while the writer was busy; all were sent | The controller asks once; the writer refuses a second PING |
+| session | Two frame-sized allocations per chunk | Chunks travel in pooled buffers (0.5 MB instead of 50 MB per 17 MB sent) |
+| core | The reader stayed blocked when a download stopped on a slow disk | The reader is released when the stream stops receiving |
+| core | The set of seen message ids belonged to the session: resends were shown twice | It belongs to the contact |
+| core | BYE "replaced" on the only session was swallowed; a redial within 5 s was refused | Both treated as what they are |
+| core | Accepting one image twice let the second download take over the first one's partial | A partial has one writer; a transfer keeps its id on resume |
+| core | Stream ids leaked when a send was cancelled while hashing | The id is taken when the offer is about to be sent |
+| core | A known contact could release another handshake's token reservation | A reservation is released by its holder only |
+| store | A second process ran recovery under a store in use; a failed swap could lose the identity | The lock stands beside the store and is taken first; failed swaps are undone or close the store |
+| store | No synchronisation between blob writes and a passphrase change | One read/write lock |
+| tor | The transport killed its own tor right after starting it | tor has a lifetime of its own |
+| UI | `/msg Bob Smith …` went to "Bob"; a name could end in a check mark; a message with line breaks could imitate other lines | Longest-match with refusal on ambiguity and quotes; verification stated where a name cannot reach; continuation lines carry a gutter |
+| UI | Commands could overtake each other in the full-screen chat; the selected conversation was a data race | Commands run in the order entered; selection behind the controller's lock |
+| scripts | Coverage, benchmark and fuzz checks passed when nothing had run | They fail instead |
+
+Choices made without asking:
+
+- **The store lock is now `<data>/store.lock`** (was `<data>/store/lock`). CLAUDE.md §7
+  is updated and says why. This is the one change to a specified path.
+- WebP stripping became an allow-list; the spec named three chunks to drop.
+- `/view` shows the image in the conversation instead of taking over the terminal.
+- `BURROW_DEBUG_CHUNK_DELAY` exists only in binaries built with `-tags e2e`.
+- A lost simultaneous dial is no longer reported as a failed handshake.
+
+Not fixed, on purpose:
+
+- The Windows behaviour of the store was reviewed by reading only. The new lock location
+  removes the known obstacle (renaming a directory that holds an open file); it has not
+  been run on Windows.
+- Plain mode still ends when its input ends. To keep it running without input, give it
+  an input that stays open.
+
 ## Known issues
 
 - The desktop app idles at 172–179 MiB with one peer on the development machine (AMD
@@ -115,5 +163,3 @@ Choices made without asking, each the more private or more cautious option:
   allocated by the graphics driver), ≈ 72 MiB file-backed (shared libraries, mostly Mesa
   and LLVM), ≈ 23 MiB shared buffers. The original 150 MiB budget was missed; **the user
   raised it to 200 MiB on 2026-09-29** (CLAUDE.md §11). Other graphics drivers may differ.
-- History, when enabled, writes each received message on the engine goroutine (one
-  fsync per message). Marked `ponytail:` in `internal/core/history.go`.

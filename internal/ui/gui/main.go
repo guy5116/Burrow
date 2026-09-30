@@ -29,25 +29,25 @@ func (a *App) buildMain() {
 			if i >= len(a.contacts) {
 				return
 			}
+			// Presence and verification come first, in columns of their own:
+			// whatever a contact called itself cannot reach them.
 			c := a.contacts[i]
-			mark := "  "
+			mark, v := "○", "?"
 			if c.Online {
-				mark = "● "
+				mark = "●"
 			}
-			v := ""
 			if c.Verified {
-				v = " ✓"
+				v = "✓"
 			}
-			o.(*widget.Label).SetText(mark + c.Nickname + v)
+			o.(*widget.Label).SetText(mark + v + " " + c.Nickname)
 		})
 	a.list.OnSelected = func(i widget.ListItemID) {
 		if i < len(a.contacts) {
 			id := a.contacts[i].ID
-			a.sel = &id
-			a.ctl.Current = &id
-			a.loadHistory(id)
+			a.choose(id)
 			a.renderConversation()
 			a.updateStatus()
+			a.loadHistory(id)
 		}
 	}
 	toolbar := container.NewHBox(
@@ -62,6 +62,7 @@ func (a *App) buildMain() {
 	a.composer.PlaceHolder = "Message (Enter to send, Shift+Enter for a new line)"
 	a.composer.Wrapping = fyne.TextWrapWord
 	a.composer.OnSubmitted = func(s string) { a.sendText(s) }
+	a.composer.OnChanged = func(s string) { a.setTyping(s != "") }
 	send := widget.NewButtonWithIcon("Send", theme.MailSendIcon(), func() { a.sendText(a.composer.Text) })
 	send.Importance = widget.HighImportance
 	imgBtn := widget.NewButtonWithIcon("File", theme.FileIcon(), a.pickImage)
@@ -117,19 +118,30 @@ func (a *App) sendText(s string) {
 		a.errDialog(err)
 		return
 	}
-	a.composer.SetText("")
-	r := &row{kind: rowText, text: s, mine: true, status: core.StatusPending}
+	a.composer.SetText("") // OnChanged reports that the typing stopped
+	r := &row{kind: rowText, text: s, mine: true, status: core.StatusPending, id: mid}
 	a.byMsg[mid] = r
 	a.addRow(id, r)
-	if a.cfg.Typing {
-		a.e.SetTyping(id, false)
-	}
 }
 
-// addRow appends a row to a conversation and re-renders when it is selected.
+// addRow appends a row to a conversation and shows it when the conversation
+// is selected. Beyond maxRows the oldest rows are dropped.
 func (a *App) addRow(id core.PeerID, r *row) {
-	a.msgs[id] = append(a.msgs[id], r)
-	if sel, ok := a.selected(); ok && sel == id {
+	rows := append(a.msgs[id], r)
+	dropped := len(rows) - maxRows
+	if dropped > 0 {
+		for _, old := range rows[:dropped] {
+			delete(a.byMsg, old.id)
+		}
+		rows = append(rows[:0], rows[dropped:]...)
+	}
+	a.msgs[id] = rows
+	sel, ok := a.selected()
+	switch {
+	case !ok || sel != id:
+	case dropped > 0:
+		a.renderConversation()
+	default:
 		a.conv.Add(a.rowWidget(r))
 		a.conv.Refresh()
 		a.scroll.ScrollToBottom()
@@ -161,14 +173,17 @@ func (a *App) rowWidget(r *row) fyne.CanvasObject {
 	case rowImage:
 		r.widget = a.imageBubble(r)
 	default:
-		prefix := "them"
+		// Who said it stands in a widget of its own, and the lines of a
+		// message after the first carry a gutter: a message with line breaks
+		// cannot pass for several messages.
+		who := widget.NewLabelWithStyle("them", fyne.TextAlignLeading, fyne.TextStyle{Bold: true})
 		if r.mine {
-			prefix = "me"
+			who.SetText("me")
 		}
-		l := widget.NewLabel(prefix + ": " + r.text)
+		l := widget.NewLabel(common.Body(r.text))
 		l.Wrapping = fyne.TextWrapWord
 		l.Selectable = true
-		items := []fyne.CanvasObject{l}
+		items := []fyne.CanvasObject{who, l}
 		for _, u := range links(r.text) {
 			items = append(items, a.linkRow(u))
 		}
@@ -200,13 +215,13 @@ func (a *App) linkRow(u string) fyne.CanvasObject {
 	items := []fyne.CanvasObject{copyBtn}
 	if a.cfg.OpenLinks {
 		items = append(items, widget.NewButton("Open in browser…", func() {
-			dialog.ShowConfirm("Open this link in your browser?", u, func(ok bool) {
+			a.confirm(dialog.NewConfirm("Open this link in your browser?", u, func(ok bool) {
 				if ok {
 					if parsed, err := parseURL(u); err == nil {
 						_ = a.fa.OpenURL(parsed)
 					}
 				}
-			}, a.win)
+			}, a.win))
 		}))
 	}
 	return container.NewHBox(items...)
@@ -225,8 +240,7 @@ func (a *App) apply(ev core.Event) {
 	case core.NewPeerViaInvite:
 		a.refreshContacts()
 		if a.sel == nil {
-			a.sel = &e.Peer
-			a.ctl.Current = &e.Peer
+			a.choose(e.Peer)
 			a.renderConversation()
 		}
 		c, _ := a.e.Contact(e.Peer)
@@ -248,6 +262,9 @@ func (a *App) apply(ev core.Event) {
 		if r := a.byMsg[e.ID]; r != nil {
 			r.status = e.Status
 			r.widget = nil
+			if e.Status == core.StatusDelivered || e.Status == core.StatusFailed {
+				delete(a.byMsg, e.ID) // final: no further status will arrive
+			}
 			if sel, ok := a.selected(); ok && sel == e.Peer {
 				a.renderConversation()
 			}
@@ -312,8 +329,7 @@ func (a *App) connectTarget(t core.Target) {
 				a.errDialog(err)
 				return
 			}
-			a.sel = &id
-			a.ctl.Current = &id
+			a.choose(id)
 			a.refreshContacts()
 			a.renderConversation()
 			a.updateStatus()
@@ -321,16 +337,25 @@ func (a *App) connectTarget(t core.Target) {
 	}()
 }
 
-// loadHistory prefills a conversation from encrypted history (once, when enabled).
+// loadHistory prefills a conversation from encrypted history (once, when
+// enabled). Reading it may wait for the disk, so it happens off the Fyne thread.
 func (a *App) loadHistory(id core.PeerID) {
 	if !a.cfg.History || len(a.msgs[id]) > 0 {
 		return
 	}
-	hist, err := a.e.History(id, 200)
-	if err != nil {
-		return
-	}
-	for _, h := range hist {
-		a.msgs[id] = append(a.msgs[id], &row{kind: rowText, text: h.Text, mine: h.Mine, status: core.StatusDelivered})
-	}
+	var hist []core.HistoryEntry
+	a.async(func() (err error) {
+		hist, err = a.e.History(id, 200)
+		return err
+	}, func(err error) {
+		if err != nil || len(a.msgs[id]) > 0 {
+			return
+		}
+		for _, h := range hist {
+			a.msgs[id] = append(a.msgs[id], &row{kind: rowText, text: h.Text, mine: h.Mine, status: core.StatusDelivered})
+		}
+		if sel, ok := a.selected(); ok && sel == id {
+			a.renderConversation()
+		}
+	})
 }

@@ -322,9 +322,10 @@ func (e *Engine) fileReader(p *peer, t *transfer, path string, raw bool, mode me
 		e.failTransfer(t, "bad offer")
 		return
 	}
-	// The stream id is taken only once nothing can stop the offer from being
-	// sent except the session itself: an id that is taken and never offered
-	// would count against the pending offers for the rest of the session.
+	// The stream id is taken and the offer queued in one step, and only now
+	// that nothing but the session itself can stop the offer: an id that is
+	// taken and never offered would count against the pending offers for the
+	// rest of the session, and offers must reach the peer in id order.
 	var openErr error
 	e.do(func() {
 		switch {
@@ -333,7 +334,7 @@ func (e *Engine) fileReader(p *peer, t *transfer, path string, raw bool, mode me
 		case e.bySession[p.s] != p:
 			openErr = session.ErrClosed
 		default:
-			if t.stream, openErr = p.s.OpenStream(prep.Size); openErr != nil {
+			if t.stream, openErr = p.s.Offer(typ, prep.Size, offer); openErr != nil {
 				return
 			}
 			t.prep, t.size, t.hash, t.format, t.ext = prep, prep.Size, prep.Hash, prep.Format, prep.Ext
@@ -355,10 +356,6 @@ func (e *Engine) fileReader(p *peer, t *transfer, path string, raw bool, mode me
 		e.failTransfer(t, "too many transfers in progress")
 		return
 	default:
-		e.failTransfer(t, "connection lost")
-		return
-	}
-	if err := p.s.SendStream(t.ctx, t.stream, typ, offer); err != nil {
 		e.failTransfer(t, "connection lost")
 		return
 	}

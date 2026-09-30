@@ -157,6 +157,7 @@ type Session struct {
 
 	streams      *streamTable
 	transferWake chan struct{}
+	offers       chan outFrame            // offers of new outgoing streams, in id order (cap MaxPendingOffers)
 	closedQueues map[uint16]chan outFrame // frames still to send on streams already closed
 	rr           []rrEntry                // writer: scratch list for nextTransferFrame
 	rrLast       uint32                   // writer: stream id served last
@@ -203,6 +204,7 @@ func New(cfg Config) (*Session, error) {
 		attached:     make(chan struct{}),
 		streams:      newStreamTable(cfg.Initiator),
 		transferWake: make(chan struct{}, 1),
+		offers:       make(chan outFrame, wire.MaxPendingOffers),
 		closedQueues: map[uint16]chan outFrame{},
 		helloRecv:    make(chan struct{}),
 		readyCh:      make(chan struct{}),
